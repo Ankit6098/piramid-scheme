@@ -1,202 +1,273 @@
 # Business Rules
 
 Authoritative domain rules. Code, tests and UI copy must agree with this document. When a rule
-changes, update this file in the same change.
+changes, update this file in the same change. Items marked **[DB]** are also enforced by database
+constraints/triggers (`apps/api/prisma/migrations/*_integrity_constraints`), so the application must
+validate first and turn violations into friendly errors.
 
 ## 0. Compliance guardrails (fixed, not configurable)
 
-1. **Rewards are funded only by qualifying sales of an approved Offering** (product or service).
-   Valid trigger types: `PRODUCT_SALE`, `SERVICE_COMPLETED`, `SUBSCRIPTION_RENEWAL`.
-   Registration, referral, and program enrollment are **never** reward triggers.
-2. **Budget cap.** Total rewards for one event ≤ `budgetBps` of the sale amount, and `budgetBps ≤ 5000`
-   (50%) — enforced by a DB CHECK, the policy validator and the engine.
-3. **No guaranteed returns.** UI never shows projected/guaranteed income. Program options are plans for
-   the offering, not investments; their price is not a deposit and earns nothing.
-4. **No payouts.** The ledger records reward liabilities. Payout execution is not implemented;
-   `payoutsEnabled` must remain false until legal/KYC/provider approvals exist (future module).
+1. **Rewards are funded only by sales of an approved Offering to an end customer.** Trigger types:
+   `PRODUCT_SALE`, `SERVICE_COMPLETED`, `SUBSCRIPTION_RENEWAL` (an *end customer's* renewal of the
+   Offering). Registration, referral and enrollment are never triggers. **A member's own payment for a
+   program Option (initial or renewal) is never a qualifying event** [DB: an event whose external id
+   equals an enrollment payment reference, or that matches the subject's own plan payment amount within
+   ±2 days of its recording, is rejected]. Every sale names an end-customer reference.
+2. **Budget cap.** Rewards for one sale ≤ `budgetBps` of the sale value and `budgetBps ≤ 5000` (50%)
+   [DB: on policies *and* on every stored calculation; Σ rewards = calculation total].
+3. **No guaranteed returns.** The UI never shows projected or guaranteed income. Option prices are the
+   price of the offering's plan, not a deposit, and earn nothing.
+4. **No payouts.** The ledger records reward liabilities only. `payoutsEnabled` is pinned to false
+   [DB CHECK]; enabling it requires a reviewed migration after legal/KYC/payment-provider approval.
+5. **Four eyes on money.** Rewards from manually recorded sales always need a second person to approve
+   them (see §3, §9).
 
-## 1. Platform settings
+## 1. Platform settings & currencies
 
-- Singleton row. `rewardUnit`: `MONEY` (rewards are currency amounts) or `POINTS` (non-cash points).
-- `currencyCode` (ISO 4217) + `currencyMinorUnits` — used for option prices and sale amounts, and for
-  rewards in MONEY mode. `pointsLabel` (e.g. "Points") and `pointsPerCurrencyUnit` (points earned per
-  1 major unit of sale value, used for percentage rules in POINTS mode).
-- Only SUPER_ADMIN (`settings:write`) can change settings; changes are audited with a reason.
-- A **program snapshots** `rewardUnit` + `currencyCode` at creation. Published programs never change
-  unit/currency (DB trigger). Changing the platform setting therefore affects new programs and global
-  display defaults; historic rewards/ledger keep their own stored unit+currency and are shown with it.
-- Changing `currencyCode` is blocked while any non-DRAFT program uses a different currency
-  (prevents mixing currencies across live programs). Changing `rewardUnit` is allowed; it affects new programs.
-- All amount rendering goes through `formatAmount(amountMinor, { unit, currencyCode, minorUnits, pointsLabel })`.
+- `currencies` table (ISO 4217 code ↔ minor units) is reference data seeded by migration [DB immutable].
+- Singleton settings: `rewardUnit` (`MONEY` | `POINTS`) = default for new programs and the global display
+  mode; `currencyCode` (+ its minor units via FK); `pointsLabel`; default `pointsPerCurrencyUnit` and
+  default `budgetBps` for new policy drafts. Only SUPER_ADMIN (`settings:write`), with a reason, audited;
+  optimistic `version` [DB bumps it].
+- Changing `currencyCode` is blocked while any SCHEDULED/ACTIVE/PAUSED program uses another currency [DB].
+- A program snapshots `rewardUnit`, `currencyCode`, `currencyMinorUnits` at creation; frozen after
+  publication [DB]. A policy version snapshots `pointsPerCurrencyUnit`; frozen once published [DB].
+  Every calculation stores the unit, currency, minor units and points rate it used.
+- Amounts are always rendered from the record's own stored unit/currency through `formatAmount()`; the
+  live settings are only the default for things that have no stored unit (e.g. empty states, forms).
 
 ## 2. Accounts & authentication
 
-- Email is normalized (trim + lower-case) and unique. Status: `PENDING_VERIFICATION → ACTIVE`;
-  `ACTIVE ↔ SUSPENDED` (admin, reason required); `DEACTIVATED` (terminal, member-initiated or admin).
-- Password: ≥ 10 chars, at least one letter and one digit; hashed with argon2id.
-- **OTP**: 6 digits from a CSPRNG; stored as HMAC-SHA-256(pepper, `purpose:email:code`); TTL 10 min;
-  max 5 verification attempts; single use; issuing a new code invalidates older open codes of the same
-  purpose+email; resend cooldown 60 s; max 5 sends per email+purpose per hour.
-- **Registration** returns the same generic response whether or not the email exists (no account
-  enumeration). For an existing address, a "someone tried to register" notice is emailed instead.
-- **Login**: generic "invalid email or password". 5 consecutive failures lock the account for 15 min.
-  Unverified accounts receive `EMAIL_NOT_VERIFIED` only after a correct password.
-- **Admin MFA**: any user holding a non-MEMBER role gets a session with `mfaVerified=false` and an
-  emailed `LOGIN_MFA` code; `/admin/*` endpoints require `mfaVerified=true`.
-- **Sessions**: opaque 32-byte token in an HttpOnly, SameSite=Lax cookie (`sid`); only its SHA-256 is
-  stored. Absolute TTL 7 days (admins 12 h); idle timeout 12 h; logout revokes; password change/reset
-  revokes all sessions; suspension revokes all sessions.
-- **Password reset** and **email change** use OTP challenges; email change requires the current password
-  and verification of the new address; the old address is notified.
-- Rate limits (per IP and per account/email): register, login, OTP send, OTP verify, password reset.
+- Email normalized (trim + lower-case), unique. Statuses: `ACTIVE` (requires a verified email [DB]),
+  `SUSPENDED` (admin, reason), `DEACTIVATED`. (`PENDING_VERIFICATION` is legacy-only: accounts are now
+  created already verified, see Registration.)
+- Password: ≥ 10 chars with a letter and a digit; argon2id.
+- **Registration (anti-squatting):** `POST /auth/register` never creates a user. It stores the pending
+  name, password hash and validated referral code on an `EMAIL_VERIFICATION` challenge and emails a code.
+  The users row, depth-0 closure row, sponsor relationship and ancestor rows are created in the single
+  transaction that verifies the code, after re-validating the referral code (owner ACTIVE + verified).
+  Only the mailbox owner can therefore attach an address to a sponsor. A newer registration for the same
+  address replaces the older pending one. For an address that already has an account the response is
+  identical and the owner gets a "someone tried to register" notice.
+- **OTP codes:** 6 digits (CSPRNG); stored only as HMAC-SHA-256(pepper, `purpose:email:code`); TTL 10
+  min; ≤ 5 attempts per code; single use; **one open challenge per (email, purpose)** [DB] — issuing a
+  new code invalidates the old one in the same transaction; resend cooldown 60 s; ≤ 5 sends per hour;
+  **cumulative cap:** ≥ 10 failed attempts for an (email, purpose) in 24 h blocks further sends and
+  verifications for 24 h (same generic responses) and notifies the owner. Verification is atomic
+  (`UPDATE … SET attempts = attempts + 1 WHERE … AND attempts < max_attempts RETURNING`, constant-time
+  compare, consume with a conditional UPDATE).
+- **OTP delivery:** the outbox payload carries only `{challengeId, codeCiphertext}` (AES-256-GCM with
+  `OTP_OUTBOX_KEY`, AAD = challengeId). The worker decrypts, checks the challenge is still open, sends,
+  and removes the ciphertext in the same UPDATE that marks the message SENT/DEAD [DB checks: no
+  plaintext `code`/`otp` keys; no ciphertext on SENT/DEAD rows]. BullMQ jobs carry only message ids;
+  `lastError` never includes the payload.
+- **Login / enumeration:** unknown email, wrong password → `INVALID_CREDENTIALS` with equal timing
+  (dummy argon2 verify). `ACCOUNT_SUSPENDED` (and deactivated) only after a correct password. No global
+  hard lock: failures are throttled per (email-HMAC, IP) and per IP with exponential backoff in Redis,
+  so a third party cannot lock an account for its owner. Password-reset, resend and email-change starts
+  always return the same 202; email change to an address that is taken returns the same success and
+  notifies that address.
+- **Admin MFA:** every user holding a non-MEMBER role must enroll a **TOTP** authenticator (secret
+  AES-256-GCM encrypted with `MFA_ENCRYPTION_KEY`, replay protection by last used time-step). First admin
+  login with no factor: email OTP bound to that session, then forced TOTP enrollment before any
+  `/admin/*` access. `/admin/*` requires `session.mfaMethod = TOTP` verified within the last 12 h.
+  Self-service password reset is disabled for admin-role users (a SUPER_ADMIN triggers it, audited);
+  password or email changes of an admin notify all SUPER_ADMINs.
+- **Sessions:** opaque 32-byte token in an HttpOnly, SameSite=Lax cookie `sid`; only its SHA-256 is
+  stored. Member TTL 7 days, idle 12 h. On MFA success the token is rotated (old row revoked
+  `mfa_rotated`) and expiry capped at now + 12 h. Logout revokes; password change/reset, suspension and
+  **any role grant/revoke** revoke all of that user's sessions. LOGIN_MFA codes elevate only the session
+  that requested them [DB]. Permissions are loaded per request.
+- Rate limits (per IP and per account/email): register, login, OTP send/verify, password reset.
 
-## 3. Roles & permissions
+## 3. Roles, permissions, segregation of duties
 
 | Role | Capabilities |
 |---|---|
-| SUPER_ADMIN | Everything, incl. settings, role assignment, referral corrections |
-| PROGRAM_ADMIN | Manage **assigned** programs: options, policies (draft/publish/preview), lifecycle, record qualifying events, view members & rewards for those programs |
-| FINANCE_REVIEWER | Approve/reject rewards, reverse rewards/events, ledger, reconciliation, exports. Cannot edit programs or policies |
+| SUPER_ADMIN | Everything: settings, roles, offering approval, auto-approving policies, API clients, referral corrections, audit, flags |
+| PROGRAM_ADMIN | **Assigned programs only**: options, policies (draft/publish/preview; only approval-requiring), lifecycle, enrollments, record sales, read members enrolled in those programs and their rewards |
+| FINANCE_REVIEWER | Approve/reject/reverse rewards, reverse events, ledger, reconciliation, exports, audit (read) |
 | MEMBER | Own profile, enrollments, referral code, own team (privacy-filtered), own rewards |
 
-- Permissions are checked on the server for every operation. A user cannot grant roles to themselves;
-  only SUPER_ADMIN assigns roles; the last SUPER_ADMIN cannot be removed.
-- Segregation of duties: a reviewer cannot approve/reject a reward where they are the recipient.
+- Every operation is authorized on the server. Only SUPER_ADMIN assigns roles; nobody grants roles to
+  themselves [DB]; at least one ACTIVE SUPER_ADMIN always remains — removal includes suspension and
+  deactivation [DB, serialized].
+- **Segregation of duties [DB]:** nobody approves, rejects or reverses their own reward; the admin who
+  recorded a sale can never approve its rewards; an admin cannot record a sale whose subject is
+  themselves or anyone in their downline; a reward recipient must be an upline of the sale's subject;
+  a member is never rewarded for their own sale; correction performers cannot be the moved member, the
+  previous or new sponsor, or an upline of the new sponsor; a flag cannot be resolved by its subject.
 
 ## 4. Offerings & programs
 
-- Offering = approved product/service (`ACTIVE`/`INACTIVE`). Only ACTIVE offerings can be attached to
-  new programs or receive new events.
-- Program lifecycle:
-  - `DRAFT` — fully editable; deletable.
-  - publish → `SCHEDULED` (if `startsAt` > now) or `ACTIVE`. Requires ≥ 1 active option, an ACTIVE
-    offering, valid dates, and ≥ 1 non-draft policy version (or one published in the same action).
-  - `SCHEDULED → ACTIVE` automatically at `startsAt` (scheduler).
-  - `ACTIVE ↔ PAUSED` (manual, reason). While paused: no enrollments; events are rejected.
-  - `ACTIVE/PAUSED → COMPLETED` manually or automatically at `endsAt`. `COMPLETED → ARCHIVED`.
-  - Never back to `DRAFT`. Non-draft programs cannot be deleted.
-- After publish, editable: name, description, terms (new `termsVersion`), `endsAt`/`enrollmentClosesAt`
-  (not into the past), options (add, deactivate, edit wording — price/duration edits create a new option).
-  Unit, currency and offering are frozen.
-- Dates: `startsAt < endsAt`; `enrollmentOpensAt < enrollmentClosesAt ≤ endsAt`. Stored UTC; displayed in
-  the program `timezone`.
-- Options: `priceMinor ≥ 0` (program currency), `billingFrequency`, `durationDays` 1..3660,
-  `renewalPolicy`. Duration should match frequency (MONTHLY≈28–31, QUARTERLY≈89–92, HALF_YEARLY≈181–184,
-  YEARLY≈365–366, ONE_TIME any) — validator enforces these ranges.
+- Offering = product/service. New offerings are `INACTIVE`; activation requires `offerings:approve`
+  (SUPER_ADMIN) and records the approver [DB]. Only ACTIVE offerings can back a program publication or
+  receive sales [DB].
+- Program lifecycle [DB state machine]: `DRAFT → SCHEDULED | ACTIVE`, `SCHEDULED → ACTIVE` (scheduler at
+  `startsAt`), `ACTIVE ↔ PAUSED` (reason), `ACTIVE | PAUSED → COMPLETED` (manual, sets `endsAt = now`
+  if later, or scheduler at `endsAt`), `COMPLETED → ARCHIVED`. Never back to DRAFT. Only DRAFT programs
+  can be deleted. Every status change is recorded in `program_status_changes` [DB trigger; the reason is
+  passed with `set_config('app.status_reason', …, true)` and the actor via `updated_by_id`].
+- Publish requires: ≥ 1 active option, ACTIVE offering, valid dates, ≥ 1 PUBLISHED policy version.
+- After publish: code, offering, unit, currency, max depth frozen [DB]; `startsAt` frozen once started;
+  `endsAt` cannot move into the past; dates frozen once COMPLETED [DB]. Name, description, terms (new
+  `termsVersion`), enrollment close date may change.
+- Dates: `startsAt < endsAt`, `enrollmentOpensAt < enrollmentClosesAt ≤ endsAt` [DB]. Stored UTC,
+  displayed in the program time zone. `lateEventGraceDays` (default 30): sales that occurred before
+  `endsAt` may still be recorded that many days after it.
+- Options: price ≥ 0 in the program currency [DB], duration 1..3660 days and consistent with frequency
+  (MONTHLY 28–31, QUARTERLY 89–92, HALF_YEARLY 181–184, YEARLY 365–366, ONE_TIME any). Price, duration
+  and frequency of an option that has enrollments never change — create a new option [DB].
 
 ## 5. Enrollment
 
-- Preconditions: member `ACTIVE` + email verified; program `ACTIVE`; now within the enrollment window;
-  option active; program `eligibility` satisfied (`minAccountAgeDays`, `requireSponsor`).
-- At most one open (`PENDING`/`ACTIVE`) enrollment per member per program (partial unique index).
-- Stores an immutable `optionSnapshot`, `termsVersion`, and the member's sponsor at that time.
-- Payment collection is not implemented: free options (price 0) activate immediately; paid options start
-  `PENDING` until an admin records the offline payment and **activates** (`effectiveFrom = now`,
-  `effectiveTo = now + durationDays`, `eligibilityStatus = ELIGIBLE`). Admin may reject (`REJECTED`).
-- Member may cancel (`CANCELLED`). Scheduler expires `ACTIVE` enrollments after `effectiveTo` (`EXPIRED`).
-  Terminal statuses never change (DB trigger). Renewal = new enrollment.
+- Preconditions [DB]: member ACTIVE + verified; program ACTIVE with an open enrollment window
+  (row-locked against concurrent pause/complete); option active and belonging to the program; plus
+  program `eligibility` rules (`minAccountAgeDays`, `requireSponsor`).
+- One `PENDING` enrollment per member and program [DB]; activated coverage periods
+  `[effectiveFrom, effectiveTo)` never overlap [DB exclusion].
+- Stores an immutable `optionSnapshot` (`{optionId, name, priceMinor (string), currencyCode,
+  billingFrequency, durationDays, renewalPolicy}`), `termsVersion` and the member's sponsor [DB].
+- Payments are collected offline. Free options activate immediately. A paid option is activated by an
+  admin (`enrollments:manage`) who records a unique `paymentReference`, `paymentAmountMinor` and time
+  [DB: a paid option cannot be ACTIVE without it; payment records are immutable]. Activation sets
+  `effectiveFrom = max(now, end of the member's current period)` (renewal without a gap),
+  `effectiveTo = effectiveFrom + durationDays`, eligibility `ELIGIBLE`. Admin may reject (`REJECTED`).
+- Coverage dates are frozen once set [DB]. Cancellation (member or admin) sets `cancelledAt = now` and
+  shortens `effectiveTo` to `max(now, effectiveFrom)` (an unstarted renewal becomes an empty period).
+  The scheduler marks `ACTIVE → EXPIRED` once `effectiveTo` has passed. Terminal states never change [DB].
 
 ## 6. Referral tree
 
-- Each member has one global referral code (8 chars, Crockford-style alphabet without 0/O/1/I/L, upper
-  case). Link: `${APP_PUBLIC_URL}/register?ref=CODE`. A code is attribution, never authentication.
-- Attribution happens **only at registration**, server-side, from a valid code whose owner is ACTIVE and
-  verified. Invalid code → validation error (the client may retry without a code). Self-referral and
-  cycles are impossible by construction (a new user has no descendants) and by DB checks.
-- `referral_relationships`: exactly one row per child (unique), immutable (trigger).
-  `referral_paths`: closure rows for every ancestor/descendant pair including depth 0 self rows; written
-  in the same transaction as the user.
-- **Corrections** (SUPER_ADMIN, `referrals:correct`): move a member (with their subtree) under a new
-  sponsor. Reason ≥ 10 chars. Rejected if the new sponsor is the member or inside the member's subtree.
-  Rewrites closure rows inside one transaction with `SET LOCAL app.referral_correction = 'on'`,
-  writes `referral_corrections` + audit. Affects only future reward calculations.
+- One global referral code per member (8 chars from `23456789ABCDEFGHJKMNPQRSTUVWXYZ`, i.e. no 0/O/1/I/L).
+  Link `${APP_PUBLIC_URL}/register?ref=CODE`. A code is attribution, never authentication.
+- **Attribution happens once, in the transaction that creates the member** (email verification), from
+  a code that is active and owned by an ACTIVE, verified sponsor [DB]. Invalid code at registration →
+  validation error (the client may continue without a code).
+- **Write protocol [DB-enforced]:** registration takes `pg_advisory_xact_lock_shared(7301, 1)` then
+  inserts users row → self closure row (depth 0) → relationship (with `registrationIp`, user agent) →
+  ancestor rows (sponsor's rows + 1), with no savepoints. Closure rows must equal the sponsor chain at
+  commit [DB]. Relationships are immutable outside corrections [DB].
+- **Corrections** (SUPER_ADMIN, `referrals:correct`, reason ≥ 10 chars): take
+  `pg_advisory_xact_lock(7301, 1)` first, insert the `referral_corrections` row, then
+  `SET LOCAL app.referral_correction_id = '<id>'`, then rewrite the relationship and the closure rows of
+  the moved subtree [DB checks cycles, SoD, consistency]. Rejected if the moved subtree has RECEIVED
+  (unprocessed) sales. Affects only calculations made afterwards; past rewards never change.
 - Member visibility: own sponsor + ancestors (display name = first name + last initial, depth, joined
   date); descendants up to depth 10 with display name, depth, joined date, status bucket
-  (active / inactive / pending), whether they hold an active enrollment, and direct-referral count.
-  Never other members' email, phone, enrollment prices, rewards or sale amounts.
+  (active / inactive), whether they currently hold an ELIGIBLE enrollment, direct-referral count. Never
+  other members' email, phone, prices paid, rewards, sale amounts or eligibility details.
 
 ## 7. Reward policies
 
-- Versions per program: `DRAFT → PUBLISHED → RETIRED`. Published versions are immutable (DB trigger);
-  to change rules create a new version.
-- Effective ranges `[effectiveFrom, effectiveTo)` of non-draft versions never overlap (exclusion
-  constraint). Publishing a version with `effectiveFrom = T` closes the currently open version at `T`.
-  `effectiveFrom` must be ≥ now (no retroactive policies). Retire = close range at now + status RETIRED.
-- Fields: `triggerEventTypes` (≥ 1), `maxDepth` (1..program.maxRewardDepth ≤ 10), `budgetBps` (1..5000),
-  optional `maxTotalPerEventMinor`, `minEventAmountMinor`, `ineligibleAncestorBehavior`
-  (`FORFEIT` | `COMPRESS`), `roundingMode` (`HALF_UP` | `HALF_EVEN` | `DOWN`), `requiresApproval`,
+- Versions per program: `DRAFT → PUBLISHED → RETIRED`; created as DRAFT only [DB]. Published versions
+  and their rules are immutable [DB; rule edits lock the version row so they cannot race a publish].
+- Effective ranges `[effectiveFrom, effectiveTo)` of non-draft versions never overlap [DB exclusion,
+  checked at commit]. `effectiveFrom ≥ now` (no retroactive policies) [DB].
+- **Publish at T:** close the version whose range contains T at T; if a published version starts at
+  S > T, the new version gets `effectiveTo = S`. One transaction; lock the program's versions first.
+- **Retire:** `effectiveTo = max(now, effectiveFrom)` + status RETIRED + `retiredAt`. Retiring a
+  version that hasn't started yet withdraws it (empty range). A range can't be closed in the past or
+  before sales already bound to it [DB]. Retired versions are frozen [DB].
+- Fields: `triggerEventTypes` (≥ 1), `maxDepth` (1..program depth ≤ 10), `budgetBps` (1..5000),
+  `maxTotalPerEventMinor?`, `minEventAmountMinor`, `pointsPerCurrencyUnit` (POINTS programs),
+  `ineligibleAncestorBehavior` (`FORFEIT` | `COMPRESS`), `roundingMode`, `requiresApproval`,
   `requireActiveEnrollment`.
-- Rules: one per level 1..maxDepth (gaps allowed = no reward at that level). `FIXED` (`fixedAmountMinor`
-  in reward-unit minor units) or `PERCENTAGE` (`percentageBps` of the base), optional `capMinor`.
-- Publish validation: ≥ 1 rule; every rule level ≤ maxDepth; Σ percentage bps ≤ budgetBps; program not
-  COMPLETED/ARCHIVED. The dry-run reports warnings when fixed amounts would exceed the budget for a
-  given sale amount.
+- `requiresApproval = false` can only be published by a SUPER_ADMIN (`policies:auto-approve`) [DB], and
+  even then rewards from ADMIN_MANUAL sales still need manual approval [DB].
+- Rules: one per level ≤ maxDepth (gaps allowed). `FIXED` (`fixedAmountMinor`, reward-unit minor units)
+  or `PERCENTAGE` (`percentageBps` of the base), optional `capMinor`. Publish validation [DB + app]:
+  ≥ 1 rule, levels ≤ maxDepth, Σ percentage bps ≤ budgetBps. The app also warns when fixed levels cannot
+  be funded by small sales (compute the break-even sale in sale currency, converting points via the rate).
 
-## 8. Reward engine (pure calculation + transactional processing)
+## 8. Sales intake & reward engine
 
-**Event intake** (`events:write`): admin/API records a qualifying event with `externalId` (unique per
-source → idempotent: a repeat returns the existing event). Validation → otherwise `REJECTED` with reason:
-event type allowed by schema; program `ACTIVE`; offering = program offering and ACTIVE; currency =
-program currency; `amountMinor > 0`; `occurredAt` within program dates and not > now + 5 min; subject
-member exists and is `ACTIVE`; an applicable policy version exists (non-draft, range contains
-`occurredAt`) and lists the event type; amount ≥ `minEventAmountMinor`.
+**Sources & idempotency.** `ADMIN_MANUAL` (recorded by an admin with `events:write` for an assigned
+program) or `API`/`WEBHOOK` (an `ApiClient` key scoped to one program; `integrations:manage` creates
+keys, shown once, stored as SHA-256). Idempotency key = **(offering, externalId, revision)** [DB], not the
+channel: the same sale can't be recorded twice through two channels or into two programs sharing an
+offering. `requestHash` = SHA-256 of the canonical request; a replay with the same hash returns the
+existing event (only if the caller may see its program), a different hash → 409 `IDEMPOTENCY_CONFLICT`
+without echoing the other event. A REJECTED or REVERSED sale may be re-recorded as `revision + 1`
+superseding it [DB].
 
-**Calculation** (pure function, engine version string recorded):
-1. **Base** (reward-unit minor units): MONEY → `amountMinor`. POINTS →
-   `round_down(amountMinor × pointsPerCurrencyUnit / 10^currencyMinorUnits)`.
-2. **Budget** = `round_down(base × budgetBps / 10000)`, then `min(budget, maxTotalPerEventMinor)` if set.
-3. **Recipients** — ancestors of the subject ordered by depth (closure table):
-   - An ancestor is *eligible* iff user `ACTIVE`, email verified, and (if `requireActiveEnrollment`) holds an
-     enrollment in the program with status `ACTIVE`, eligibility `ELIGIBLE`, and
-     `effectiveFrom ≤ occurredAt < effectiveTo`.
-   - `FORFEIT`: level L ↔ ancestor at depth L. Missing → stop; ineligible → level forfeited (traced).
-   - `COMPRESS`: the k-th *eligible* ancestor (searching up to depth 50) receives level k.
-4. **Amount per level**: FIXED → `fixedAmountMinor`; PERCENTAGE → `round(base × bps / 10000, roundingMode)`;
-   then `min(amount, capMinor)`.
-5. **Budget allocation** in level order: `amount = min(amount, remainingBudget)`; zero amounts are dropped
-   (traced as "budget exhausted").
-6. Output: rewards (level, recipient, amount) + full trace (inputs, every ancestor considered, decisions,
-   rounding, caps, budget before/after). Σ amounts ≤ budget always.
+**Intake validation** (the app stores failures as `REJECTED` with a reason when the row itself is valid):
+type is a sale type; offering = program offering and ACTIVE [DB]; currency = program currency [DB];
+amount > 0; customer reference present; `occurredAt` within the program period, ≤ now + 5 min [DB], the
+program was ACTIVE (not PAUSED/SCHEDULED) at `occurredAt` (from `program_status_changes`), and if the
+program is COMPLETED, now ≤ `endsAt` + grace; subject member exists and is ACTIVE; recorder SoD [DB];
+plan-payment checks [DB]; an applicable policy version exists (non-draft, range contains `occurredAt`,
+lists the type, amount ≥ minimum) [DB when bound].
 
-**Persistence** (one DB transaction, idempotent): lock the event row (`FOR UPDATE`), skip if already
-processed; insert `reward_calculations` (unique per event) and `rewards` (unique per event+level and
-event+recipient); mark event `PROCESSED`. If `requiresApproval = false` rewards are created
-`APPROVED` (system) and posted to the ledger in the same transaction. Notifications go via the outbox.
-Historical rewards are never recalculated when policies change.
+**Calculation** (pure, `ENGINE_VERSION` recorded):
+1. Base: MONEY → `amountMinor`; POINTS → `floor(amountMinor × pointsPerCurrencyUnit / 10^minorUnits)`.
+2. Budget = `floor(base × budgetBps / 10000)`, then `min(budget, maxTotalPerEventMinor)`.
+3. Ancestors of the subject by depth (closure table). An ancestor is **eligible** iff user ACTIVE and
+   verified, and (if `requireActiveEnrollment`) holds an enrollment in the program with eligibility
+   `ELIGIBLE`, `effectiveFrom ≤ occurredAt < effectiveTo`, and status `ACTIVE` or `EXPIRED`, or
+   `CANCELLED` with `occurredAt < cancelledAt`. (Determined by `occurredAt`, never by when processing runs.)
+   `FORFEIT`: level L ↔ ancestor at depth L; ineligible → level forfeited. `COMPRESS`: k-th eligible
+   ancestor (search to depth 50) gets level k.
+4. Per level: FIXED amount or `round(base × bps / 10000, roundingMode)`, then `min(·, capMinor)`.
+5. Allocate in level order against the remaining budget; zero amounts dropped. Σ ≤ budget always.
 
-**Dry-run** (`policies:write`): runs the same pure calculator against a draft or published version with
-an admin-supplied sale amount and a synthetic ancestor chain (eligibility per level). No writes.
+**Persistence** (one transaction, idempotent): lock the event `FOR UPDATE`; skip unless RECEIVED; bind
+the policy to the event [DB re-checks applicability]; insert the calculation (with base, budget,
+unit/currency/minor units/points rate snapshot) [DB re-derives the base and checks the cap] and rewards
+[DB checks upline, depth, SoD]; mark the event PROCESSED. If the policy doesn't require approval and the
+source is not ADMIN_MANUAL, rewards are created `APPROVED` (system) and posted in the same transaction.
+Notifications go via the outbox. Historical rewards are never recalculated.
+
+**Dry-run** (`policies:write`): the same calculator with an admin-supplied sale amount and synthetic
+ancestor chain, or a real subject's tree (read-only). No writes.
 
 ## 9. Approval, posting, reversal
 
-- `PENDING_APPROVAL → APPROVED | REJECTED` (reviewer, reason required for reject).
-- `APPROVED → POSTED`: ledger transaction (idempotency key `reward-posting:<rewardId>`): DEBIT
-  `PLATFORM_REWARD_EXPENSE`, CREDIT the recipient's `MEMBER_REWARDS_PAYABLE` (accounts created on demand
-  per unit+currency). Approval posts immediately (approve = approve + post, one transaction).
-- `POSTED → REVERSED` (`rewards:reverse`, reason): compensating transaction
-  (`reward-reversal:<rewardId>`, references the original) with mirrored entries.
-- **Event reversal** (refund/chargeback, `events:reverse`): event `PROCESSED → REVERSED`; every reward of the
-  event: `PENDING_APPROVAL/APPROVED → REJECTED` ("event reversed"), `POSTED → REVERSED` with compensating
-  entries — all in one transaction. Partial refunds are not supported in v1 (reverse and re-record).
+- `PENDING_APPROVAL → APPROVED | REJECTED` (reviewer with `rewards:approve`, reason required to reject)
+  [DB state machine + SoD]. Approve = approve + post in one transaction.
+- Posting [DB-verified shape]: ledger transaction `reward-posting:<rewardId>` with exactly two entries —
+  DEBIT `PLATFORM_REWARD_EXPENSE`, CREDIT the recipient's `MEMBER_REWARDS_PAYABLE` — both equal to the
+  reward amount, same unit/currency. Accounts are created with `INSERT … ON CONFLICT DO NOTHING`.
+  Reward `POSTED` ⇔ exactly one posting [DB].
+- Reversal (`rewards:reverse`, reason): `reward-reversal:<rewardId>` mirroring the posting exactly,
+  referencing it; reward `REVERSED` ⇔ posting + reversal [DB]. One posting and one reversal per reward
+  at most [DB].
+- **Event reversal** (refund/chargeback, `events:reverse`, reason): first UPDATE the event to REVERSED
+  (row lock), then every reward: `PENDING_APPROVAL/APPROVED → REJECTED`, `POSTED → REVERSED` with a
+  compensating transaction — one transaction; the DB rejects a commit that leaves live rewards [DB].
+  Approvals lock the event `FOR SHARE`, so approval and reversal serialize [DB]. Partial refunds are not
+  supported in v1 (reverse, then re-record a new revision).
 - Bulk approve processes each reward in its own transaction and reports per-item results.
-- Ledger rows are never updated or deleted (triggers); every transaction balances (deferred trigger).
+- Financial mutations accept an `Idempotency-Key` header persisted in `idempotency_keys`.
 
-## 10. Earnings shown to members
+## 10. What members see
 
-Per (unit, currency) bucket:
-- **Earned to date** = Σ CREDIT − Σ DEBIT on the member's `MEMBER_REWARDS_PAYABLE` accounts (posted minus reversed).
-- **Pending** = Σ rewards in `PENDING_APPROVAL` + `APPROVED`.
-- **Reversed** = Σ rewards in `REVERSED`. Rejected rewards are listed but not totalled as earnings.
+- Rewards list/detail: `{id, program name, level, amountMinor, rewardUnit, currencyCode, status,
+  createdAt (date), decision dates, rejection/reversal reason}`. Never the sale's subject, sale amount,
+  exact occurredAt, external id, customer reference or calculation trace (admin-only).
+- **Earned to date** (profile + dashboard), per (unit, currency): Σ CREDIT − Σ DEBIT on the member's
+  payable accounts (posted minus reversed). **Pending** = Σ PENDING_APPROVAL + APPROVED.
+  **Reversed** = Σ REVERSED. Rejected rewards are listed but never totalled as earnings.
 
 ## 11. Reconciliation
 
-For each reward: `POSTED` ⇒ exactly one posting txn whose member credit equals `amountMinor`;
-`REVERSED` ⇒ posting + reversal txns; `PENDING/APPROVED/REJECTED` ⇒ no posting txn. Also: every ledger
-transaction balances; member account balance = Σ posted − Σ reversed rewards. Mismatches are reported
-as exceptions on the reconciliation page and counted on the admin overview.
+Exceptions reported (and counted on the admin overview): reward status vs ledger mismatch; posting or
+reversal amount ≠ reward amount; unbalanced transaction; member payable balance ≠ Σ posted − Σ reversed
+rewards; REVERSED event with live rewards; PROCESSED event whose calculation total ≠ Σ rewards; events
+stuck in RECEIVED > 15 min; sales whose subject has a paid enrollment payment of the same amount within
+±2 days in the same program (compliance review queue). Most are impossible by construction (DB) — the
+report proves it continuously.
 
-## 12. Fraud signals (v1, advisory)
+## 12. Fraud signals (advisory)
 
-- ≥ 3 registrations attributed to the same sponsor from the same IP within 24 h → `MemberFlag`
-  `SHARED_IP_REGISTRATIONS` on the sponsor. Admins can raise manual flags and resolve/dismiss them.
-  Flags never change balances automatically.
+- Registration enqueues `fraud.registration-attributed`; the worker counts committed attributions for
+  (sponsor, registration IP, last 24 h). ≥ 3 → upsert an OPEN `MemberFlag` `SHARED_IP_REGISTRATIONS` with
+  dedupe key `SHARED_IP:<sponsorId>:<ip>` [DB unique while OPEN]. Admins (`flags:manage`) can raise
+  manual flags and resolve/dismiss them (not their own [DB]). Flags never change balances automatically.
+
+## 13. Audit
+
+- Append-only [DB]. `before`/`after` hold an explicit allow-list of changed fields per action; emails and
+  phones masked (`a***@d***.com`); ids instead of names where possible; secret-looking keys are rejected
+  [DB CHECK]. `programId` is set on program-scoped entries (programs, options, policies, enrollments,
+  events, rewards) so PROGRAM_ADMIN history views can be scoped.

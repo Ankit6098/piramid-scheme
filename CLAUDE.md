@@ -10,9 +10,10 @@ a referral link), enroll in programs, see their team tree, sponsor, and rewards/
 
 **Non-negotiable product rule (agreed with the owner):** rewards are calculated **only** from
 qualifying sales of an approved Offering (product/service). Enrollment/joining payments are never a
-reward trigger, total rewards per event are capped at ≤ 50% of the sale amount (DB CHECK), and
-real-money payouts are not implemented (`platform_settings.payouts_enabled` stays false). Do not add
-features that pay ancestors for recruitment alone.
+reward trigger (nor is a member's own plan payment), total rewards per event are capped at ≤ 50% of
+the sale amount (enforced in SQL on policies and on every calculation), and real-money payouts are not
+implemented (`payouts_enabled` is pinned false by a CHECK). Do not add features that pay ancestors for
+recruitment alone.
 
 ## Stack
 
@@ -87,21 +88,32 @@ Never run `prisma migrate dev` non-interactively (it hangs); create migrations w
 
 ## Domain glossary & invariants (details: docs/business-rules.md)
 
-- **Offering**: approved product/service. **Program**: references one Offering, has Options (plans) and
-  effective-dated **RewardPolicyVersions** (+ **RewardRules** per level). Published versions are immutable.
-- **Sponsor/parent** = direct referrer. Tree = `referral_relationships` (adjacency, one sponsor per
-  child, written once at registration) + `referral_paths` (closure table incl. depth-0 self rows).
-  Changes only through the audited correction flow (`SET LOCAL app.referral_correction = 'on'`).
-- **QualifyingEvent**: a sale of an Offering credited to a subject member; idempotent on
-  `(source, externalId)`. **RewardCalculation**: one per event, full trace, immutable.
-  **Reward**: one per (event, level); state machine PENDING_APPROVAL→APPROVED→POSTED→REVERSED (+REJECTED).
-- **Ledger**: double-entry, append-only. Posting = DEBIT platform expense / CREDIT member payable.
-  Reversal = compensating transaction. Idempotency keys `reward-posting:<id>` / `reward-reversal:<id>`.
-- **PlatformSettings** (singleton): `rewardUnit` MONEY|POINTS, `currencyCode`, `pointsLabel`. Programs
-  snapshot unit+currency at creation (frozen after publish). Format amounts only via
-  `formatAmount()` from `@app/shared`.
+The DB enforces most invariants with triggers (see the integrity migration + docs/database.md). When a
+use case fails with `INVARIANT_VIOLATION`, fix the use case — never weaken a trigger without updating
+business-rules.md and the ADRs.
+
+- **Offering**: product/service; starts INACTIVE, SUPER_ADMIN approves. **Program**: one Offering,
+  Options (plans), effective-dated **RewardPolicyVersions** (+ **RewardRules**). Published = immutable.
+  Program status changes are logged by trigger in `program_status_changes`.
+- **Sponsor/parent** = direct referrer. Tree = `referral_relationships` + `referral_paths` (closure,
+  incl. depth-0 self rows). Written only (a) by the transaction that creates the user (email
+  verification) holding `pg_advisory_xact_lock_shared(7301,1)`, order: user → self row → relationship →
+  ancestor rows, no savepoints; or (b) by a correction holding `pg_advisory_xact_lock(7301,1)` after
+  inserting a `referral_corrections` row and `SET LOCAL app.referral_correction_id = '<id>'`.
+- **QualifyingEvent**: a sale of the program's Offering to an end customer, credited to a subject
+  member; idempotent on `(offeringId, externalId, revision)` + `requestHash`. Plan payments are never
+  sales. **RewardCalculation**: one per event, snapshot + trace, ≤ 50% cap enforced in SQL.
+  **Reward**: one per (event, level); PENDING_APPROVAL→APPROVED→POSTED→REVERSED (+REJECTED); SoD in SQL.
+- **Ledger**: double-entry, append-only. Posting = exactly DEBIT platform expense / CREDIT recipient
+  payable, `reward-posting:<rewardId>`; reversal mirrors it, `reward-reversal:<rewardId>`. Header stores
+  `entryCount` + `debitTotalMinor`. Create accounts with `INSERT … ON CONFLICT DO NOTHING`.
+- **PlatformSettings** (singleton): `rewardUnit` MONEY|POINTS, `currencyCode`(+minor units via
+  `currencies`), `pointsLabel`. Programs snapshot unit/currency/minor units; policy versions snapshot the
+  points rate. Format amounts only via `formatAmount()` with the record's own unit/currency.
 - Roles: SUPER_ADMIN, PROGRAM_ADMIN (scoped via program_admin_assignments), FINANCE_REVIEWER, MEMBER.
-  Admin sessions require email-OTP second factor (`session.mfaVerified`).
+  `/admin/*` requires a TOTP-verified session (`session.mfaMethod = 'TOTP'`, `mfaVerifiedAt` < 12 h).
+- **Secrets**: OTPs only as HMAC; outbox OTP emails carry AES-GCM ciphertext scrubbed after send;
+  TOTP secrets encrypted (`MFA_ENCRYPTION_KEY`); audit `before/after` = allow-listed fields, masked PII.
 
 ## Testing
 

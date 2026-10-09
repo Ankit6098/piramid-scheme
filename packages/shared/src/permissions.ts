@@ -8,11 +8,13 @@ export const Permission = {
   SettingsWrite: 'settings:write',
   RolesAssign: 'roles:assign',
   OfferingsWrite: 'offerings:write',
+  OfferingsApprove: 'offerings:approve',
   ProgramsRead: 'programs:read',
   ProgramsWrite: 'programs:write',
   ProgramsPublish: 'programs:publish',
   PoliciesWrite: 'policies:write',
   PoliciesPublish: 'policies:publish',
+  PoliciesAutoApprove: 'policies:auto-approve',
   EnrollmentsManage: 'enrollments:manage',
   MembersRead: 'members:read',
   MembersWrite: 'members:write',
@@ -27,6 +29,7 @@ export const Permission = {
   ReportsExport: 'reports:export',
   AuditRead: 'audit:read',
   FlagsManage: 'flags:manage',
+  IntegrationsManage: 'integrations:manage',
 } as const;
 export type Permission = (typeof Permission)[keyof typeof Permission];
 
@@ -35,12 +38,14 @@ export const ALL_PERMISSIONS: readonly Permission[] = Object.values(Permission);
 export const PERMISSION_DESCRIPTIONS: Record<Permission, string> = {
   'settings:write': 'Change platform-wide settings (reward unit, currency)',
   'roles:assign': 'Grant and revoke administrative roles',
-  'offerings:write': 'Create and edit approved products/services',
+  'offerings:write': 'Create and edit products/services (new ones start inactive)',
+  'offerings:approve': 'Approve products/services so they can be used by programs',
   'programs:read': 'View programs and their configuration',
   'programs:write': 'Create and edit programs and options',
   'programs:publish': 'Publish, pause, resume, complete and archive programs',
   'policies:write': 'Draft reward policies and run dry-run previews',
   'policies:publish': 'Publish and retire reward policy versions',
+  'policies:auto-approve': 'Publish policies whose rewards skip manual approval',
   'enrollments:manage': 'Activate, reject and review enrollments',
   'members:read': 'View member profiles, enrollments and team structure',
   'members:write': 'Suspend and reactivate members',
@@ -55,12 +60,13 @@ export const PERMISSION_DESCRIPTIONS: Record<Permission, string> = {
   'reports:export': 'Export CSV reports',
   'audit:read': 'View the audit log',
   'flags:manage': 'Raise and resolve suspicious-activity flags',
+  'integrations:manage': 'Create and revoke API clients that submit sales',
 };
 
 export const ROLE_PERMISSIONS: Record<RoleKey, readonly Permission[]> = {
   SUPER_ADMIN: ALL_PERMISSIONS,
+  // Least privilege: no global data (audit, flags, offerings) and no self-approving policies.
   PROGRAM_ADMIN: [
-    'offerings:write',
     'programs:read',
     'programs:write',
     'programs:publish',
@@ -70,8 +76,6 @@ export const ROLE_PERMISSIONS: Record<RoleKey, readonly Permission[]> = {
     'members:read',
     'events:write',
     'rewards:read',
-    'audit:read',
-    'flags:manage',
   ],
   FINANCE_REVIEWER: [
     'programs:read',
