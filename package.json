@@ -1,0 +1,27 @@
+{
+  "name": "referral-platform",
+  "private": true,
+  "packageManager": "pnpm@10.34.6",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel --filter ./apps/* dev",
+    "build": "pnpm --filter @app/shared build && pnpm --filter @app/api build && pnpm --filter @app/web build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "test:integration": "pnpm --filter @app/api test:integration",
+    "test:e2e": "playwright test",
+    "db:migrate": "pnpm --filter @app/api db:migrate",
+    "db:deploy": "pnpm --filter @app/api db:deploy",
+    "db:seed": "pnpm --filter @app/api db:seed",
+    "db:reset": "pnpm --filter @app/api db:reset",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "prettier": "3.9.9",
+    "typescript": "5.9.3"
+  }
+}
