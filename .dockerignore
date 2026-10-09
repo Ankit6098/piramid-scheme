@@ -1,0 +1,48 @@
+# Build context for infra/docker/*.Dockerfile (context = repo root).
+# Keep it small and free of secrets: dependencies, build output and generated code are recreated
+# inside the image from the lockfile and sources.
+
+# VCS / editors / OS
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+**/.DS_Store
+**/*.swp
+
+# Dependencies and build output (rebuilt in the image)
+**/node_modules
+**/dist
+**/.next
+**/out
+**/.turbo
+**/coverage
+**/*.tsbuildinfo
+apps/api/src/generated
+
+# Secrets and local configuration. Runtime config comes from the environment, never the image.
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.crt
+
+# Tests, reports and tooling that the images do not need
+tests
+playwright-report
+test-results
+playwright.config.ts
+**/*.log
+uploads
+backups
+
+# Docs and infra definitions (not needed to build either image)
+docs
+*.md
+!apps/**/*.md
+infra/nginx
+infra/postgres
+docker-compose*.yml

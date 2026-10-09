@@ -1,0 +1,291 @@
+# Production-style stack: everything behind nginx on ONE origin (host port 8080 → nginx :80).
+#
+#   cp .env.example .env        # then set real values; see docs/deployment.md (env var table)
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml run --rm seed            # first install: roles + super admin
+#   docker compose -f docker-compose.prod.yml --profile dev-mail up -d # + Mailpit instead of real SMTP
+#
+# Only nginx publishes a port (plus Mailpit's UI on 127.0.0.1 when the dev-mail profile is on).
+# PostgreSQL, Redis, the API and the web server are reachable only on the internal `backend`
+# network, which has no route to the internet. Only the worker (SMTP delivery) gets egress.
+#
+# No secrets live in this file: they come from .env (env_file + interpolation). Required values use
+# ${VAR:?message}, so `docker compose config` / `up` fail fast when one is missing.
+
+name: referral-platform-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '5'
+
+x-api-image: &api-image
+  image: ${IMAGE_REGISTRY:-referral-platform}/api:${IMAGE_TAG:-latest}
+  build:
+    context: .
+    dockerfile: infra/docker/api.Dockerfile
+
+# Settings shared by api, worker, migrate and seed. Values here override the same keys from .env
+# (env_file) — they pin container-internal addresses and production behaviour.
+x-api-env: &api-env
+  NODE_ENV: production
+  APP_PUBLIC_URL: ${APP_PUBLIC_URL:?set APP_PUBLIC_URL (public origin, e.g. https://rewards.example.com or http://localhost:8080)}
+  CORS_ORIGINS: ${CORS_ORIGINS:-${APP_PUBLIC_URL}}
+  API_PORT: '4000'
+  # Passwords are embedded in URLs: use URL-safe values (e.g. hex from `openssl rand -hex 32`).
+  DATABASE_URL: postgresql://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}?schema=public
+  DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
+  OTP_PEPPER: ${OTP_PEPPER:?set OTP_PEPPER (64 hex chars)}
+  # nginx always sits in front and overwrites X-Forwarded-For with the client address → trust
+  # exactly one hop. Pinned (not taken from .env, whose development value is false): without it
+  # every client would share nginx's IP for rate limiting. An LB in front is handled in nginx
+  # (set_real_ip_from), so this stays 1.
+  TRUST_PROXY: 'true'
+  # Secure cookies need HTTPS; browsers also accept them on http://localhost. Set false only for
+  # plain-HTTP access through a non-localhost hostname (never in real production).
+  COOKIE_SECURE: ${COOKIE_SECURE:-true}
+  SMTP_HOST: ${SMTP_HOST:?set SMTP_HOST (use "mailpit" together with --profile dev-mail)}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  MAIL_FROM: ${MAIL_FROM:?set MAIL_FROM}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  RUN_WORKER_IN_API: 'false'
+  # Shared rate-limit counters so limits hold across API replicas.
+  THROTTLE_STORAGE: redis
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  # ─── data ──────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 256m
+    networks: [backend]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF persistence (BullMQ queues), password auth, and noeviction (required by BullMQ).
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --maxmemory-policy noeviction --requirepass "$${REDIS_PASSWORD}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    networks: [backend]
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+  # Development / staging only: catches all mail (UI + API on http://127.0.0.1:8025).
+  # Use with SMTP_HOST=mailpit SMTP_PORT=1025 SMTP_SECURE=false.
+  mailpit:
+    image: axllent/mailpit:latest
+    profiles: [dev-mail]
+    restart: unless-stopped
+    environment:
+      MP_MAX_MESSAGES: '5000'
+      MP_SMTP_AUTH_ACCEPT_ANY: '1'
+      MP_SMTP_AUTH_ALLOW_INSECURE: '1'
+    ports:
+      - '127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025'
+    networks: [backend, edge]
+    logging: *logging
+
+  # ─── one-shot jobs ─────────────────────────────────────────────────────────
+  # Applies pending migrations, then exits. api/worker start only after it succeeded.
+  migrate:
+    <<: [*api-image, *hardening]
+    command: ['prisma', 'migrate', 'deploy']
+    restart: 'no'
+    env_file: .env
+    environment: *api-env
+    healthcheck:
+      disable: true
+    networks: [backend]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *logging
+
+  # Seeds roles/permissions, platform settings and the first SUPER_ADMIN (SEED_* in .env).
+  # On demand only:  docker compose -f docker-compose.prod.yml run --rm seed
+  seed:
+    image: ${IMAGE_REGISTRY:-referral-platform}/api-tools:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+      target: tools
+    profiles: [ops]
+    <<: *hardening
+    restart: 'no'
+    env_file: .env
+    environment: *api-env
+    networks: [backend]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    logging: *logging
+
+  # ─── application ───────────────────────────────────────────────────────────
+  api:
+    <<: [*api-image, *hardening]
+    restart: unless-stopped
+    env_file: .env
+    environment: *api-env
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [backend]
+    # Add `egress` here if the API itself ever needs outbound internet (it does not today: email
+    # is delivered by the worker through the outbox).
+    # Readiness (DB + Redis reachable), so nginx only starts routing once the API can serve. The
+    # image's own HEALTHCHECK uses the dependency-free liveness probe /api/v1/health.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4000/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+  # Outbox relay, BullMQ processors (email, notifications) and schedulers. Same image as the API.
+  worker:
+    <<: [*api-image, *hardening]
+    command: ['node', 'dist/worker.js']
+    restart: unless-stopped
+    env_file: .env
+    environment: *api-env
+    read_only: true
+    tmpfs: [/tmp]
+    # The image HEALTHCHECK probes the HTTP API, which the worker does not serve.
+    healthcheck:
+      disable: true
+    stop_grace_period: 60s
+    networks: [backend, egress]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+  web:
+    image: ${IMAGE_REGISTRY:-referral-platform}/web:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:4000
+    <<: *hardening
+    restart: unless-stopped
+    # No env_file: the web server needs no secrets.
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      HOSTNAME: 0.0.0.0
+      NEXT_TELEMETRY_DISABLED: '1'
+      # Server-side calls (RSC, route handlers) go straight to the API on the internal network.
+      API_INTERNAL_URL: http://api:4000
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:?set APP_PUBLIC_URL}
+    tmpfs: [/tmp]
+    networks: [backend]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/',{redirect:'manual'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      api:
+        condition: service_started
+    logging: *logging
+
+  # ─── edge ──────────────────────────────────────────────────────────────────
+  nginx:
+    # Stable branch, pinned minor. Upstream `server ... resolve` needs nginx >= 1.27.3.
+    image: nginx:1.30-alpine
+    restart: unless-stopped
+    ports:
+      - '${NGINX_HTTP_PORT:-8080}:80'
+      # - '443:443'          # TLS: see the template at the end of infra/nginx/conf.d/default.conf
+      # - '443:443/udp'      # HTTP/3
+    volumes:
+      - ./infra/nginx:/etc/nginx:ro
+      # - ./infra/nginx/certs:/etc/nginx/certs:ro
+    tmpfs:
+      - /var/cache/nginx
+    networks: [backend, edge]
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    logging: *logging
+
+networks:
+  # App-internal traffic; `internal: true` = no outbound internet and no published ports.
+  backend:
+    internal: true
+  # Outbound internet (worker → SMTP provider) and inbound published ports (nginx, Mailpit UI).
+  edge: {}
+  egress: {}
+
+volumes:
+  pgdata:
+  redisdata:

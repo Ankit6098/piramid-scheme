@@ -1,0 +1,14 @@
+{
+  "//": "Editor/typecheck support for Playwright specs (Playwright transpiles TS itself and does not typecheck). The root package has no @types/node, so node types are taken from a workspace app.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "sourceMap": false,
+    "lib": ["ES2023", "DOM"],
+    "types": ["node"],
+    "typeRoots": ["../../node_modules/@types", "../../apps/web/node_modules/@types"]
+  },
+  "include": ["**/*.ts", "../../playwright.config.ts"]
+}

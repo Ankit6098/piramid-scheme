@@ -1,0 +1,67 @@
+name: Setup Node, pnpm and dependencies
+description: >-
+  Installs Node 22, activates the pnpm version pinned in package.json ("packageManager") via
+  corepack, restores the pnpm store cache and runs a frozen-lockfile install. Optionally builds
+  @app/shared and generates the Prisma client, which api/web typechecks and builds depend on.
+
+inputs:
+  node-version:
+    description: Node.js version
+    default: '22'
+  filter:
+    description: Optional pnpm --filter selector for the install (e.g. "@app/api..."); empty = whole workspace
+    default: ''
+  build-shared:
+    description: Build packages/shared (dist) after installing
+    default: 'true'
+  prisma-generate:
+    description: Run `prisma generate` for apps/api after installing
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v5
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Enable corepack (pnpm from packageManager)
+      shell: bash
+      run: |
+        corepack enable
+        corepack install
+        echo "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" >> "$GITHUB_ENV"
+        pnpm --version
+
+    - name: Locate pnpm store
+      id: store
+      shell: bash
+      run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ steps.store.outputs.path }}
+        key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+        restore-keys: pnpm-store-${{ runner.os }}-
+
+    - name: Install dependencies
+      shell: bash
+      env:
+        FILTER: ${{ inputs.filter }}
+      run: |
+        if [ -n "$FILTER" ]; then
+          pnpm install --frozen-lockfile --filter "$FILTER"
+        else
+          pnpm install --frozen-lockfile
+        fi
+
+    - name: Build @app/shared
+      if: inputs.build-shared == 'true'
+      shell: bash
+      run: pnpm --filter @app/shared build
+
+    - name: Generate Prisma client
+      if: inputs.prisma-generate == 'true'
+      shell: bash
+      # prisma.config.ts reads DATABASE_URL eagerly; generate never connects.
+      run: DATABASE_URL="${DATABASE_URL:-postgresql://ci:ci@localhost:5432/ci}" pnpm --filter @app/api exec prisma generate

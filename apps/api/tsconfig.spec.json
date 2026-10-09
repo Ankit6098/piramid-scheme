@@ -1,0 +1,10 @@
+{
+  // Type-checks everything (src + tests + seed + tool configs). `tsconfig.json` stays limited to
+  // `src` because `rootDir: src` is what the build emits from.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src", "test", "prisma", "vitest.config.ts", "vitest.integration.config.ts", "prisma.config.ts"]
+}

@@ -27,6 +27,9 @@ export const ErrorCode = {
   PolicyInvalid: 'POLICY_INVALID',
   StaleVersion: 'STALE_VERSION',
   IdempotencyConflict: 'IDEMPOTENCY_CONFLICT',
+  PayloadTooLarge: 'PAYLOAD_TOO_LARGE',
+  NotImplemented: 'NOT_IMPLEMENTED',
+  ServiceUnavailable: 'SERVICE_UNAVAILABLE',
   Internal: 'INTERNAL_ERROR',
 } as const;
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
