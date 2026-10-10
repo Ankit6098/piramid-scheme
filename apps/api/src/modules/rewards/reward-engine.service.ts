@@ -4,6 +4,7 @@ import { formatAmount } from '@app/shared';
 import { AuditService } from '../../common/audit/audit.service';
 import { notFound } from '../../common/errors/app-error';
 import { PrismaService, type Tx } from '../../common/prisma/prisma.service';
+import { lockReferralTreeShared } from '../../common/prisma/referral-tree-lock';
 import type { Prisma, QualifyingEventStatus } from '../../generated/prisma/client';
 import { EnrollmentsService } from '../enrollments/enrollments.service';
 import { LedgerService } from '../ledger/ledger.service';
@@ -59,7 +60,8 @@ export class RewardEngineService {
 
   /**
    * Processes one event in its own transaction (do not call inside another transaction):
-   * lock the event FOR UPDATE → ALREADY_PROCESSED unless RECEIVED → validate (→ REJECTED with a
+   * lock the event FOR UPDATE → ALREADY_PROCESSED unless RECEIVED → take the referral tree lock in
+   * SHARED mode (waits for an in-flight sponsor correction) → validate (→ REJECTED with a
    * reason) → bind the applicable policy → calculate → insert the calculation and rewards → auto-post
    * when the policy skips approval and the sale did not come from a manual entry → mark PROCESSED →
    * notify recipients. Concurrent calls for the same event serialize on the row lock; exactly one
@@ -78,6 +80,13 @@ export class RewardEngineService {
     const event = locked[0];
     if (!event) throw notFound('Qualifying event');
     if (event.status !== 'RECEIVED') return { outcome: 'ALREADY_PROCESSED', rewardIds: [] };
+
+    // Hold the referral tree stable until COMMIT (business rules §6): a sponsor correction takes the
+    // EXCLUSIVE lock, so it can neither interleave with this calculation nor slip in after its
+    // "no RECEIVED sales in the moved subtree" check. Taken after the event row lock; corrections
+    // never lock event rows, so the order cannot deadlock. Shared mode: sales and registrations
+    // still run in parallel with each other.
+    await lockReferralTreeShared(tx);
 
     const program = await tx.program.findUniqueOrThrow({
       where: { id: event.program_id },

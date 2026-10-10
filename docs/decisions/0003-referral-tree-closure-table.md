@@ -36,7 +36,7 @@ Store the tree **twice**, in the same transaction:
   sponsor is the member or inside the member's subtree (one indexed `EXISTS` on the closure).
 
 Query patterns (children, descendants by depth, ancestors, ancestor at depth N, team size per
-depth, search within a team) are in [docs/database.md](../database.md#referral-tree-closure-table).
+depth, search within a team) are in [docs/database.md](../database.md#referral-tree-closure-table-and-its-write-protocol).
 
 ## Consequences
 

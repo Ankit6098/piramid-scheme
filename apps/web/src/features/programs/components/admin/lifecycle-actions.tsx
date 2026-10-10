@@ -1,6 +1,6 @@
 'use client';
 
-import { Archive, CheckCircle2, CirclePause, CirclePlay, Flag, MoreHorizontal, Pencil, Rocket, Trash2, XCircle } from 'lucide-react';
+import { Archive, Ban, CheckCircle2, CirclePause, CirclePlay, Flag, MoreHorizontal, Pencil, Rocket, Trash2, XCircle } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
@@ -31,6 +31,8 @@ interface ActionCopy {
   icon: typeof Rocket;
   destructive?: boolean;
   reason: 'required' | 'optional';
+  /** Toast after success (default: "Program <new status>"). */
+  done?: string;
 }
 
 function actionCopy(action: ProgramLifecycleAction, program: AdminProgramDetailDto, now: number): ActionCopy {
@@ -86,6 +88,18 @@ function actionCopy(action: ProgramLifecycleAction, program: AdminProgramDetailD
         icon: Archive,
         reason: 'optional',
       };
+    case 'cancel':
+      return {
+        label: 'Cancel program',
+        title: `Cancel “${program.name}” before it starts?`,
+        description:
+          'The scheduled program is withdrawn and archived: it never starts, is removed from the member catalogue and cannot be reactivated. No one can have enrolled yet and no sales can be recorded for it. To run it later, create a new program.',
+        confirm: 'Cancel program',
+        icon: Ban,
+        destructive: true,
+        reason: 'required',
+        done: 'Program cancelled',
+      };
   }
 }
 
@@ -102,14 +116,17 @@ export function ProgramLifecycleActions({ program }: { program: AdminProgramDeta
   const canWrite = can(Permission.ProgramsWrite);
   const actions = canPublish ? program.allowedActions : [];
   const failingChecks = program.publishChecks.filter((c) => !c.ok);
-  const primary = actions[0];
-  const secondary = actions.slice(1);
+  // Withdrawing a scheduled program is never the highlighted (filled) action.
+  const primary = actions[0] === 'cancel' ? undefined : actions[0];
+  const secondary = actions[0] === 'cancel' ? actions : actions.slice(1);
+  // The API refuses once the start has passed (the scheduler is about to activate the program).
+  const started = Date.parse(program.startsAt) <= now;
   const copy = pending && pending !== 'delete' ? actionCopy(pending, program, now) : null;
 
   async function run(action: ProgramLifecycleAction, reason?: string) {
     try {
       const updated = await lifecycle.mutateAsync({ action, reason, expectedVersion: program.version });
-      toast.success(`Program ${updated.status.toLowerCase()}`);
+      toast.success(actionCopy(action, program, now).done ?? `Program ${updated.status.toLowerCase()}`);
     } catch (error) {
       if (isApiError(error) && error.code === 'STALE_VERSION') {
         throw new Error('This program was changed by someone else. Close this dialog and try again with the latest version.');
@@ -121,15 +138,15 @@ export function ProgramLifecycleActions({ program }: { program: AdminProgramDeta
   const button = (action: ProgramLifecycleAction, variant: 'default' | 'outline') => {
     const c = actionCopy(action, program, now);
     const Icon = c.icon;
-    const blocked = action === 'publish' && failingChecks.length > 0;
+    const notReady = action === 'publish' && failingChecks.length > 0;
+    const tooLate = action === 'cancel' && started;
+    const title = notReady
+      ? `Not ready: ${failingChecks.map((f) => f.message).join('; ')}`
+      : tooLate
+        ? 'The start date has passed and the program is starting; pause or complete it once it is active.'
+        : undefined;
     return (
-      <Button
-        key={action}
-        variant={variant}
-        onClick={() => setPending(action)}
-        disabled={blocked}
-        title={blocked ? `Not ready: ${failingChecks.map((f) => f.message).join('; ')}` : undefined}
-      >
+      <Button key={action} variant={variant} onClick={() => setPending(action)} disabled={notReady || tooLate} title={title}>
         <Icon aria-hidden />
         {c.label}
       </Button>
@@ -170,6 +187,7 @@ export function ProgramLifecycleActions({ program }: { program: AdminProgramDeta
         title={copy?.title ?? ''}
         description={copy?.description}
         confirmLabel={copy?.confirm}
+        cancelLabel={pending === 'cancel' ? 'Keep program' : undefined}
         variant={copy?.destructive ? 'destructive' : 'default'}
         reason={copy ? (copy.reason === 'required' ? true : { required: false, label: 'Note (optional)' }) : undefined}
         onConfirm={({ reason }) => (pending && pending !== 'delete' ? run(pending, reason) : undefined)}

@@ -138,7 +138,7 @@ CI fills it only for the e2e runner.
 
 | Header | Source | Value |
 |---|---|---|
-| `Content-Security-Policy` | nginx default (pages); helmet (API) | `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; …` (+ `upgrade-insecure-requests` under TLS) |
+| `Content-Security-Policy` | nginx default (pages); helmet (API) | `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; …` (+ `upgrade-insecure-requests` under TLS) |
 | `X-Content-Type-Options` | Next `headers()`, helmet, nginx default | `nosniff` |
 | `Referrer-Policy` | Next, helmet, nginx default | `strict-origin-when-cross-origin` (helmet may use `no-referrer` for API responses) |
 | `X-Frame-Options` | Next, nginx default | `DENY` |
@@ -159,10 +159,17 @@ plugins, framing and foreign form targets, and relies on React escaping plus the
 cookie. If the web app later adopts nonces, it sends its own `Content-Security-Policy` and nginx
 automatically stops adding the default.
 
+**Why `img-src` allows `https:`.** Member avatars are external URLs chosen by the member
+(`PATCH /users/me`). The API accepts only absolute `https://` URLs (no `http:`, `data:` or
+`javascript:`), and images cannot execute script, so allowing any HTTPS image origin does not widen
+the XSS surface. The trade-off is that a viewer's browser fetches the avatar host directly (that
+host sees the viewer's IP and the page's origin, limited by `Referrer-Policy`). Scripts, styles,
+fonts, connections and frames stay restricted to `'self'`.
+
 ## 7. Authorization (RBAC)
 
 - Roles are SUPER_ADMIN, PROGRAM_ADMIN, FINANCE_REVIEWER and MEMBER
-  ([business-rules §3](business-rules.md#3-roles--permissions)). Permissions are keys in
+  ([business-rules §3](business-rules.md#3-roles-permissions-segregation-of-duties)). Permissions are keys in
   `@app/shared` (`Permission`, `ROLE_PERMISSIONS`), seeded into `roles` / `permissions` /
   `role_permissions`.
 - Every route is protected unless marked `@Public()`. Admin routes declare

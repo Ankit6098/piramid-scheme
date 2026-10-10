@@ -7,6 +7,7 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import {
+  ErrorCode,
   OTP_RESEND_COOLDOWN_SECONDS,
   verifyEmailSchema,
   type SessionUserDto,
@@ -19,6 +20,7 @@ import { applyApiFieldErrors, FormTextField } from '@/components/app/form';
 import { Button } from '@/components/ui/button';
 import { FieldGroup } from '@/components/ui/field';
 import { routes } from '@/config/routes';
+import { isApiError } from '@/lib/api-client';
 
 import { useResendVerification, useVerifyEmail } from '../api';
 import {
@@ -28,11 +30,14 @@ import {
   readPendingEmail,
 } from '../lib/navigation';
 import { FormErrorAlert, InfoAlert, ResendButton, SubmitButton } from './auth-bits';
-import { FormOtpField } from './form-fields';
+import { FormOtpField, FormPasswordField } from './form-fields';
 
 /**
- * Step 2 of registration: the 6-digit code from the email creates the account (and links the
- * sponsor, if a valid referral code was given) and signs the member in.
+ * Step 2 of registration: the 6-digit code from the email plus the password chosen at registration
+ * create the account (and link the sponsor, if a valid referral code was given) and sign the member
+ * in. The password is required so a code from somebody else's registration for this address can
+ * never activate an account with their password. Only the email is carried over from the register
+ * screen (sessionStorage); the password lives in form state only.
  */
 export function VerifyEmailForm() {
   const queryClient = useQueryClient();
@@ -44,7 +49,7 @@ export function VerifyEmailForm() {
 
   const form = useForm<VerifyEmailInput, unknown, VerifyEmailRequest>({
     resolver: zodResolver(verifyEmailSchema),
-    defaultValues: { email: '', code: '' },
+    defaultValues: { email: '', code: '', password: '' },
   });
 
   useEffect(() => {
@@ -64,7 +69,7 @@ export function VerifyEmailForm() {
         else finish(result.user);
       },
       onError: (error) => {
-        applyApiFieldErrors(error, form.setError, { knownFields: ['email', 'code'] });
+        applyApiFieldErrors(error, form.setError, { knownFields: ['email', 'code', 'password'] });
         form.setValue('code', '');
       },
     }),
@@ -106,11 +111,26 @@ export function VerifyEmailForm() {
     <>
       <AuthHeading
         title="Check your email"
-        description="Enter the 6-digit code we sent to your address. It expires in 10 minutes."
+        description="Enter the 6-digit code we sent to your address and confirm your password. The code expires in 10 minutes."
       />
       <div className="space-y-4">
         {verify.isError && !form.formState.errors.email ? (
           <FormErrorAlert error={verify.error} />
+        ) : null}
+        {verify.isError &&
+        isApiError(verify.error) &&
+        verify.error.code === ErrorCode.OtpInvalid ? (
+          <p className="text-sm text-muted-foreground">
+            Use the code from the latest email and the password you chose when you registered. If
+            you didn&apos;t start this registration or don&apos;t remember that password,{' '}
+            <Link
+              href={routes.auth.register}
+              className="font-medium text-primary underline-offset-4 hover:underline"
+            >
+              register again
+            </Link>
+            .
+          </p>
         ) : null}
         {resent && !verify.isError ? (
           <InfoAlert>
@@ -136,8 +156,19 @@ export function VerifyEmailForm() {
               autoFocus
               required
               onComplete={() => {
-                if (!verify.isPending) void onSubmit();
+                if (verify.isPending) return;
+                // Submit once the password is filled in; otherwise continue with the password.
+                if (form.getValues('password')) void onSubmit();
+                else form.setFocus('password');
               }}
+            />
+            <FormPasswordField
+              control={form.control}
+              name="password"
+              label="Confirm your password"
+              autoComplete="current-password"
+              description="The password you chose when you registered."
+              required
             />
             <SubmitButton pending={verify.isPending || verify.isSuccess}>
               Verify and continue

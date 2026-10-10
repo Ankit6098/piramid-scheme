@@ -144,7 +144,7 @@ export function programEditableFields(status: ProgramStatus): readonly ProgramEd
 }
 
 /** Manual lifecycle actions (`POST /admin/programs/:id/<action>`). */
-export const ProgramLifecycleAction = ['publish', 'pause', 'resume', 'complete', 'archive'] as const;
+export const ProgramLifecycleAction = ['publish', 'pause', 'resume', 'complete', 'archive', 'cancel'] as const;
 export type ProgramLifecycleAction = (typeof ProgramLifecycleAction)[number];
 
 /**
@@ -159,6 +159,8 @@ export const PROGRAM_LIFECYCLE_RULES: Readonly<
   resume: { from: ['PAUSED'], reasonRequired: false },
   complete: { from: ['ACTIVE', 'PAUSED'], reasonRequired: false },
   archive: { from: ['COMPLETED'], reasonRequired: false },
+  /** Withdraw a SCHEDULED program before its start date (→ ARCHIVED). */
+  cancel: { from: ['SCHEDULED'], reasonRequired: true },
 };
 
 export function programLifecycleActions(status: ProgramStatus): ProgramLifecycleAction[] {
@@ -260,6 +262,10 @@ export const pauseProgramSchema = z.object({
   reason: reasonSchema,
 });
 export type PauseProgramInput = z.infer<typeof pauseProgramSchema>;
+
+/** Body of cancel (SCHEDULED → ARCHIVED before the start date; reason required). */
+export const cancelProgramSchema = pauseProgramSchema;
+export type CancelProgramInput = z.infer<typeof cancelProgramSchema>;
 
 const statusFilter = z.union([z.enum(ProgramStatus), z.array(z.enum(ProgramStatus)).max(ProgramStatus.length)]);
 

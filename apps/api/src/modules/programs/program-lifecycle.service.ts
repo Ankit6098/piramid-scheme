@@ -14,7 +14,13 @@ import {
   type Tx,
 } from '../../common';
 import type { Prisma, ProgramStatus } from '../../generated/prisma/client';
-import { computeCompletionDates, evaluatePublishChecks, publishTargetStatus } from './domain/program-rules';
+import {
+  canCancelScheduled,
+  computeCancellationEndsAt,
+  computeCompletionDates,
+  evaluatePublishChecks,
+  publishTargetStatus,
+} from './domain/program-rules';
 import { lockProgram, setStatusReason } from './program-db';
 import { ProgramsService } from './programs.service';
 
@@ -24,6 +30,7 @@ const VERB: Record<ProgramLifecycleAction, string> = {
   resume: 'resumed',
   complete: 'completed',
   archive: 'archived',
+  cancel: 'cancelled',
 };
 
 export interface ScheduledTransitionResult {
@@ -34,8 +41,9 @@ export interface ScheduledTransitionResult {
 
 /**
  * Program lifecycle (business rules §4, DB state machine `trg_programs_guard`): manual publish /
- * pause / resume / complete / archive, and the scheduler's SCHEDULED → ACTIVE (at `startsAt`) and
- * ACTIVE|PAUSED → COMPLETED (at `endsAt`). Every change is logged by trigger in
+ * pause / resume / complete / archive / cancel (SCHEDULED → ARCHIVED before the start), and the
+ * scheduler's SCHEDULED → ACTIVE (at `startsAt`) and ACTIVE|PAUSED → COMPLETED (at `endsAt`).
+ * Every change is logged by trigger in
  * `program_status_changes` with the actor (`updated_by_id`, null = system) and the reason
  * (`app.status_reason`), and audited in the same transaction.
  */
@@ -115,6 +123,19 @@ export class ProgramLifecycleService {
         case 'archive':
           to = 'ARCHIVED';
           break;
+        case 'cancel': {
+          // Withdraw a published program that never started: no enrollments or sales can exist yet.
+          if (!canCancelScheduled(p, now)) {
+            throw invalidState('The start date has passed and the program is starting; pause or complete it instead', {
+              status: p.status,
+              action,
+            });
+          }
+          to = 'ARCHIVED';
+          const endsAt = computeCancellationEndsAt(p);
+          if (endsAt) data.endsAt = endsAt;
+          break;
+        }
       }
       data.status = to;
 

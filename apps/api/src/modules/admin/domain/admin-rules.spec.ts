@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildDailySeries,
+  checkAdminPasswordReset,
   checkStatusChange,
   diffRoles,
   escapeLike,
@@ -35,6 +36,26 @@ describe('checkStatusChange', () => {
     expect(checkStatusChange(superAdmin, member('ACTIVE'), 'reactivate')).toEqual({ allowed: false, reason: 'INVALID_STATUS' });
     expect(checkStatusChange(superAdmin, member('DEACTIVATED'), 'reactivate')).toEqual({ allowed: false, reason: 'INVALID_STATUS' });
     expect(checkStatusChange(superAdmin, member('SUSPENDED'), 'reactivate')).toEqual({ allowed: true });
+  });
+});
+
+describe('checkAdminPasswordReset', () => {
+  const member = (status: 'ACTIVE' | 'SUSPENDED' | 'DEACTIVATED' = 'ACTIVE') => ({ id: 'm', status });
+
+  it('is a SUPER_ADMIN action, for another account', () => {
+    expect(checkAdminPasswordReset(superAdmin, member())).toEqual({ allowed: true });
+    expect(checkAdminPasswordReset(superAdmin, { id: 'pa', status: 'ACTIVE' })).toEqual({ allowed: true });
+    expect(checkAdminPasswordReset(financeWithWrite, member())).toEqual({ allowed: false, reason: 'NOT_SUPER_ADMIN' });
+    expect(checkAdminPasswordReset({ userId: 'pa', roles: ['MEMBER', 'PROGRAM_ADMIN'] }, member())).toEqual({
+      allowed: false,
+      reason: 'NOT_SUPER_ADMIN',
+    });
+    expect(checkAdminPasswordReset(superAdmin, { id: 'sa', status: 'ACTIVE' })).toEqual({ allowed: false, reason: 'SELF' });
+  });
+
+  it('requires an ACTIVE target', () => {
+    expect(checkAdminPasswordReset(superAdmin, member('SUSPENDED'))).toEqual({ allowed: false, reason: 'INVALID_STATUS' });
+    expect(checkAdminPasswordReset(superAdmin, member('DEACTIVATED'))).toEqual({ allowed: false, reason: 'INVALID_STATUS' });
   });
 });
 

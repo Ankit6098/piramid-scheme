@@ -3,6 +3,7 @@
 import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
   AdminMemberDetailDto,
+  AdminMemberPasswordResetResultDto,
   AdminMemberRolesResultDto,
   AdminMemberStatusResultDto,
   RoleKey,
@@ -57,6 +58,22 @@ export function useUpdateMemberRoles(id: string) {
   return useMutation({
     mutationFn: (input: { roles: RoleKey[]; reason: string }) =>
       api.put<AdminMemberRolesResultDto>(`${ADMIN_MEMBERS_PATH}/${id}/roles`, input),
+    onSuccess: () => invalidate(),
+  });
+}
+
+/**
+ * `POST /admin/members/:id/password-reset` (Super Admin): emails the member a reset code and signs
+ * them out everywhere — the way to reset an admin-role account, whose self-service reset is disabled.
+ */
+export function useSendMemberPasswordReset(id: string) {
+  const invalidate = useInvalidateMember(id);
+  return useMutation({
+    mutationFn: (input: { reason: string }) =>
+      api.post<AdminMemberPasswordResetResultDto>(
+        `${ADMIN_MEMBERS_PATH}/${id}/password-reset`,
+        input,
+      ),
     onSuccess: () => invalidate(),
   });
 }

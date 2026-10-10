@@ -174,7 +174,13 @@ export interface AdminMemberDetailDto {
   /** OPEN flags; null when the caller is limited to assigned programs. */
   openFlags: AdminMemberFlagDto[] | null;
   /** What the caller may do with this member (UX hints; the API re-checks every action). */
-  can: { suspend: boolean; reactivate: boolean; changeRoles: boolean };
+  can: {
+    suspend: boolean;
+    reactivate: boolean;
+    changeRoles: boolean;
+    /** SUPER_ADMIN viewer, another account, ACTIVE (`POST /admin/members/:id/password-reset`). */
+    sendPasswordReset: boolean;
+  };
 }
 
 export const adminMemberStatusChangeSchema = z.object({ reason: reasonSchema });
@@ -198,6 +204,24 @@ export interface AdminMemberRolesResultDto {
 export interface AdminMemberStatusResultDto {
   id: string;
   status: UserStatus;
+  sessionsRevoked: number;
+}
+
+/**
+ * `POST /admin/members/:id/password-reset` (SUPER_ADMIN only, never yourself). Emails the member a
+ * PASSWORD_RESET code — also for admin-role accounts, whose self-service reset is disabled — and
+ * signs them out everywhere. The member finishes on the normal reset page.
+ */
+export const adminMemberPasswordResetSchema = z.object({ reason: reasonSchema });
+export type AdminMemberPasswordResetInput = z.infer<typeof adminMemberPasswordResetSchema>;
+
+export interface AdminMemberPasswordResetResultDto {
+  id: string;
+  /** Masked destination, e.g. `a***@e***.com`. */
+  sentTo: string;
+  /** When the emailed code expires (10 minutes). */
+  expiresAt: string;
+  /** Sessions of the member that were revoked. */
   sessionsRevoked: number;
 }
 

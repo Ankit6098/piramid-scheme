@@ -120,7 +120,7 @@ export interface LifecycleVariables {
   reason?: string;
 }
 
-/** publish / pause / resume / complete / archive. */
+/** publish / pause / resume / complete / archive / cancel (`POST /admin/programs/:id/<action>`). */
 export function useProgramLifecycle(id: string) {
   const queryClient = useQueryClient();
   const invalidate = useInvalidatePrograms();

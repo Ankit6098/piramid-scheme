@@ -31,7 +31,13 @@ import { ADMIN_ENROLLMENTS_PATH, useAdminCancelEnrollment, useRejectEnrollment }
 import { ActivateEnrollmentDialogContent } from './activate-enrollment-dialog';
 
 const ALL = 'ALL';
-type StatusFilter = EnrollmentStatus | typeof ALL;
+export type StatusFilter = EnrollmentStatus | typeof ALL;
+
+/** `?status=` value → filter (`undefined` when missing or unknown). */
+export function parseStatusFilter(value: string | null | undefined): StatusFilter | undefined {
+  if (value === ALL) return ALL;
+  return EnrollmentStatus.find((s) => s === value);
+}
 
 export interface AdminEnrollmentsTableProps {
   /** Restrict to one program (program detail tab); hides the program column and filter. */
@@ -39,13 +45,24 @@ export interface AdminEnrollmentsTableProps {
   /** Programs offered in the program filter (queue page). */
   programOptions?: readonly { value: string; label: string }[];
   defaultStatus?: StatusFilter;
+  /** Controlled status filter (e.g. kept in the URL); uncontrolled (starting at `defaultStatus`) when omitted. */
+  status?: StatusFilter;
+  onStatusChange?: (status: StatusFilter) => void;
 }
 
 type Decision = { kind: 'reject' | 'cancel'; enrollment: AdminEnrollmentDto };
 
 /** Enrollment list with activation (payment), rejection and cancellation. Scoped by the API. */
-export function AdminEnrollmentsTable({ programId, programOptions, defaultStatus = 'PENDING' }: AdminEnrollmentsTableProps) {
-  const [status, setStatus] = useState<StatusFilter>(defaultStatus);
+export function AdminEnrollmentsTable({
+  programId,
+  programOptions,
+  defaultStatus = 'PENDING',
+  status: controlledStatus,
+  onStatusChange,
+}: AdminEnrollmentsTableProps) {
+  const [localStatus, setLocalStatus] = useState<StatusFilter>(defaultStatus);
+  const status = controlledStatus ?? localStatus;
+  const setStatus = (next: StatusFilter) => (onStatusChange ? onStatusChange(next) : setLocalStatus(next));
   const [q, setQ] = useState('');
   const [program, setProgram] = useState<string | undefined>(programId);
   const query = useMemo(

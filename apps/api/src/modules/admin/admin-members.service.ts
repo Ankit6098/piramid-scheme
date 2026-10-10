@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import {
   ErrorCode,
+  isAdminRole,
   Permission,
   type AdminMemberDetailDto,
   type AdminMemberEnrollmentDto,
   type AdminMemberListItemDto,
   type AdminMemberListQuery,
+  type AdminMemberPasswordResetResultDto,
   type AdminMemberRolesResultDto,
   type AdminMemberRolesUpdateInput,
   type AdminMemberStatusResultDto,
@@ -25,6 +27,7 @@ import {
   hasPermission,
   invalidState,
   mapDbError,
+  maskEmail,
   notFound,
   paginate,
   PrismaService,
@@ -33,8 +36,19 @@ import {
   type Tx,
 } from '../../common';
 import { Prisma } from '../../generated/prisma/client';
+import { AuthService } from '../auth/auth.service';
+import { SecurityNoticesService } from '../auth/security-notices.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { checkStatusChange, diffRoles, escapeLike, normalizeRoles, type StatusAction, type StatusChangeRefusal } from './domain/admin-rules';
+import {
+  checkAdminPasswordReset,
+  checkStatusChange,
+  diffRoles,
+  escapeLike,
+  normalizeRoles,
+  type PasswordResetRefusal,
+  type StatusAction,
+  type StatusChangeRefusal,
+} from './domain/admin-rules';
 import { loadRewardSummary, toRewardSummaryDto } from './reward-summary';
 
 const cursorSchema = z.object({ createdAt: z.iso.datetime(), id: z.uuid() });
@@ -80,6 +94,17 @@ function refusalError(reason: StatusChangeRefusal, action: StatusAction): AppErr
   }
 }
 
+function passwordResetRefusalError(reason: PasswordResetRefusal): AppError {
+  switch (reason) {
+    case 'NOT_SUPER_ADMIN':
+      return forbidden('Only a Super Admin can send a password reset');
+    case 'SELF':
+      return forbidden('You cannot send a password reset to your own account. Change your password from your profile instead');
+    case 'INVALID_STATUS':
+      return invalidState('Only active accounts can reset their password');
+  }
+}
+
 /**
  * Admin member management (members:read / members:write / roles:assign). PROGRAM_ADMINs only see
  * members holding an enrollment in one of their programs (business rules §3); everything outside
@@ -94,6 +119,8 @@ export class AdminMembersService {
     private readonly audit: AuditService,
     private readonly sessions: SessionTokenService,
     private readonly notifications: NotificationsService,
+    private readonly authService: AuthService,
+    private readonly securityNotices: SecurityNoticesService,
   ) {}
 
   // ─── Queries ──────────────────────────────────────────────────────────────
@@ -293,6 +320,10 @@ export class AdminMembersService {
         suspend: canWrite && checkStatusChange(actor, target, 'suspend').allowed,
         reactivate: canWrite && checkStatusChange(actor, target, 'reactivate').allowed,
         changeRoles: hasPermission(auth, Permission.RolesAssign) && auth.userId !== user.id,
+        sendPasswordReset:
+          hasPermission(auth, Permission.MembersWrite) &&
+          hasPermission(auth, Permission.RolesAssign) &&
+          checkAdminPasswordReset(actor, target).allowed,
       },
     };
   }
@@ -397,6 +428,67 @@ export class AdminMembersService {
         dedupeKey: `account-roles:${entry.id}`,
       });
       return { roles: requested, granted, revoked, sessionsRevoked };
+    });
+  }
+
+  /**
+   * Admin-triggered password reset (business rules §2) — SUPER_ADMIN only, never yourself, ACTIVE
+   * accounts. Primarily for admin-role accounts, whose self-service reset is disabled. In one
+   * transaction: a PASSWORD_RESET code bound to the caller's session is emailed through the auth
+   * slice (`AuthService.issueAdminPasswordReset`, code limits → 429) → all of the member's sessions
+   * revoked → audit `member.password_reset.send` (reason) → every ACTIVE SUPER_ADMIN notified. The
+   * password itself is unchanged until the member enters the code on the normal reset page.
+   */
+  async sendPasswordReset(auth: AuthContext, id: string, reason: string): Promise<AdminMemberPasswordResetResultDto> {
+    const actor = { userId: auth.userId, roles: auth.roles };
+    // Role and self checks first: they do not depend on the target (no existence probe).
+    const early = checkAdminPasswordReset(actor, { id, status: 'ACTIVE' });
+    if (!early.allowed) throw passwordResetRefusalError(early.reason);
+
+    return this.prisma.runInTransaction(async (tx) => {
+      await this.assertInScope(tx, programScopeFilter(auth, 'read'), id);
+      const user = await tx.user.findUnique({
+        where: { id },
+        select: { id: true, email: true, fullName: true, status: true },
+      });
+      if (!user) throw notFound('Member');
+      const decision = checkAdminPasswordReset(actor, user);
+      if (!decision.allowed) throw passwordResetRefusalError(decision.reason);
+
+      const now = new Date();
+      const roles = await this.rolesOf(tx, id);
+      const adminAccount = roles.some(isAdminRole);
+      const issued = await this.authService.issueAdminPasswordReset(
+        tx,
+        { user: { id: user.id, email: user.email, fullName: user.fullName }, issuedBySessionId: auth.sessionId },
+        now,
+      );
+      const sessionsRevoked = await this.sessions.revokeAllForUser(tx, id, 'admin_password_reset');
+      const sentTo = maskEmail(user.email);
+      const entry = await this.audit.record(tx, {
+        action: 'member.password_reset.send',
+        resourceType: 'user',
+        resourceId: id,
+        after: {
+          challengeId: issued.challengeId,
+          sentTo,
+          expiresAt: issued.expiresAt,
+          adminAccount,
+          sessionsRevoked,
+        },
+        reason,
+      });
+      await this.securityNotices.notifySuperAdmins(tx, {
+        subjectUserId: id,
+        title: adminAccount ? 'Password reset sent to an admin account' : 'Password reset sent to a member account',
+        paragraphs: [
+          `${auth.fullName} sent a password reset code to the ${adminAccount ? 'admin ' : ''}account ${sentTo} and signed it out on every device.`,
+          `Reason: ${reason}`,
+          'The password changes only when the account owner enters the emailed code. If this was not expected, review the audit log.',
+        ],
+        dedupeKey: `admin-password-reset:${entry.id}`,
+      });
+      return { id, sentTo, expiresAt: issued.expiresAt.toISOString(), sessionsRevoked };
     });
   }
 

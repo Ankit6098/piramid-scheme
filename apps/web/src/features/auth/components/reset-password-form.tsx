@@ -24,7 +24,10 @@ import { forgetPendingEmail, readPendingEmail } from '../lib/navigation';
 import { FormErrorAlert, InfoAlert, ResendButton, SubmitButton } from './auth-bits';
 import { FormOtpField, FormPasswordField, NEW_PASSWORD_HINT } from './form-fields';
 
-/** Code from the email + a new password. Every signed-in device is signed out afterwards. */
+/**
+ * Code from the email + a new password. Every signed-in device is signed out afterwards. Also where
+ * admin-role accounts finish a reset a Super Admin sent them (they cannot request codes here).
+ */
 export function ResetPasswordForm() {
   const router = useRouter();
   const reset = useResetPassword();
@@ -110,6 +113,10 @@ export function ResetPasswordForm() {
             pending={resend.isPending}
             label="Send a new code"
           />
+          <span className="text-center text-xs">
+            Administrator accounts can&apos;t request codes themselves — if yours expired, ask a
+            Super Admin to send a new one.
+          </span>
           <Link
             href={routes.auth.login}
             className="text-primary underline-offset-4 hover:underline"

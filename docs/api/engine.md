@@ -90,7 +90,10 @@ names, notes, approval settings or authors.
 | GET | `/admin/events/:id` | rewards:read | – | `SaleEventDetailDto` — calculation (base, budget, ancestors with eligibility, steps, warnings), rewards, revisions |
 | POST | `/admin/events` | events:write | `recordSaleSchema`; optional `Idempotency-Key` | 201 new / 200 replay: `{ event: SaleEventDetailDto, outcome, replayed }` |
 
-`POST /admin/events/:id/reverse` (events:reverse) is owned by the rewards slice.
+`POST /admin/events/:id/reverse` (events:reverse) is documented in [finance.md](finance.md).
+
+The web "Record sale" sheet picks the credited member with a search over `GET /admin/members?q=&status=ACTIVE&limit=8`
+(members:read; name or email, or a pasted member id) and never offers the recorder themselves (recorder SoD).
 
 **Request.** `{ programId, type (PRODUCT_SALE | SERVICE_COMPLETED | SUBSCRIPTION_RENEWAL), externalId,
 customerReference, subjectUserId, amountMinor (> 0, program currency), currencyCode?, occurredAt,
@@ -127,6 +130,15 @@ window (`endsAt + lateEventGraceDays`) has closed; subject not ACTIVE + verified
 `outcome` ∈ `REWARDS_CREATED`, `NO_ELIGIBLE_RECIPIENTS`, `REJECTED`, `PENDING` (engine failed — the event stays
 RECEIVED), `REVERSED`. The scheduled job **`events-received-sweeper`** (every minute) re-runs the engine for
 events RECEIVED for more than 2 minutes (batch of 100, idempotent).
+
+**Engine transaction & the referral tree.** `processEvent` locks the event row `FOR UPDATE` (concurrent runs
+serialize; one calculation per event), skips it unless RECEIVED, then takes the referral tree lock in **shared**
+mode (`pg_advisory_xact_lock_shared(7301, 1)`, `lockReferralTreeShared`) until commit. A sponsor correction holds
+the same lock **exclusively**, so the two never interleave: a sale processed while a correction is in flight
+waits and is calculated on the corrected tree, and a correction waits for in-flight calculations — its "no
+RECEIVED sales in the moved subtree" check therefore cannot be overtaken by a sale processed on the old tree.
+Sales and registrations (also shared) still run in parallel. Lock order is event row → tree lock; corrections
+never lock event rows, so the order cannot deadlock.
 
 ## Integrations
 

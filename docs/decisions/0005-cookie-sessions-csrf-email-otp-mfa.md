@@ -1,6 +1,6 @@
 # ADR-0005: Cookie sessions, CSRF double-submit, email-OTP admin MFA
 
-- **Status:** Accepted
+- **Status:** Accepted. The "Admin MFA (email OTP)" section is superseded by [ADR-0009](0009-totp-admin-mfa-session-rotation.md) (TOTP for admin access, session rotation on elevation); email OTP remains only as the first-login bootstrap.
 - **Date:** 2026-10-09
 
 ## Context

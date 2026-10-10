@@ -8,10 +8,19 @@ import { PageHeader } from '@/components/app/page-header';
 import { api } from '@/lib/api-client';
 import { queryKeys } from '@/lib/query-keys';
 
-import { AdminEnrollmentsTable } from './admin-enrollments-table';
+import { useUrlState } from '../../finance/use-url-state';
+import { AdminEnrollmentsTable, parseStatusFilter, type StatusFilter } from './admin-enrollments-table';
 
-/** /admin/enrollments — queue of enrollments to activate (offline payments) or reject. */
+const URL_KEYS = ['status'] as const;
+const DEFAULT_STATUS: StatusFilter = 'PENDING';
+
+/**
+ * /admin/enrollments — queue of enrollments to activate (offline payments) or reject. The status
+ * filter lives in `?status=` (e.g. the admin overview links to `?status=PENDING`); default PENDING.
+ */
 export function AdminEnrollmentsPage() {
+  const [params, setParams] = useUrlState(URL_KEYS);
+  const status = parseStatusFilter(params.status) ?? DEFAULT_STATUS;
   // Programs the admin may see, for the program filter (program admins: assigned ones only).
   const programs = useQuery({
     queryKey: queryKeys.admin.programs({ purpose: 'enrollment-filter' }),
@@ -29,7 +38,12 @@ export function AdminEnrollmentsPage() {
         title="Enrollments"
         description="Members enroll in program plans. Free plans activate immediately; paid plans wait here until you record the offline payment. Plan payments never generate rewards."
       />
-      <AdminEnrollmentsTable programOptions={programOptions} />
+      <AdminEnrollmentsTable
+        programOptions={programOptions}
+        defaultStatus={DEFAULT_STATUS}
+        status={status}
+        onStatusChange={(next) => setParams({ status: next === DEFAULT_STATUS ? null : next })}
+      />
     </div>
   );
 }

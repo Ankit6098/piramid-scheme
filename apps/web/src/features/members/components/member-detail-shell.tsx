@@ -17,6 +17,7 @@ import { useSession } from '@/hooks/use-session';
 import { cn } from '@/lib/utils';
 
 import { useAdminMember } from '../api';
+import { MemberPasswordResetAction } from './member-password-reset-action';
 import { MemberRolesDialog } from './member-roles-dialog';
 import { MemberStatusAction } from './member-status-action';
 import { RoleBadges } from './role-badges';
@@ -75,6 +76,7 @@ export function MemberDetailShell({ children }: { children: ReactNode }) {
                 </Button>
               ) : null}
               {member.can.changeRoles ? <MemberRolesDialog member={member} /> : null}
+              <MemberPasswordResetAction member={member} />
               <MemberStatusAction member={member} />
             </div>
           </>

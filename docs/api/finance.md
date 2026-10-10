@@ -37,6 +37,13 @@ code, timezone), `recipient` (id, fullName), `event` (id, externalId, revision, 
 `viewer: { isRecipient, recordedSale }` — segregation-of-duties hints for the caller (the server enforces
 them regardless).
 
+**Web deep links** (`/admin/rewards`): `?tab=` (or its alias `?status=`, used by the admin overview) selects the
+status tab (`PENDING_APPROVAL` default, `POSTED`, `REJECTED`, `REVERSED`, `ALL`); `?recipientUserId=<uuid>`
+(member detail "View rewards") and `?event=<uuid>` (one sale) scope the list, counts and CSV export via the
+`recipientUserId` / `eventId` filters and open on the `ALL` tab unless a tab is given; `?reward=<id>` opens the
+detail drawer (ledger and reconciliation link with `?tab=ALL&reward=`). Malformed ids are ignored.
+`/admin/enrollments` keeps its status filter in `?status=` (`PENDING` default, any `EnrollmentStatus`, `ALL`).
+
 `AdminRewardDetailDto` adds: `event.customerReference/description/processedAt/reversedAt/reversalReason`,
 `policyVersion` (id, version, name, requiresApproval), `calculation` (snapshot: base, budget bps/amount,
 total allocated, points rate, engine version, outcome) with a readable **trace** (`levels[]`: level,
@@ -82,7 +89,9 @@ the batch and are reported per item with the same codes as the single endpoint (
 reward is then reversed, or waits and fails with 409), then every reward of the sale: `PENDING_APPROVAL` /
 `APPROVED` → `REJECTED` (reason `"Sale reversed: <reason>"`, rejectedBy = caller), `POSTED` → `REVERSED` with
 a compensating ledger transaction. Audits `event.reverse` plus one `reward.reject` / `reward.reverse` per
-reward; each affected member is notified. The DB refuses a commit that leaves live rewards.
+reward; each affected member is notified. The DB refuses a commit that leaves live rewards. In the web app,
+a reversal from the sales events page (like one from the rewards queue) refreshes the sales, the approval queue
+and its counts, the ledger, reconciliation and the admin overview counters.
 
 Errors (all decisions):
 

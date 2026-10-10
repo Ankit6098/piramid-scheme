@@ -28,9 +28,21 @@ import { BulkApproveBar } from './bulk-approve';
 import { RewardDecisionDialog, type RewardDecisionIntent, type RewardDecisionKind } from './reward-decision-dialog';
 import { RewardDetailSheet } from './reward-detail-sheet';
 
-const URL_KEYS = ['tab', 'program', 'level', 'q', 'from', 'to', 'reward'] as const;
+/**
+ * URL state. Deep links: `?status=` is an alias of `?tab=` (admin overview), `?recipientUserId=`
+ * (member detail) and `?event=` (a sale) scope the queue to one member's or one sale's rewards.
+ */
+const URL_KEYS = ['tab', 'status', 'program', 'level', 'q', 'from', 'to', 'reward', 'recipientUserId', 'event'] as const;
+type UrlKey = (typeof URL_KEYS)[number];
 const LEVEL_OPTIONS = Array.from({ length: 10 }, (_, i) => ({ value: String(i + 1), label: `Level ${i + 1}` }));
 type Tab = (typeof QUEUE_TABS)[number]['value'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const isTab = (value: string | undefined): value is Tab => QUEUE_TABS.some((t) => t.value === value);
+/** Malformed ids are ignored rather than sent to the API (which would answer 400). */
+const uuidParam = (value: string | undefined) => (value && UUID_RE.test(value) ? value : undefined);
+/** One member's or one sale's rewards open on "All"; the plain queue opens on "Pending approval". */
+const defaultTabFor = (scoped: boolean): Tab => (scoped ? 'ALL' : 'PENDING_APPROVAL');
 
 /** Admin approval queue: status tabs with counts, filters, bulk approve, decision dialogs, detail drawer. */
 export function AdminRewardsPage() {
@@ -41,7 +53,10 @@ export function AdminRewardsPage() {
     reverseEvent: can(Permission.EventsReverse),
   };
   const [filters, setFilters] = useUrlState(URL_KEYS);
-  const tab: Tab = QUEUE_TABS.some((t) => t.value === filters.tab) ? (filters.tab as Tab) : 'PENDING_APPROVAL';
+  const recipientUserId = uuidParam(filters.recipientUserId);
+  const eventId = uuidParam(filters.event);
+  const defaultTab = defaultTabFor(Boolean(recipientUserId || eventId));
+  const tab: Tab = isTab(filters.tab) ? filters.tab : isTab(filters.status) ? filters.status : defaultTab;
   const status = tab === 'ALL' ? undefined : tab;
   const range = localDayRange(filters.from, filters.to);
   const baseQuery = {
@@ -50,6 +65,8 @@ export function AdminRewardsPage() {
     q: filters.q,
     from: range.from,
     to: range.to,
+    recipientUserId,
+    eventId,
   };
   // The approval queue is first-in, first-out; the other tabs show the newest first.
   const order = tab === 'PENDING_APPROVAL' ? 'asc' : 'desc';
@@ -99,11 +116,19 @@ export function AdminRewardsPage() {
     [perms.approve, perms.reverse, perms.reverseEvent, selected, selectionEnabled, allSelected, someSelected, list.rows, setFilters],
   );
 
-  const hasFilters = Boolean(filters.program || filters.level || filters.q || filters.from || filters.to);
-  const changeFilters = (patch: Partial<Record<(typeof URL_KEYS)[number], string | null>>) => {
+  const hasFilters = Boolean(filters.program || filters.level || filters.q || filters.from || filters.to || recipientUserId || eventId);
+  const changeFilters = (patch: Partial<Record<UrlKey, string | null>>) => {
     setSelected(new Set());
-    setFilters(patch);
+    // Removing the member/sale scope changes the default tab: keep the tab the user is looking at.
+    const scopedAfter = Boolean(
+      ('recipientUserId' in patch ? patch.recipientUserId : recipientUserId) || ('event' in patch ? patch.event : eventId),
+    );
+    const pinTab = 'tab' in patch ? {} : { tab: tab === defaultTabFor(scopedAfter) ? null : tab, status: null };
+    setFilters({ ...pinTab, ...patch });
   };
+  // Names for the scope chips come from the (already filtered) rows; no extra request.
+  const recipientName = recipientUserId ? list.rows.find((r) => r.recipient.id === recipientUserId)?.recipient.fullName : undefined;
+  const eventLabel = eventId ? list.rows.find((r) => r.event.id === eventId)?.event.externalId : undefined;
 
   return (
     <div className="space-y-6">
@@ -117,7 +142,7 @@ export function AdminRewardsPage() {
         }
       />
 
-      <Tabs value={tab} onValueChange={(v) => changeFilters({ tab: v === 'PENDING_APPROVAL' ? null : v, reward: null })}>
+      <Tabs value={tab} onValueChange={(v) => changeFilters({ tab: v === defaultTab ? null : v, status: null, reward: null })}>
         <div className="-mx-1 overflow-x-auto px-1 pb-1">
           <TabsList aria-label="Reward status">
             {QUEUE_TABS.map((t) => {
@@ -187,11 +212,32 @@ export function AdminRewardsPage() {
                 </div>
                 <div className="flex w-full flex-wrap items-center gap-2">
                   <DateRangeFilter label="Created" from={filters.from} to={filters.to} onChange={(p) => changeFilters({ ...p, reward: null })} />
+                  {recipientUserId ? (
+                    <ScopeChip
+                      label="Recipient"
+                      value={recipientName ?? 'Selected member'}
+                      onClear={() => changeFilters({ recipientUserId: null, reward: null })}
+                    />
+                  ) : null}
+                  {eventId ? (
+                    <ScopeChip label="Sale" value={eventLabel ?? 'Selected sale'} onClear={() => changeFilters({ event: null, reward: null })} />
+                  ) : null}
                   {hasFilters ? (
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => changeFilters({ program: null, level: null, q: null, from: null, to: null, reward: null })}
+                      onClick={() =>
+                        changeFilters({
+                          program: null,
+                          level: null,
+                          q: null,
+                          from: null,
+                          to: null,
+                          recipientUserId: null,
+                          event: null,
+                          reward: null,
+                        })
+                      }
                     >
                       <X aria-hidden />
                       Clear filters
@@ -268,6 +314,19 @@ export function AdminRewardsPage() {
         }}
       />
     </div>
+  );
+}
+
+/** An active deep-link scope (one member or one sale) with a button to remove it. */
+function ScopeChip({ label, value, onClear }: { label: string; value: string; onClear: () => void }) {
+  return (
+    <span className="inline-flex h-7 max-w-full items-center gap-1 rounded-full border bg-muted/50 pr-0.5 pl-2.5 text-xs">
+      <span className="text-muted-foreground">{label}:</span>
+      <span className="truncate font-medium">{value}</span>
+      <Button variant="ghost" size="icon-xs" className="rounded-full" onClick={onClear} aria-label={`Remove ${label.toLowerCase()} filter`}>
+        <X aria-hidden />
+      </Button>
+    </span>
   );
 }
 

@@ -1,7 +1,8 @@
-import type { AdminMemberDetailDto, AdminMemberListItemDto, ApiPage } from '@app/shared';
+import type { AdminMemberDetailDto, AdminMemberListItemDto, AdminMemberPasswordResetResultDto, ApiPage } from '@app/shared';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthContext } from '../src/common/auth/auth-context';
 import { RequestContext } from '../src/common/context/request-context';
+import { CryptoService } from '../src/common/crypto/crypto.service';
 import { AdminMembersService } from '../src/modules/admin/admin-members.service';
 import { createTestApp, type TestApp } from './utils/app';
 import { disconnectTestPrisma, resetDatabase } from './utils/db';
@@ -165,7 +166,7 @@ describe('admin members', () => {
         referralCode: f.rahul.referralCode,
         sponsor: { id: f.anita.id, fullName: 'Anita Sharma', email: 'anita.sharma@example.test' },
         team: { directReferrals: 2, totalDescendants: 2 },
-        can: { suspend: true, reactivate: false, changeRoles: true },
+        can: { suspend: true, reactivate: false, changeRoles: true, sendPasswordReset: true },
       });
       expect(d.enrollments.map((e) => e.program.id).sort()).toEqual([f.p1.id]);
       expect(d.enrollments[0]).toMatchObject({ status: 'ACTIVE', priceMinor: '0', program: { currencyCode: 'INR' } });
@@ -185,7 +186,7 @@ describe('admin members', () => {
       const d = (await client.get(`/api/v1/admin/members/${f.rahul.id}`).expect(200)).body.data as AdminMemberDetailDto;
       expect(d.rewardSummary).toEqual([{ rewardUnit: 'MONEY', currencyCode: 'INR', earnedMinor: '10000', pendingMinor: '0', reversedMinor: '0' }]);
       expect(d.openFlags).toBeNull();
-      expect(d.can).toEqual({ suspend: false, reactivate: false, changeRoles: false });
+      expect(d.can).toEqual({ suspend: false, reactivate: false, changeRoles: false, sendPasswordReset: false });
       await client.get(`/api/v1/admin/members/${f.kiran.id}`).expect(404);
       await client.get(`/api/v1/admin/members/${f.admin.id}`).expect(404);
     });
@@ -367,6 +368,177 @@ describe('admin members', () => {
       });
       expect((await t.prisma.user.findUniqueOrThrow({ where: { id: f.admin.id } })).status).toBe('ACTIVE');
       expect(await t.prisma.auditLog.count({ where: { action: 'member.suspend' } })).toBe(0);
+    });
+  });
+
+  describe('POST /admin/members/:id/password-reset', () => {
+    const NEW_PASSWORD = 'Fresh-admin-pass-9';
+
+    async function openResetChallenge(email: string) {
+      return t.prisma.emailChallenge.findFirst({
+        where: { email, purpose: 'PASSWORD_RESET', consumedAt: null, invalidatedAt: null },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+
+    /** The code the worker would send: decrypts the outbox ciphertext of the open challenge. */
+    async function resetCode(email: string): Promise<string> {
+      const ch = await openResetChallenge(email);
+      if (!ch) throw new Error(`no open PASSWORD_RESET challenge for ${email}`);
+      const rows = await t.prisma.$queryRaw<Array<{ payload: { codeCiphertext: string } }>>`
+        SELECT "payload" FROM "outbox_messages" WHERE "topic" = 'email.otp' AND "payload"->>'challengeId' = ${ch.id}`;
+      return t.get(CryptoService).decryptOtpCode(rows[0]!.payload.codeCiphertext, ch.id);
+    }
+
+    const emailsTo = async (to: string) =>
+      (await t.prisma.outboxMessage.findMany({ where: { topic: 'email.send' }, orderBy: { createdAt: 'asc' } }))
+        .map((m) => m.payload as { to: string; data: { subject: string; paragraphs: string[] } })
+        .filter((p) => p.to === to);
+
+    it('emails an admin account a code despite the self-service block, signs it out, notifies Super Admins and audits; the owner completes the reset', async () => {
+      const otherSuper = await createUser(t.prisma, { fullName: 'Second Super', roles: ['SUPER_ADMIN'] });
+      const financeSession = await loginAs(t, f.finance);
+      await financeSession.get('/api/v1/auth/session').expect(200);
+      const admin = await loginAs(t, f.admin);
+
+      const res = await admin.post(`/api/v1/admin/members/${f.finance.id}/password-reset`).send({ reason: REASON }).expect(200);
+      const body = res.body.data as AdminMemberPasswordResetResultDto;
+      expect(body).toMatchObject({ id: f.finance.id, sessionsRevoked: 1 });
+      expect(body.sentTo).not.toBe(f.finance.email);
+      expect(body.sentTo).toContain('***');
+      expect(new Date(body.expiresAt).getTime()).toBeGreaterThan(Date.now() + 9 * 60_000);
+
+      // Code bound to the issuing SUPER_ADMIN session; the member is signed out everywhere.
+      const ch = await openResetChallenge(f.finance.email);
+      expect(ch).toMatchObject({ userId: f.finance.id, sessionId: admin.sessionId, attempts: 0 });
+      const revoked = await t.prisma.session.findUniqueOrThrow({ where: { id: financeSession.sessionId } });
+      expect(revoked.revokeReason).toBe('admin_password_reset');
+      await financeSession.get('/api/v1/auth/session').expect(401);
+      // The password itself is unchanged until the code is used.
+      expect((await t.prisma.user.findUniqueOrThrow({ where: { id: f.finance.id } })).passwordChangedAt).toBeNull();
+
+      const audit = await t.prisma.auditLog.findFirstOrThrow({ where: { action: 'member.password_reset.send', resourceId: f.finance.id } });
+      expect(audit).toMatchObject({ actorUserId: f.admin.id, resourceType: 'user', reason: REASON });
+      expect(audit.after).toMatchObject({ challengeId: ch!.id, sentTo: body.sentTo, adminAccount: true, sessionsRevoked: 1 });
+      expect(JSON.stringify(audit.after)).not.toContain(f.finance.email);
+
+      // Owner: the code (OTP outbox, ciphertext only) + an explanatory notice. Every SUPER_ADMIN (incl. the actor) is told.
+      const toOwner = await emailsTo(f.finance.email);
+      expect(toOwner.map((e) => e.data.subject)).toEqual(['An administrator started a password reset for your account']);
+      for (const superAdmin of [f.admin, otherSuper]) {
+        const notices = await emailsTo(superAdmin.email);
+        expect(notices.map((e) => e.data.subject)).toEqual(['Security notice: Password reset sent to an admin account']);
+        expect(notices[0]!.data.paragraphs.join(' ')).toContain(REASON);
+        expect(JSON.stringify(notices[0])).not.toContain(f.finance.email);
+      }
+      const inApp = (await t.prisma.outboxMessage.findMany({ where: { topic: 'notification.create' } })).map(
+        (m) => m.payload as { userId: string; type: string },
+      );
+      expect(inApp).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ userId: f.finance.id, type: 'security.password_reset_started' }),
+          expect.objectContaining({ userId: otherSuper.id, type: 'security.admin_account' }),
+          expect.objectContaining({ userId: f.admin.id, type: 'security.admin_account' }),
+        ]),
+      );
+
+      // The owner finishes on the normal reset page — accepted for an admin account because a SUPER_ADMIN issued it.
+      const code = await resetCode(f.finance.email);
+      await t
+        .client()
+        .post('/api/v1/auth/password/reset')
+        .send({ email: f.finance.email, code, newPassword: NEW_PASSWORD })
+        .expect(200);
+      const login = await t.client().post('/api/v1/auth/login').send({ email: f.finance.email, password: NEW_PASSWORD }).expect(200);
+      expect(login.body.data.mfaRequired).toBe(true);
+      const done = await t.prisma.auditLog.findFirstOrThrow({ where: { action: 'user.password.reset', resourceId: f.finance.id } });
+      expect(done.after).toEqual({ adminInitiated: true, initiatedByUserId: f.admin.id });
+      expect((await emailsTo(otherSuper.email)).map((e) => e.data.subject)).toContain(
+        'Security notice: Admin account password reset completed',
+      );
+    });
+
+    it('accepts a code for an admin account only when an ACTIVE Super Admin (still) stands behind it', async () => {
+      // (a) a self-service code issued while the account was a plain member, then the member became an admin
+      const promoted = await createUser(t.prisma, { fullName: 'Promoted Later' });
+      await t.client().post('/api/v1/auth/password/forgot').send({ email: promoted.email }).expect(202);
+      const selfServiceCode = await resetCode(promoted.email);
+      const role = await t.prisma.role.findUniqueOrThrow({ where: { key: 'PROGRAM_ADMIN' } });
+      await t.prisma.userRole.create({ data: { userId: promoted.id, roleId: role.id, grantedById: f.admin.id } });
+      const refused = await t
+        .client()
+        .post('/api/v1/auth/password/reset')
+        .send({ email: promoted.email, code: selfServiceCode, newPassword: NEW_PASSWORD })
+        .expect(400);
+      expect(refused.body.error.code).toBe('OTP_INVALID');
+      expect((await t.prisma.user.findUniqueOrThrow({ where: { id: promoted.id } })).passwordChangedAt).toBeNull();
+
+      // (b) issued by a SUPER_ADMIN who lost the role before the owner used the code
+      const issuer = await createUser(t.prisma, { fullName: 'Soon Demoted', roles: ['SUPER_ADMIN'] });
+      await (await loginAs(t, issuer)).post(`/api/v1/admin/members/${f.programAdmin.id}/password-reset`).send({ reason: REASON }).expect(200);
+      const code = await resetCode(f.programAdmin.email);
+      await t.prisma.userRole.deleteMany({ where: { userId: issuer.id, role: { key: 'SUPER_ADMIN' } } });
+      await t
+        .client()
+        .post('/api/v1/auth/password/reset')
+        .send({ email: f.programAdmin.email, code, newPassword: NEW_PASSWORD })
+        .expect(400);
+      expect(await t.prisma.auditLog.count({ where: { action: 'user.password.reset' } })).toBe(0);
+    });
+
+    it('works for a plain member too, and enforces the code limits without side effects when refused', async () => {
+      const admin = await loginAs(t, f.admin);
+      await admin.post(`/api/v1/admin/members/${f.priya.id}/password-reset`).send({ reason: REASON }).expect(200);
+      const memberSession = await loginAs(t, f.priya);
+
+      const again = await admin.post(`/api/v1/admin/members/${f.priya.id}/password-reset`).send({ reason: REASON }).expect(429);
+      expect(again.body.error.code).toBe('OTP_COOLDOWN');
+      expect(Number(again.headers['retry-after'])).toBeGreaterThan(0);
+      // Refused → rolled back: the new session survives, no second code, no second audit entry.
+      await memberSession.get('/api/v1/auth/session').expect(200);
+      expect(await t.prisma.emailChallenge.count({ where: { email: f.priya.email, purpose: 'PASSWORD_RESET' } })).toBe(1);
+      expect(await t.prisma.auditLog.count({ where: { action: 'member.password_reset.send' } })).toBe(1);
+
+      const code = await resetCode(f.priya.email);
+      await t.client().post('/api/v1/auth/password/reset').send({ email: f.priya.email, code, newPassword: NEW_PASSWORD }).expect(200);
+      await memberSession.get('/api/v1/auth/session').expect(401);
+      await t.client().post('/api/v1/auth/login').send({ email: f.priya.email, password: NEW_PASSWORD }).expect(200);
+      const done = await t.prisma.auditLog.findFirstOrThrow({ where: { action: 'user.password.reset', resourceId: f.priya.id } });
+      expect(done.after).toEqual({ adminInitiated: true, initiatedByUserId: f.admin.id });
+    });
+
+    it('is Super Admin only, never yourself, ACTIVE accounts only; validates the reason and needs CSRF', async () => {
+      const path = (id: string) => `/api/v1/admin/members/${id}/password-reset`;
+      for (const user of [f.finance, f.programAdmin]) {
+        const res = await (await loginAs(t, user)).post(path(f.priya.id)).send({ reason: REASON }).expect(403);
+        expect(res.body.error.details.missingPermissions).toEqual(expect.arrayContaining(['members:write']));
+      }
+      // Even with both permissions granted to another role, the role check holds.
+      const role = await t.prisma.role.findUniqueOrThrow({ where: { key: 'FINANCE_REVIEWER' } });
+      const perms = await t.prisma.permission.findMany({ where: { key: { in: ['members:write', 'roles:assign'] } } });
+      await t.prisma.rolePermission.createMany({ data: perms.map((p) => ({ roleId: role.id, permissionId: p.id })) });
+      const notSuper = await (await loginAs(t, f.finance)).post(path(f.priya.id)).send({ reason: REASON }).expect(403);
+      expect(notSuper.body.error.message).toMatch(/Only a Super Admin/);
+
+      const admin = await loginAs(t, f.admin);
+      const self = await admin.post(path(f.admin.id)).send({ reason: REASON }).expect(403);
+      expect(self.body.error.message).toMatch(/your own account/);
+      const short = await admin.post(path(f.priya.id)).send({ reason: 'short' }).expect(400);
+      expect(short.body.error.code).toBe('VALIDATION_FAILED');
+      await admin.post(path('00000000-0000-4000-8000-000000000000')).send({ reason: REASON }).expect(404);
+      const csrf = await admin.withoutCsrf().post(path(f.priya.id)).send({ reason: REASON }).expect(403);
+      expect(csrf.body.error.code).toBe('CSRF_FAILED');
+
+      await admin.post(`/api/v1/admin/members/${f.priya.id}/suspend`).send({ reason: REASON }).expect(200);
+      const suspended = await admin.post(path(f.priya.id)).send({ reason: REASON }).expect(409);
+      expect(suspended.body.error.code).toBe('INVALID_STATE_TRANSITION');
+      const detail = (await admin.get(`/api/v1/admin/members/${f.priya.id}`).expect(200)).body.data as AdminMemberDetailDto;
+      expect(detail.can.sendPasswordReset).toBe(false);
+      const selfDetail = (await admin.get(`/api/v1/admin/members/${f.admin.id}`).expect(200)).body.data as AdminMemberDetailDto;
+      expect(selfDetail.can.sendPasswordReset).toBe(false);
+
+      expect(await t.prisma.emailChallenge.count({ where: { purpose: 'PASSWORD_RESET' } })).toBe(0);
+      expect(await t.prisma.auditLog.count({ where: { action: 'member.password_reset.send' } })).toBe(0);
     });
   });
 });

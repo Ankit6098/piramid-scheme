@@ -47,6 +47,7 @@ programs. Anything outside the scope behaves as missing (404), filtering by an u
 | POST | `/admin/members/:id/suspend` | members:write | `{ reason }` (10..1000 chars) | `{ id, status: "SUSPENDED", sessionsRevoked }` |
 | POST | `/admin/members/:id/reactivate` | members:write | `{ reason }` | `{ id, status: "ACTIVE", sessionsRevoked: 0 }` |
 | PUT | `/admin/members/:id/roles` | roles:assign | `{ roles: RoleKey[], reason }` — the complete role set (MEMBER is always kept) | `{ roles, granted, revoked, sessionsRevoked }` |
+| POST | `/admin/members/:id/password-reset` | members:write + roles:assign, **SUPER_ADMIN role** | `{ reason }` (10..1000 chars) | `{ id, sentTo (masked), expiresAt, sessionsRevoked }` |
 
 **Search.** `q` is matched case-insensitively against `full_name` and `email` with `ILIKE '%q%'` (served by the
 `pg_trgm` GIN indexes; `%`, `_` and `\` are matched literally). Sort `(createdAt desc, id desc)`; the cursor is
@@ -61,8 +62,8 @@ is 0 for program-scoped callers. Emails are visible to admins; secrets never are
 assignments), `hasTotpFactor`, `referralCode`, `sponsor { id, fullName, email } | null`,
 `team { directReferrals, totalDescendants }`, `enrollments` (scoped; option name and price from the immutable
 snapshot), `rewardSummary: RewardSummaryBucketDto[]` (scoped; earned from the ledger, see below),
-`openFlags` (`null` for program-scoped callers) and `can { suspend, reactivate, changeRoles }` (UI hints; every
-action is re-checked).
+`openFlags` (`null` for program-scoped callers) and `can { suspend, reactivate, changeRoles, sendPasswordReset }`
+(UI hints; every action is re-checked).
 
 **Suspend / reactivate rules.** Not your own account (403); only a SUPER_ADMIN may suspend or reactivate a user
 holding an admin role (403); suspend requires ACTIVE, reactivate requires SUSPENDED (409
@@ -78,7 +79,22 @@ roles deleted, **all the member's sessions revoked** (`roles_changed`), audit `m
 (`account.roles_changed`). PROGRAM_ADMIN program assignments are managed on the programs side
 (`PUT /admin/programs/:id/admins`).
 
-**Last Super Admin.** Both commands lock the SUPER_ADMIN `roles` row (the row the DB trigger locks), then check
+**Admin-triggered password reset.** Self-service reset is disabled for admin-role accounts
+([business rules §2](../business-rules.md#2-accounts--authentication)); this is how they recover (it works for
+plain members too). Only a SUPER_ADMIN (both permissions **and** the role — `403` "Only a Super Admin…"
+otherwise), never for yourself (`403`), ACTIVE accounts only (`409 INVALID_STATE_TRANSITION`), unknown id
+`404`. One transaction: `AuthService.issueAdminPasswordReset` emails a `PASSWORD_RESET` code (OtpMailer; the
+challenge records the caller's session as issuer) plus an "an administrator started a password reset" notice
+(email + in-app `security.password_reset_started`) → **all the member's sessions revoked**
+(`admin_password_reset`) → audit `member.password_reset.send` (`after.{challengeId, sentTo (masked), expiresAt,
+adminAccount, sessionsRevoked}`, the reason) → every ACTIVE SUPER_ADMIN (including the caller) gets an email +
+in-app notice with the masked address and the reason. The code limits apply explicitly: `429 OTP_COOLDOWN`
+(60 s), `429 RATE_LIMITED` (5/hour), `429 OTP_TOO_MANY_ATTEMPTS` (24 h block), each with `Retry-After` —
+refused requests change nothing. The password is unchanged until the member submits the code on
+`/reset-password` (`POST /auth/password/reset`), which for admin accounts accepts only codes issued this way
+by a still-ACTIVE SUPER_ADMIN (see [identity.md](identity.md#post-authpasswordreset--public--limit-auth--200)).
+
+**Last Super Admin.** The status and role commands lock the SUPER_ADMIN `roles` row (the row the DB trigger locks), then check
 that another ACTIVE SUPER_ADMIN remains before removing/suspending one. The deferred DB trigger is the backstop;
 either way the response is 409 `INVARIANT_VIOLATION` with message "At least one active Super Admin must
 remain…" and `details.rule = "LAST_SUPER_ADMIN"`.

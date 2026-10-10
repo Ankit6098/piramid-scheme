@@ -8,6 +8,8 @@ import {
   programLifecycleActions,
 } from '@app/shared';
 import {
+  canCancelScheduled,
+  computeCancellationEndsAt,
   computeCompletionDates,
   evaluatePublishChecks,
   isEnrollmentWindowOpen,
@@ -113,7 +115,7 @@ describe('status rules', () => {
 
   it('lists manual lifecycle actions per status (DB state machine)', () => {
     expect(programLifecycleActions('DRAFT')).toEqual(['publish']);
-    expect(programLifecycleActions('SCHEDULED')).toEqual([]);
+    expect(programLifecycleActions('SCHEDULED')).toEqual(['cancel']);
     expect(programLifecycleActions('ACTIVE')).toEqual(['pause', 'complete']);
     expect(programLifecycleActions('PAUSED')).toEqual(['resume', 'complete']);
     expect(programLifecycleActions('COMPLETED')).toEqual(['archive']);
@@ -174,6 +176,33 @@ describe('computeCompletionDates', () => {
     expect(late.endsAt).toEqual(now);
     expect(late.enrollmentClosesAt).toEqual(now);
     expect(late.enrollmentOpensAt!.getTime()).toBeLessThan(now.getTime());
+  });
+});
+
+describe('cancelling a scheduled program', () => {
+  const SEC = 1_000;
+
+  it('keeps an existing end date', () => {
+    expect(computeCancellationEndsAt({ startsAt: at(5), endsAt: at(40), enrollmentOpensAt: at(5), enrollmentClosesAt: at(20) })).toBeNull();
+  });
+
+  it('ends one second after the start when no end is set and enrollment fits', () => {
+    expect(computeCancellationEndsAt({ startsAt: at(5), endsAt: null, enrollmentOpensAt: at(2), enrollmentClosesAt: null })).toEqual(
+      new Date(at(5).getTime() + SEC),
+    );
+  });
+
+  it('moves the end past the enrollment window so the date CHECKs hold', () => {
+    expect(computeCancellationEndsAt({ startsAt: at(5), endsAt: null, enrollmentOpensAt: at(7), enrollmentClosesAt: null })).toEqual(
+      new Date(at(7).getTime() + SEC),
+    );
+    expect(computeCancellationEndsAt({ startsAt: at(5), endsAt: null, enrollmentOpensAt: at(5), enrollmentClosesAt: at(30) })).toEqual(at(30));
+  });
+
+  it('is allowed only for SCHEDULED programs whose start is still ahead', () => {
+    expect(canCancelScheduled({ status: 'SCHEDULED', startsAt: at(1) }, now)).toBe(true);
+    expect(canCancelScheduled({ status: 'SCHEDULED', startsAt: now }, now)).toBe(false);
+    expect(canCancelScheduled({ status: 'ACTIVE', startsAt: at(1) }, now)).toBe(false);
   });
 });
 

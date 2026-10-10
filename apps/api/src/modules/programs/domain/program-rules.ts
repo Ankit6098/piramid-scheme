@@ -85,6 +85,24 @@ export function computeCompletionDates(p: ProgramDates, now: Date): Partial<Prog
   return patch;
 }
 
+/**
+ * Cancelling a SCHEDULED program (→ ARCHIVED) needs an end date (DB CHECK for ARCHIVED). Keeps an
+ * existing `endsAt`; otherwise the earliest instant that satisfies the date CHECKs without touching
+ * the other dates: strictly after `startsAt` (by one second) and `enrollmentOpensAt`, and not before
+ * `enrollmentClosesAt`. Returns `null` when `endsAt` stays as it is.
+ */
+export function computeCancellationEndsAt(p: ProgramDates): Date | null {
+  if (p.endsAt !== null) return null;
+  return new Date(
+    Math.max(p.startsAt.getTime() + 1_000, p.enrollmentOpensAt.getTime() + 1_000, p.enrollmentClosesAt?.getTime() ?? 0),
+  );
+}
+
+/** A SCHEDULED program can be cancelled only while its start is still ahead (else it is starting). */
+export function canCancelScheduled(p: { status: ProgramStatus; startsAt: Date }, now: Date): boolean {
+  return p.status === 'SCHEDULED' && p.startsAt.getTime() > now.getTime();
+}
+
 /** Program enrollment window is open at `now` (status checked separately). */
 export function isEnrollmentWindowOpen(p: Pick<ProgramDates, 'enrollmentOpensAt' | 'enrollmentClosesAt'>, now: Date): boolean {
   if (now.getTime() < p.enrollmentOpensAt.getTime()) return false;

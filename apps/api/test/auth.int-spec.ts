@@ -81,7 +81,7 @@ describe('auth: registration, verification, login, password reset', () => {
     const c = anon();
     await register(c, { email, ...(referralCode ? { referralCode } : {}) }).expect(202);
     const { code } = await latestCode(email, 'EMAIL_VERIFICATION');
-    const res = await c.post('/api/v1/auth/verify-email').send({ email, code }).expect(200);
+    const res = await c.post('/api/v1/auth/verify-email').send({ email, code, password: PASSWORD }).expect(200);
     return { res, token: cookieFrom(res, SESSION_COOKIE)! };
   }
 
@@ -158,7 +158,7 @@ describe('auth: registration, verification, login, password reset', () => {
       expect(await t.prisma.referralRelationship.count({ where: { sponsorUserId: sponsor.id } })).toBe(0);
 
       const { code, challengeId } = await latestCode(email, 'EMAIL_VERIFICATION');
-      const res = await c.post('/api/v1/auth/verify-email').send({ email, code: `${code.slice(0, 3)} ${code.slice(3)}` }).expect(200);
+      const res = await c.post('/api/v1/auth/verify-email').send({ email, code: `${code.slice(0, 3)} ${code.slice(3)}`, password: PASSWORD }).expect(200);
       expect(res.body.data.referral).toEqual({ applied: true, codeNoLongerValid: false });
       expect(res.body.data.user).toMatchObject({
         email,
@@ -212,7 +212,7 @@ describe('auth: registration, verification, login, password reset', () => {
       await register(c, { email, referralCode: sponsor.referralCode }).expect(202);
       await t.prisma.referralCode.update({ where: { id: sponsor.referralCodeId }, data: { isActive: false } });
       const { code } = await latestCode(email, 'EMAIL_VERIFICATION');
-      const res = await c.post('/api/v1/auth/verify-email').send({ email, code }).expect(200);
+      const res = await c.post('/api/v1/auth/verify-email').send({ email, code, password: PASSWORD }).expect(200);
       expect(res.body.data.referral).toEqual({ applied: false, codeNoLongerValid: true });
       const user = await t.prisma.user.findUniqueOrThrow({ where: { email } });
       expect(await t.prisma.referralRelationship.count({ where: { childUserId: user.id } })).toBe(0);
@@ -238,16 +238,62 @@ describe('auth: registration, verification, login, password reset', () => {
       const old = await t.prisma.emailChallenge.findUniqueOrThrow({ where: { id: attackerCode.challengeId } });
       expect(old.invalidatedAt).not.toBeNull();
       expect(old.pendingPasswordHash).toBeNull();
-      expect((await owner.post('/api/v1/auth/verify-email').send({ email: victim, code: attackerCode.code })).body.error.code).toBe(
+      expect((await owner.post('/api/v1/auth/verify-email').send({ email: victim, code: attackerCode.code, password: PASSWORD })).body.error.code).toBe(
         'OTP_INVALID',
       );
 
       const ownerCode = await latestCode(victim, 'EMAIL_VERIFICATION');
-      await owner.post('/api/v1/auth/verify-email').send({ email: victim, code: ownerCode.code }).expect(200);
+      await owner.post('/api/v1/auth/verify-email').send({ email: victim, code: ownerCode.code, password: PASSWORD }).expect(200);
       const user = await t.prisma.user.findUniqueOrThrow({ where: { email: victim } });
       const rel = await t.prisma.referralRelationship.findUniqueOrThrow({ where: { childUserId: user.id } });
       expect(rel.sponsorUserId).toBe(ownerSponsor.id);
       expect(await t.prisma.referralRelationship.count({ where: { sponsorUserId: attackerSponsor.id } })).toBe(0);
+      expect((await anon().post('/api/v1/auth/login').send({ email: victim, password: 'Attacker-pass-1' })).status).toBe(401);
+      await anon().post('/api/v1/auth/login').send({ email: victim, password: PASSWORD }).expect(200);
+    });
+
+    it("requires the registration password: a code from someone else's registration never activates the account", async () => {
+      const victim = uniqueEmail('victim-pw');
+      // The attacker registers the victim's address with THEIR password; the code lands in the victim's mailbox.
+      await register(anon(), { email: victim, password: 'Attacker-pass-1' }).expect(202);
+      const attackerRegistration = await latestCode(victim, 'EMAIL_VERIFICATION');
+
+      // The victim enters that code with their own password → refused exactly like a wrong code.
+      const owner = anon();
+      const refused = await owner
+        .post('/api/v1/auth/verify-email')
+        .send({ email: victim, code: attackerRegistration.code, password: PASSWORD })
+        .expect(400);
+      const wrong = await owner
+        .post('/api/v1/auth/verify-email')
+        .send({ email: victim, code: wrongCode(attackerRegistration.code), password: PASSWORD })
+        .expect(400);
+      expect(refused.body.error.code).toBe('OTP_INVALID');
+      expect(refused.body.error.message).toBe(wrong.body.error.message);
+      expect(cookieFrom(refused, SESSION_COOKIE)).toBeNull();
+      expect(await t.prisma.user.count({ where: { email: victim } })).toBe(0);
+      // Both count as failed attempts; the code was not consumed.
+      const ch = await t.prisma.emailChallenge.findUniqueOrThrow({ where: { id: attackerRegistration.challengeId } });
+      expect(ch).toMatchObject({ attempts: 2, consumedAt: null });
+
+      // The password is required (validation), never stored in the challenge in plaintext.
+      const missing = await owner.post('/api/v1/auth/verify-email').send({ email: victim, code: attackerRegistration.code }).expect(400);
+      expect(missing.body.error.code).toBe('VALIDATION_FAILED');
+      expect(JSON.stringify(ch)).not.toContain(PASSWORD);
+
+      // The victim registers themselves → the attacker's payload is replaced; only their own password works.
+      await register(owner, { email: victim }).expect(202);
+      const ownRegistration = await latestCode(victim, 'EMAIL_VERIFICATION');
+      expect(ownRegistration.challengeId).not.toBe(attackerRegistration.challengeId);
+      await owner
+        .post('/api/v1/auth/verify-email')
+        .send({ email: victim, code: ownRegistration.code, password: 'Attacker-pass-1' })
+        .expect(400);
+      const res = await owner
+        .post('/api/v1/auth/verify-email')
+        .send({ email: victim, code: ownRegistration.code, password: PASSWORD })
+        .expect(200);
+      expect(res.body.data.user.email).toBe(victim);
       expect((await anon().post('/api/v1/auth/login').send({ email: victim, password: 'Attacker-pass-1' })).status).toBe(401);
       await anon().post('/api/v1/auth/login').send({ email: victim, password: PASSWORD }).expect(200);
     });
@@ -258,10 +304,10 @@ describe('auth: registration, verification, login, password reset', () => {
       await register(c, { email }).expect(202);
       const { code, challengeId } = await latestCode(email, 'EMAIL_VERIFICATION');
       for (let i = 0; i < 5; i++) {
-        const res = await c.post('/api/v1/auth/verify-email').send({ email, code: wrongCode(code) }).expect(400);
+        const res = await c.post('/api/v1/auth/verify-email').send({ email, code: wrongCode(code), password: PASSWORD }).expect(400);
         expect(res.body.error.code).toBe('OTP_INVALID');
       }
-      const last = await c.post('/api/v1/auth/verify-email').send({ email, code }).expect(400);
+      const last = await c.post('/api/v1/auth/verify-email').send({ email, code, password: PASSWORD }).expect(400);
       expect(last.body.error.code).toBe('OTP_INVALID');
       expect((await t.prisma.emailChallenge.findUniqueOrThrow({ where: { id: challengeId } })).attempts).toBe(5);
       expect(await t.prisma.user.count({ where: { email } })).toBe(0);
@@ -277,8 +323,8 @@ describe('auth: registration, verification, login, password reset', () => {
         where: { id: challengeId },
         data: { createdAt: new Date(now - 20 * 60_000), expiresAt: new Date(now - 10 * 60_000) },
       });
-      const expired = await c.post('/api/v1/auth/verify-email').send({ email, code }).expect(400);
-      const unknown = await c.post('/api/v1/auth/verify-email').send({ email: uniqueEmail('nobody'), code }).expect(400);
+      const expired = await c.post('/api/v1/auth/verify-email').send({ email, code, password: PASSWORD }).expect(400);
+      const unknown = await c.post('/api/v1/auth/verify-email').send({ email: uniqueEmail('nobody'), code, password: PASSWORD }).expect(400);
       expect(expired.body.error.code).toBe('OTP_INVALID');
       expect(expired.body.error.message).toBe(unknown.body.error.message);
 
@@ -288,7 +334,7 @@ describe('auth: registration, verification, login, password reset', () => {
       expect(res.status).toBe(200);
       const used = await t.prisma.emailChallenge.findFirstOrThrow({ where: { email: other, consumedAt: { not: null } } });
       expect(used).toBeTruthy();
-      const again = await anon().post('/api/v1/auth/verify-email').send({ email: other, code: '123456' }).expect(400);
+      const again = await anon().post('/api/v1/auth/verify-email').send({ email: other, code: '123456', password: PASSWORD }).expect(400);
       expect(again.body.error.code).toBe('OTP_INVALID');
       expect(await t.prisma.user.count({ where: { email: other } })).toBe(1);
     });
@@ -298,7 +344,7 @@ describe('auth: registration, verification, login, password reset', () => {
       const c = anon();
       const fail = async (n: number) => {
         const { code } = await latestCode(email, 'EMAIL_VERIFICATION');
-        for (let i = 0; i < n; i++) await c.post('/api/v1/auth/verify-email').send({ email, code: wrongCode(code) }).expect(400);
+        for (let i = 0; i < n; i++) await c.post('/api/v1/auth/verify-email').send({ email, code: wrongCode(code), password: PASSWORD }).expect(400);
       };
       await register(c, { email }).expect(202);
       await fail(5);
@@ -307,7 +353,7 @@ describe('auth: registration, verification, login, password reset', () => {
       await register(c, { email }).expect(202);
       const { code } = await latestCode(email, 'EMAIL_VERIFICATION');
       await fail(1); // 10th failure → blocked
-      const blocked = await c.post('/api/v1/auth/verify-email').send({ email, code }).expect(400);
+      const blocked = await c.post('/api/v1/auth/verify-email').send({ email, code, password: PASSWORD }).expect(400);
       expect(blocked.body.error.code).toBe('OTP_INVALID');
       expect(await t.prisma.user.count({ where: { email } })).toBe(0);
 
@@ -346,9 +392,9 @@ describe('auth: registration, verification, login, password reset', () => {
       expect((await t.prisma.emailChallenge.findUniqueOrThrow({ where: { id: first.challengeId } })).invalidatedAt).not.toBeNull();
 
       if (first.code !== second.code) {
-        await c.post('/api/v1/auth/verify-email').send({ email, code: first.code }).expect(400);
+        await c.post('/api/v1/auth/verify-email').send({ email, code: first.code, password: PASSWORD }).expect(400);
       }
-      await c.post('/api/v1/auth/verify-email').send({ email, code: second.code }).expect(200);
+      await c.post('/api/v1/auth/verify-email').send({ email, code: second.code, password: PASSWORD }).expect(200);
     });
 
     it('stops after 5 codes per hour', async () => {

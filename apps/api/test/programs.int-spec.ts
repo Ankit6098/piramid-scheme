@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ScheduledJobsRegistry } from '../src/jobs/scheduler/scheduled-jobs.registry';
+import { ProgramLifecycleService } from '../src/modules/programs/program-lifecycle.service';
 import { PROGRAM_STATUS_JOB } from '../src/modules/programs/programs.jobs';
 import { createTestApp, type TestApp } from './utils/app';
 import { disconnectTestPrisma, resetDatabase } from './utils/db';
@@ -18,6 +20,7 @@ import {
 const BASE = '/api/v1/admin/programs';
 const DAY = 86_400_000;
 const REASON = 'Pausing while the supplier restocks';
+const CANCEL_REASON = 'Launch postponed by the supplier';
 
 const iso = (offsetDays: number) => new Date(Date.now() + offsetDays * DAY).toISOString();
 
@@ -226,7 +229,100 @@ describe('admin programs (business rules §1, §4)', () => {
       const p = await publishable({ startsAt: iso(5), endsAt: iso(60) });
       const res = await sa.post(`${BASE}/${p.id}/publish`).expect(200);
       expect(res.body.data.status).toBe('SCHEDULED');
-      expect(res.body.data.allowedActions).toEqual([]);
+      expect(res.body.data.allowedActions).toEqual(['cancel']);
+    });
+
+    it('cancels a SCHEDULED program before it starts: ARCHIVED, end date kept, reason and audit', async () => {
+      const p = await publishable({ startsAt: iso(5), endsAt: iso(60) });
+      const scheduled = (await sa.post(`${BASE}/${p.id}/publish`).expect(200)).body.data;
+      await sa.post(`${BASE}/${p.id}/cancel`).send({}).expect(400);
+      await sa.post(`${BASE}/${p.id}/cancel`).send({ reason: 'short' }).expect(400);
+      await sa.post(`${BASE}/${p.id}/cancel`).send({ reason: CANCEL_REASON, expectedVersion: scheduled.version - 1 }).expect(409);
+
+      const res = await sa.post(`${BASE}/${p.id}/cancel`).send({ reason: CANCEL_REASON, expectedVersion: scheduled.version }).expect(200);
+      expect(res.body.data).toMatchObject({
+        status: 'ARCHIVED',
+        endsAt: scheduled.endsAt,
+        startsAt: scheduled.startsAt,
+        allowedActions: [],
+        editableFields: [],
+        canDelete: false,
+      });
+      expect(res.body.data.statusHistory[0]).toMatchObject({
+        fromStatus: 'SCHEDULED',
+        toStatus: 'ARCHIVED',
+        reason: CANCEL_REASON,
+        changedBy: { id: superAdmin.id },
+      });
+      const audit = await t.prisma.auditLog.findFirstOrThrow({ where: { action: 'program.cancel', programId: p.id } });
+      expect(audit).toMatchObject({ resourceType: 'program', resourceId: p.id, reason: CANCEL_REASON, actorUserId: superAdmin.id });
+      expect(audit.before).toEqual({ status: 'SCHEDULED' });
+      expect(audit.after).toEqual({ status: 'ARCHIVED' });
+
+      // Terminal: no second cancel, no edits, and the scheduler never starts it.
+      expect((await sa.post(`${BASE}/${p.id}/cancel`).send({ reason: CANCEL_REASON }).expect(409)).body.error.code).toBe(
+        'INVALID_STATE_TRANSITION',
+      );
+      await sa.patch(`${BASE}/${p.id}`).send({ expectedVersion: res.body.data.version, name: 'Nope' }).expect(409);
+      await t.get(ProgramLifecycleService).applyScheduledTransitions(new Date(Date.now() + 10 * DAY));
+      expect((await t.prisma.program.findUniqueOrThrow({ where: { id: p.id } })).status).toBe('ARCHIVED');
+    });
+
+    it('gives an open-ended cancelled program the earliest end the date CHECKs allow', async () => {
+      const startsAt = new Date(Date.now() + 5 * DAY);
+      const plain = await createProgram(t.prisma, { status: 'SCHEDULED', startsAt, endsAt: null });
+      const v1 = (await sa.post(`${BASE}/${plain.id}/cancel`).send({ reason: CANCEL_REASON }).expect(200)).body.data;
+      expect(v1).toMatchObject({ status: 'ARCHIVED', endsAt: new Date(startsAt.getTime() + 1_000).toISOString() });
+
+      const closesAt = new Date(Date.now() + 20 * DAY);
+      const windowed = await createProgram(t.prisma, { status: 'SCHEDULED', startsAt, endsAt: null, enrollmentClosesAt: closesAt });
+      const v2 = (await sa.post(`${BASE}/${windowed.id}/cancel`).send({ reason: CANCEL_REASON }).expect(200)).body.data;
+      expect(v2).toMatchObject({ status: 'ARCHIVED', endsAt: closesAt.toISOString(), enrollmentClosesAt: closesAt.toISOString() });
+      const audit = await t.prisma.auditLog.findFirstOrThrow({ where: { action: 'program.cancel', programId: windowed.id } });
+      expect(audit.before).toEqual({ status: 'SCHEDULED', endsAt: null });
+      expect(audit.after).toEqual({ status: 'ARCHIVED', endsAt: closesAt.toISOString() });
+    });
+
+    it('refuses to cancel a program that is not scheduled or whose start has passed', async () => {
+      const active = await createProgram(t.prisma, { status: 'ACTIVE' });
+      expect((await sa.post(`${BASE}/${active.id}/cancel`).send({ reason: CANCEL_REASON }).expect(409)).body.error.code).toBe(
+        'INVALID_STATE_TRANSITION',
+      );
+      const draftProgram = await createProgram(t.prisma, { status: 'DRAFT' });
+      await sa.post(`${BASE}/${draftProgram.id}/cancel`).send({ reason: CANCEL_REASON }).expect(409);
+      // Start reached but the scheduler has not activated it yet: it is starting, not cancellable.
+      const starting = await createProgram(t.prisma, { status: 'SCHEDULED', startsAt: new Date(Date.now() - 60_000) });
+      const res = await sa.post(`${BASE}/${starting.id}/cancel`).send({ reason: CANCEL_REASON }).expect(409);
+      expect(res.body.error.code).toBe('INVALID_STATE_TRANSITION');
+      expect((await t.prisma.program.findUniqueOrThrow({ where: { id: starting.id } })).status).toBe('SCHEDULED');
+      await sa.post(`${BASE}/${randomUUID()}/cancel`).send({ reason: CANCEL_REASON }).expect(404);
+    });
+
+    it('requires programs:publish and program scope to cancel', async () => {
+      const startsAt = new Date(Date.now() + 5 * DAY);
+      const mine = await createProgram(t.prisma, { status: 'SCHEDULED', startsAt });
+      const other = await createProgram(t.prisma, { status: 'SCHEDULED', startsAt });
+      const pa = await loginAs(t, await createUser(t.prisma, { roles: ['PROGRAM_ADMIN'], programScopes: [mine.id] }));
+      await pa.post(`${BASE}/${other.id}/cancel`).send({ reason: CANCEL_REASON }).expect(403);
+      const finance = await loginAs(t, await createUser(t.prisma, { roles: ['FINANCE_REVIEWER'] }));
+      await finance.post(`${BASE}/${mine.id}/cancel`).send({ reason: CANCEL_REASON }).expect(403);
+      const member = await loginAs(t, await createUser(t.prisma));
+      await member.post(`${BASE}/${mine.id}/cancel`).send({ reason: CANCEL_REASON }).expect(403);
+      expect((await pa.post(`${BASE}/${mine.id}/cancel`).send({ reason: CANCEL_REASON }).expect(200)).body.data.status).toBe('ARCHIVED');
+      expect((await t.prisma.program.findUniqueOrThrow({ where: { id: other.id } })).status).toBe('SCHEDULED');
+    });
+
+    it('the DB state machine allows SCHEDULED to ARCHIVED (with an end) and no other shortcut', async () => {
+      const startsAt = new Date(Date.now() + 5 * DAY);
+      const endsAt = new Date(startsAt.getTime() + DAY);
+      const a = await createProgram(t.prisma, { status: 'SCHEDULED', startsAt, endsAt: null });
+      // ARCHIVED needs an end date (CHECK); COMPLETED / PAUSED are not reachable from SCHEDULED.
+      await expect(t.prisma.program.update({ where: { id: a.id }, data: { status: 'ARCHIVED' } })).rejects.toThrow();
+      await expect(t.prisma.program.update({ where: { id: a.id }, data: { status: 'COMPLETED', endsAt } })).rejects.toThrow();
+      await expect(t.prisma.program.update({ where: { id: a.id }, data: { status: 'PAUSED' } })).rejects.toThrow();
+      const archived = await t.prisma.program.update({ where: { id: a.id }, data: { status: 'ARCHIVED', endsAt } });
+      expect(archived.status).toBe('ARCHIVED');
+      await expect(t.prisma.program.update({ where: { id: a.id }, data: { status: 'SCHEDULED' } })).rejects.toThrow();
     });
 
     it('walks ACTIVE → PAUSED → ACTIVE → COMPLETED → ARCHIVED with reasons and audit', async () => {

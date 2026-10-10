@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AuthContext } from '../src/common/auth/auth-context';
 import { EnrollmentsService } from '../src/modules/enrollments/enrollments.service';
 import { LedgerService } from '../src/modules/ledger/ledger.service';
 import { HierarchyService } from '../src/modules/referrals/hierarchy.service';
 import { ReferralsService } from '../src/modules/referrals/referrals.service';
+import { SponsorCorrectionService } from '../src/modules/referrals/sponsor-correction.service';
+import { TeamRepository } from '../src/modules/referrals/team.repository';
 import { RewardEngineService } from '../src/modules/rewards/reward-engine.service';
 import { createTestApp, type TestApp } from './utils/app';
 import { disconnectTestPrisma, resetDatabase } from './utils/db';
@@ -258,6 +261,123 @@ describe('cross-module services: referrals, eligibility, ledger, reward engine',
       await t.prisma.user.update({ where: { id: rahul.id }, data: { status: 'SUSPENDED', suspendedAt: new Date() } });
       expect((await engine.processEvent(suspendedSubject.id)).outcome).toBe('REJECTED');
       expect((await t.prisma.qualifyingEvent.findUniqueOrThrow({ where: { id: suspendedSubject.id } })).status).toBe('REJECTED');
+    });
+  });
+
+  describe('referral tree lock: sale processing vs sponsor corrections', () => {
+    const REASON = 'Signed up through the wrong referral link';
+
+    /** Advisory locks on the referral tree key (7301, 1) in THIS database (other suites share the server). */
+    function treeLocks(granted: boolean) {
+      return t.prisma.$queryRaw<Array<{ mode: string }>>`
+        SELECT "mode" FROM pg_locks
+        WHERE "locktype" = 'advisory' AND "classid" = 7301 AND "objid" = 1 AND "objsubid" = 2
+          AND "granted" = ${granted}
+          AND "database" = (SELECT "oid" FROM pg_database WHERE "datname" = current_database())`;
+    }
+
+    async function waitUntil(check: () => Promise<boolean>, what: string, timeoutMs = 10_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!(await check())) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+
+    function latch() {
+      let open!: () => void;
+      const opened = new Promise<void>((resolve) => (open = resolve));
+      return { open, opened };
+    }
+
+    /** Anita > Rahul > Priya plus Sam (root), all enrolled; the factory admin performs corrections. */
+    async function setup() {
+      const { anita, rahul, priya } = await chain();
+      const sam = await createUser(t.prisma, { fullName: 'Sam Rao' });
+      const { program } = await programWithPolicy();
+      await enroll([anita, rahul, sam], program.id);
+      const admin = await factoryAdmin(t.prisma);
+      const auth = { userId: admin.id } as AuthContext;
+      return { anita, rahul, priya, sam, program, auth };
+    }
+
+    it('holds the tree lock in SHARED mode while calculating, so a correction waits for the commit', async () => {
+      const { anita, rahul, priya, sam, program, auth } = await setup();
+      const event = await createEvent(t.prisma, { programId: program.id, subjectUserId: priya.id, amountMinor: 100_000n });
+      const corrections = t.get(SponsorCorrectionService);
+
+      // Pause the engine before it reads the tree, while it holds the event row and tree locks.
+      const entered = latch();
+      const release = latch();
+      const getAncestors = hierarchy.getAncestors.bind(hierarchy);
+      const spy = vi.spyOn(hierarchy, 'getAncestors').mockImplementationOnce(async (...args) => {
+        entered.open();
+        await release.opened;
+        return getAncestors(...args);
+      });
+      try {
+        const processing = engine.processEvent(event.id);
+        await entered.opened;
+        expect(await treeLocks(true)).toEqual([{ mode: 'ShareLock' }]);
+
+        const correction = corrections.apply(auth, priya.id, { newSponsorId: sam.id, reason: REASON });
+        await waitUntil(async () => (await treeLocks(false)).some((l) => l.mode === 'ExclusiveLock'), 'the correction to queue');
+        expect(await t.prisma.referralCorrection.count()).toBe(0);
+
+        release.open();
+        expect((await processing).outcome).toBe('REWARDS_CREATED');
+        // Under the lock the correction sees the sale PROCESSED (not RECEIVED) and goes ahead.
+        await expect(correction).resolves.toMatchObject({ previousSponsorId: rahul.id, newSponsorId: sam.id });
+      } finally {
+        release.open();
+        spy.mockRestore();
+      }
+
+      // The calculation used the tree as it was before the correction; past rewards never change.
+      const rewards = await t.prisma.reward.findMany({ where: { eventId: event.id }, orderBy: { level: 'asc' } });
+      expect(rewards.map((r) => [r.level, r.recipientUserId])).toEqual([
+        [1, rahul.id],
+        [2, anita.id],
+      ]);
+      const rel = await t.prisma.referralRelationship.findUniqueOrThrow({ where: { childUserId: priya.id } });
+      expect(rel.sponsorUserId).toBe(sam.id);
+    });
+
+    it('makes processing wait for an in-flight correction and calculate on the corrected tree', async () => {
+      const { priya, sam, program, auth } = await setup();
+      const corrections = t.get(SponsorCorrectionService);
+      const repo = t.get(TeamRepository);
+
+      // Pause the correction under its exclusive lock, AFTER its "no RECEIVED sales" check passed.
+      const entered = latch();
+      const release = latch();
+      const subtreeSize = repo.subtreeSize.bind(repo);
+      const spy = vi.spyOn(repo, 'subtreeSize').mockImplementationOnce(async (...args) => {
+        entered.open();
+        await release.opened;
+        return subtreeSize(...args);
+      });
+      try {
+        const correction = corrections.apply(auth, priya.id, { newSponsorId: sam.id, reason: REASON });
+        await entered.opened;
+        expect(await treeLocks(true)).toEqual([{ mode: 'ExclusiveLock' }]);
+
+        // A sale for the moved member arrives in the window between the check and the commit.
+        const event = await createEvent(t.prisma, { programId: program.id, subjectUserId: priya.id, amountMinor: 100_000n });
+        const processing = engine.processEvent(event.id);
+        await waitUntil(async () => (await treeLocks(false)).some((l) => l.mode === 'ShareLock'), 'processing to queue');
+        expect((await t.prisma.qualifyingEvent.findUniqueOrThrow({ where: { id: event.id } })).status).toBe('RECEIVED');
+
+        release.open();
+        await expect(correction).resolves.toMatchObject({ newSponsorId: sam.id });
+        expect((await processing).outcome).toBe('REWARDS_CREATED');
+
+        const rewards = await t.prisma.reward.findMany({ where: { eventId: event.id }, orderBy: { level: 'asc' } });
+        expect(rewards.map((r) => [r.level, r.recipientUserId, r.amountMinor])).toEqual([[1, sam.id, 10_000n]]);
+      } finally {
+        release.open();
+        spy.mockRestore();
+      }
     });
   });
 

@@ -27,10 +27,10 @@ import { AppError, isAppError } from '../../common/errors/app-error';
 import { PrismaService, type Db, type Tx } from '../../common/prisma/prisma.service';
 import { LoginThrottleService } from '../../common/throttle/login-throttle.service';
 import { ReferralsService, type ResolvedReferralCode } from '../referrals/referrals.service';
-import { ACCEPTED_MESSAGES, accepted, invalidCredentials, otpInvalid } from './auth-errors';
+import { ACCEPTED_MESSAGES, accepted, invalidCredentials, otpInvalid, otpSendRefused } from './auth-errors';
 import { hourBucket } from './domain/otp-policy';
 import { adminMfaStep, toSessionUserDto } from './domain/session-user';
-import { OtpService } from './otp.service';
+import { OtpService, type IssuedChallenge } from './otp.service';
 import { PasswordService } from './password.service';
 import { SecurityNoticesService } from './security-notices.service';
 
@@ -43,8 +43,9 @@ export interface SignedIn<T> {
 const ROLE_SELECT = { roles: { select: { role: { select: { key: true } } } } } as const;
 
 /**
- * Registration (anti-squatting), email verification, login, logout, session view and password reset
- * (business rules §2). Admin MFA lives in MfaService.
+ * Registration (anti-squatting), email verification (code + registration password), login, logout,
+ * session view, password reset and the admin-triggered reset code (business rules §2). Admin MFA
+ * lives in MfaService.
  */
 @Injectable()
 export class AuthService {
@@ -145,23 +146,35 @@ export class AuthService {
   }
 
   /**
-   * Verifies the code and, in ONE transaction without savepoints: consumes it, creates the user
-   * (ACTIVE + verified), re-validates the referral code (joins without a sponsor if it is no longer
-   * valid), writes the referral tree rows, grants MEMBER, creates the session and audits.
+   * Verifies the code AND the password chosen at registration (argon2 against the pending hash) and,
+   * in ONE transaction without savepoints: consumes the code, creates the user (ACTIVE + verified),
+   * re-validates the referral code (joins without a sponsor if it is no longer valid), writes the
+   * referral tree rows, grants MEMBER, creates the session and audits.
+   *
+   * The password check means a code from somebody else's registration for this address can never
+   * activate an account with *their* password. A wrong password looks exactly like a wrong code: one
+   * argon2 verification runs on every path (dummy hash when the code was wrong), the response is the
+   * same `OTP_INVALID`, and the attempt — already counted by `attempt()` — stays a failed attempt
+   * because the challenge is not consumed.
    */
   async verifyEmail(dto: VerifyEmailRequest, presentedToken?: string | null): Promise<SignedIn<VerifyEmailResponseDto>> {
     const now = new Date();
     const scope = { email: dto.email, purpose: 'EMAIL_VERIFICATION' as const };
-    if (await this.otp.isVerificationBlocked(this.prisma, scope, now)) throw otpInvalid();
+    if (await this.otp.isVerificationBlocked(this.prisma, scope, now)) {
+      await this.passwords.verifyDummy(dto.password);
+      throw otpInvalid();
+    }
     const attempt = await this.otp.attempt(scope, dto.code, now);
-    if (!attempt.ok) {
+    const pending = attempt.ok ? attempt.challenge : null;
+    // Always exactly one argon2 verification (a missing hash burns the dummy one).
+    const passwordOk = await this.passwords.verify(pending?.pendingPasswordHash, dto.password);
+    if (!pending || !passwordOk || !pending.pendingFullName || !pending.pendingPasswordHash) {
       await this.otp.afterFailure(scope, { notifyTo: dto.email }, now);
       throw otpInvalid();
     }
-    const challenge = attempt.challenge;
-    const fullName = challenge.pendingFullName;
-    const passwordHash = challenge.pendingPasswordHash;
-    if (!fullName || !passwordHash) throw otpInvalid();
+    const challenge = pending;
+    const fullName = pending.pendingFullName;
+    const passwordHash = pending.pendingPasswordHash;
 
     const userId = randomUUID();
     const ip = RequestContext.ip;
@@ -402,7 +415,51 @@ export class AuthService {
     return accepted(ACCEPTED_MESSAGES.forgot);
   }
 
-  /** Code + new password → new hash, every session revoked, owner notified. Does not sign in. */
+  /**
+   * Admin-triggered reset (used by `AdminMembersService.sendPasswordReset` — SUPER_ADMIN, audited
+   * there): issues a PASSWORD_RESET code to the account's current address, also for admin-role
+   * accounts whose self-service reset is disabled, and tells the owner (email + in-app) that an
+   * administrator started it. The challenge records the issuing SUPER_ADMIN session in `session_id`;
+   * that is what lets `resetPassword` accept the code for an admin-role account.
+   *
+   * Runs inside the caller's transaction (advisory lock per address + purpose). The code limits apply
+   * with explicit 429s — the caller is an authenticated admin, so there is nothing to enumerate.
+   * Revoking the member's sessions, auditing and notifying the SUPER_ADMINs is the caller's job.
+   */
+  async issueAdminPasswordReset(
+    tx: Tx,
+    input: { user: { id: string; email: string; fullName: string }; issuedBySessionId: string },
+    now: Date,
+  ): Promise<IssuedChallenge> {
+    const { user } = input;
+    const scope = { email: user.email, purpose: 'PASSWORD_RESET' as const, userId: user.id };
+    await this.otp.lock(tx, user.email, 'PASSWORD_RESET');
+    const decision = await this.otp.sendDecision(tx, scope, now);
+    if (!decision.allowed) throw otpSendRefused(decision);
+    const issued = await this.otp.issue(tx, { ...scope, sessionId: input.issuedBySessionId }, now);
+    await this.notices.adminPasswordResetStarted(tx, user);
+    return issued;
+  }
+
+  /**
+   * The SUPER_ADMIN behind an admin-triggered reset code: the user of the session recorded on the
+   * challenge, if that user is still an ACTIVE SUPER_ADMIN other than the account being reset.
+   * Null for self-service codes (no session) or when the issuer lost the role/was suspended meanwhile.
+   */
+  private async adminResetIssuer(db: Db, sessionId: string | null, subjectUserId: string): Promise<string | null> {
+    if (!sessionId) return null;
+    const session = await db.session.findUnique({
+      where: { id: sessionId },
+      select: { userId: true, user: { select: { status: true, ...ROLE_SELECT } } },
+    });
+    if (!session || session.userId === subjectUserId || session.user.status !== 'ACTIVE') return null;
+    return session.user.roles.some((r) => r.role.key === 'SUPER_ADMIN') ? session.userId : null;
+  }
+
+  /**
+   * Code + new password → new hash, every session revoked, owner notified. Does not sign in.
+   * Admin-role accounts can only use a code a SUPER_ADMIN issued (`issueAdminPasswordReset`).
+   */
   async resetPassword(dto: ResetPasswordRequest): Promise<PasswordResetResponseDto> {
     const now = new Date();
     const scope = { email: dto.email, purpose: 'PASSWORD_RESET' as const };
@@ -424,10 +481,13 @@ export class AuthService {
             select: { id: true, email: true, fullName: true, status: true, ...ROLE_SELECT },
           })
         : null;
-      // The code stays consumed even when the reset is refused (address changed, suspended, now an admin).
+      // The code stays consumed even when the reset is refused (address changed, suspended, an admin
+      // account with a self-service code).
       if (!user || user.email !== challenge.email || user.status !== 'ACTIVE') return false;
       const roles = user.roles.map((r) => r.role.key);
-      if (roles.some(isAdminRole)) return false;
+      const adminAccount = roles.some(isAdminRole);
+      const issuedBy = await this.adminResetIssuer(tx, challenge.sessionId, user.id);
+      if (adminAccount && !issuedBy) return false;
 
       await tx.user.update({
         where: { id: user.id },
@@ -442,8 +502,18 @@ export class AuthService {
         resourceId: user.id,
         actorUserId: user.id,
         actorRoles: roles,
+        ...(issuedBy ? { after: { adminInitiated: true, initiatedByUserId: issuedBy } } : {}),
       });
       await this.notices.passwordChanged(tx, user, 'reset');
+      if (adminAccount) {
+        await this.notices.notifySuperAdmins(tx, {
+          subjectUserId: user.id,
+          title: 'Admin account password reset completed',
+          paragraphs: [
+            `The admin account ${maskEmail(user.email)} set a new password with the reset code a Super Admin sent. All of its sessions were signed out.`,
+          ],
+        });
+      }
       return true;
     });
     if (!applied) throw otpInvalid();

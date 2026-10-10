@@ -56,6 +56,7 @@ active offering). Audit: `offering.create|update|approve|deactivate|delete`.
 | POST | `/admin/programs/:id/publish` | programs:publish (scoped) | `{ expectedVersion?, reason? }` (body optional) | `AdminProgramDetailDto` (SCHEDULED if `startsAt` is ahead, else ACTIVE) |
 | POST | `/admin/programs/:id/pause` | programs:publish (scoped) | `{ expectedVersion?, reason }` | `AdminProgramDetailDto` (PAUSED) |
 | POST | `/admin/programs/:id/resume` · `/complete` · `/archive` | programs:publish (scoped) | `{ expectedVersion?, reason? }` (body optional) | `AdminProgramDetailDto` |
+| POST | `/admin/programs/:id/cancel` | programs:publish (scoped) | `cancelProgramSchema` `{ expectedVersion?, reason }` | `AdminProgramDetailDto` (ARCHIVED) |
 
 `AdminProgramDetailDto` = summary (status, offering ref, unit/currency snapshot, dates, `version`, active option /
 active / pending enrollment counts) + `description`, `maxRewardDepth`, `lateEventGraceDays`, `eligibility`,
@@ -74,13 +75,20 @@ Rules:
   `maxRewardDepth` below a published policy's depth → 400. Stale version → 409 `STALE_VERSION`.
 - **Lifecycle** (DB state machine): publish DRAFT → SCHEDULED|ACTIVE; pause ACTIVE → PAUSED (reason required);
   resume PAUSED → ACTIVE (not after the end date); complete ACTIVE|PAUSED → COMPLETED (sets `endsAt = now` when
-  later and pulls enrollment dates in); archive COMPLETED → ARCHIVED. Invalid transition → 409
-  `INVALID_STATE_TRANSITION`. Publish preconditions (409 with `details.checks`): ≥ 1 active option, ACTIVE
+  later and pulls enrollment dates in); archive COMPLETED → ARCHIVED; **cancel** SCHEDULED → ARCHIVED (reason
+  required) withdraws a published program before it starts — only while `startsAt` is still ahead (else 409
+  `INVALID_STATE_TRANSITION`: the scheduler is activating it). It keeps an existing `endsAt`, otherwise sets the
+  earliest end the date CHECKs allow (`max(startsAt + 1 s, enrollmentOpensAt + 1 s, enrollmentClosesAt)`); other
+  dates are untouched. A scheduled program has never been ACTIVE, so it has no enrollments and can have no sales;
+  once cancelled it leaves the member catalogue and is no longer offered for recording sales.
+  `allowedActions` is `['cancel']` for SCHEDULED. Invalid transition → 409 `INVALID_STATE_TRANSITION`.
+  Publish preconditions (409 with `details.checks`): ≥ 1 active option, ACTIVE
   offering, consistent dates with the end/close still ahead, ≥ 1 PUBLISHED policy version. The reason goes to
   `program_status_changes` via `set_config('app.status_reason', …, true)`, the actor via `updated_by_id`.
 - **Delete** — DRAFT only, without published/retired policy versions or API clients (409 otherwise).
 - A PROGRAM_ADMIN who creates a program is assigned to it automatically (audited `creatorAssigned`).
-- Audit: `program.create|update|delete|publish|pause|resume|complete|archive`, scheduler `program.auto_start|auto_complete` (system).
+- Audit: `program.create|update|delete|publish|pause|resume|complete|archive|cancel` (cancel: `before/after` status,
+  plus `endsAt` when it was set), scheduler `program.auto_start|auto_complete` (system).
 
 ### Options
 

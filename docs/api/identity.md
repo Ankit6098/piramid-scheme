@@ -21,7 +21,7 @@ code, single use, one open challenge per (address, purpose) — issuing a new co
 in the same transaction. Delivery only via `OtpMailer` (outbox payload `{ challengeId, codeCiphertext,
 template }`, scrubbed when SENT/DEAD). Limits per (address, purpose), derived from `email_challenges`:
 
-| Limit | Value | Public flows (register, resend, forgot, email change) | Admin email MFA |
+| Limit | Value | Public flows (register, resend, forgot, email change) | Admin email MFA, admin-triggered reset |
 |---|---|---|---|
 | Resend cooldown | 60 s | silent (same 202) | `429 OTP_COOLDOWN` + `Retry-After` |
 | Codes per hour | 5 | silent | `429 RATE_LIMITED` + `Retry-After` |
@@ -57,8 +57,15 @@ re-sent until 24 h after their last code expired (then scrubbed by `auth-challen
 
 ### `POST /auth/verify-email` — public · limit `otp` · `200` · sets `sid` + new `csrf_token`
 
-`{ email, code }`. Atomic attempt (`UPDATE … attempts + 1 … RETURNING`, constant-time compare), then ONE
-transaction without savepoints: consume the challenge (conditional) → create the user (`ACTIVE`, verified,
+`{ email, code, password }` — `password` is the one chosen at registration (any non-empty string ≤ 256; the
+strength rules were applied at registration). Atomic attempt (`UPDATE … attempts + 1 … RETURNING`,
+constant-time compare), then **one argon2 verification of `password` against the pending hash on every path**
+(a dummy hash when the code was wrong or the address is blocked, so timing does not reveal whether the code
+was right). A wrong password returns the same `400 OTP_INVALID` as a wrong code and stays a failed attempt
+(the challenge is not consumed; it counts towards the 5-per-code and 10-per-24 h limits). A code from somebody
+else's registration for your address therefore never creates an account with their password — register
+again (the newer registration replaces theirs) and verify with your own. Then ONE transaction without
+savepoints: consume the challenge (conditional) → create the user (`ACTIVE`, verified,
 pending password hash) → re-validate the stored referral code (if no longer valid: join as a root member and
 report it) → `ReferralsService.attachNewMember` (shared tree lock, self row, relationship with registration
 IP + user agent, ancestor rows, own referral code) → `MEMBER` role → session (member TTL) → audit
@@ -66,7 +73,8 @@ IP + user agent, ancestor rows, own referral code) → `MEMBER` role → session
 with the request is revoked.
 
 Response `{ data: { user: SessionUserDto, referral: { applied, codeNoLongerValid } } }`.
-Errors: `400 OTP_INVALID`.
+Errors: `400 OTP_INVALID` (wrong/expired/used code **or** wrong password), `400 VALIDATION_FAILED`
+(missing `password`, malformed code/email).
 
 ### `POST /auth/login` — public · limits `auth` + `login` · `200` · sets `sid` + new `csrf_token`
 
@@ -100,14 +108,24 @@ SessionUserDto = { id, fullName, email, emailVerified, avatarUrl, roles, permiss
 
 `{ email }` → generic body. ACTIVE members get a `PASSWORD_RESET` code (limits silent). **Admin-role users:**
 same 202, no email; every ACTIVE SUPER_ADMIN gets an email + in-app notice (1/hour per account, masked
-address) and `auth.password_reset.blocked_admin` is audited. Unknown/suspended addresses: nothing.
+address) and `auth.password_reset.blocked_admin` is audited — a SUPER_ADMIN can then send an admin-triggered
+reset (below). Unknown/suspended addresses: nothing.
 
 ### `POST /auth/password/reset` — public · limit `auth` · `200`
 
 `{ email, code, newPassword }`. Code verified atomically; then one transaction: consume → (refused, code
-still consumed, if the account changed address, is not ACTIVE or now holds an admin role) → new hash +
-`passwordChangedAt` → **all** sessions revoked (`password_reset`) → audit `user.password.reset` → owner
-notice. Does not sign in. `{ data: { passwordReset: true } }`. Errors: `400 OTP_INVALID`, `400 VALIDATION_FAILED`.
+still consumed, if the account changed address or is not ACTIVE, or holds an admin role and the code was
+not an admin-triggered one — see below) → new hash + `passwordChangedAt` → **all** sessions revoked
+(`password_reset`) → audit `user.password.reset` (`after = { adminInitiated: true, initiatedByUserId }` for
+admin-triggered codes) → owner notice (+ every SUPER_ADMIN for admin accounts). Does not sign in.
+`{ data: { passwordReset: true } }`. Errors: `400 OTP_INVALID`, `400 VALIDATION_FAILED`.
+
+**Admin-triggered codes.** `POST /admin/members/:id/password-reset` (SUPER_ADMIN, see
+[adminops.md](adminops.md#members)) issues the code through `AuthService.issueAdminPasswordReset`: same
+challenge table, limits and OTP delivery, but the challenge records the issuing SUPER_ADMIN session in
+`session_id` (null for self-service codes). For an admin-role account a code is accepted only when that
+session belongs to an ACTIVE SUPER_ADMIN other than the account itself — so a code requested while the
+account was still a plain member, or issued by someone who has since lost the role, is refused.
 
 ## Admin MFA (`/auth/mfa`) — admin session
 
@@ -155,7 +173,11 @@ address is already taken.
 
 ## Residual risks (documented decisions)
 
-- A registration started by someone else for your address emails you a code; entering that code would create
-  the account with *their* password. The email says to ignore unsolicited codes, the code is only usable from
-  the mailbox, and any newer registration by the owner replaces the pending one.
+- A registration started by someone else for your address still emails you a code (we cannot tell who is
+  registering). The code alone is useless: verification also needs the password of *that* registration, so
+  entering it with your own password fails and you simply register again. Repeated foreign registrations can
+  delay yours only within the hourly code cap.
+- Self-service password reset is off for admin-role accounts; recovery depends on another SUPER_ADMIN
+  sending an admin-triggered reset (the last remaining SUPER_ADMIN cannot reset themselves this way — keep at
+  least two).
 - `POST /auth/mfa/totp/*` failures share the per-IP login backoff budget (20 free failures per IP).

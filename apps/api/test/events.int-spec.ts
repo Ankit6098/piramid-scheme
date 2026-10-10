@@ -335,6 +335,23 @@ describe('sales intake (business rules §8)', () => {
     });
   });
 
+  describe('recordable programs', () => {
+    it('offers finished programs for late sales only if they ran (a cancelled scheduled program never did)', async () => {
+      const inFiveDays = new Date(Date.now() + 5 * 86_400_000);
+      await createProgram(t.prisma, { status: 'COMPLETED', name: 'Completed' });
+      await createProgram(t.prisma, { status: 'SCHEDULED', name: 'Scheduled', startsAt: inFiveDays });
+      const cancelled = await createProgram(t.prisma, { status: 'SCHEDULED', name: 'Cancelled', startsAt: inFiveDays });
+      await su.post(`/api/v1/admin/programs/${cancelled.id}/cancel`).send({ reason: 'Launch postponed by the supplier' }).expect(200);
+
+      const options = (await su.get('/api/v1/admin/events/programs').expect(200)).body.data as SaleProgramOptionDto[];
+      expect(Object.fromEntries(options.map((o) => [o.name, [o.status, o.canRecordSales]]))).toEqual({
+        Completed: ['COMPLETED', true],
+        Scheduled: ['SCHEDULED', false],
+        Cancelled: ['ARCHIVED', false],
+      });
+    });
+  });
+
   describe('sweeper', () => {
     it('processes events stuck in RECEIVED for more than two minutes', async () => {
       const { program, priya } = await setup();

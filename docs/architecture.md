@@ -3,7 +3,208 @@
 Modular monolith (see [ADR-0001](decisions/0001-modular-monolith-nestjs-nextjs.md)): one NestJS API
 (`apps/api`) plus a background worker built from the same code, a Next.js web app (`apps/web`), and
 a shared contracts package (`packages/shared`). Business rules live in
-[business-rules.md](business-rules.md); the schema and its invariants in [database.md](database.md).
+[business-rules.md](business-rules.md); the schema and its invariants in [database.md](database.md);
+the endpoint index in [api.md](api.md); the web conventions in [frontend.md](frontend.md).
+
+## Contents
+
+1. [System overview](#system-overview)
+2. [Module map](#module-map)
+3. [Request and processing flows](#request-and-processing-flows)
+4. [API core & module contracts](#api-core--module-contracts) (layout, pipeline, config, errors,
+   auth primitives, crypto, rate limiting, validation, idempotency, data access, cross-cutting
+   services, background jobs, cross-module contracts, testing)
+
+## System overview
+
+```
+ browser ──▶ nginx (single origin, :8080 / :443)
+               ├── /api/*  ──▶ api   (NestJS: guards → controller → service → domain; Prisma → PostgreSQL)
+               └── /*      ──▶ web   (Next.js App Router; server code calls api via API_INTERNAL_URL)
+ api, worker ──▶ PostgreSQL 17 (all state, invariants in SQL)    ──▶ Redis 7 (BullMQ schedulers,
+ worker      ──▶ SMTP (Mailpit in dev)                                rate-limit + login-backoff counters)
+ sales system ──▶ POST /api/v1/integrations/events (API key) ──▶ api
+```
+
+- **api** (`node dist/main.js`): HTTP only. Writes business state, audit rows and outbox messages
+  in one transaction. Never sends email itself.
+- **worker** (`node dist/worker.js`, same image and modules, no HTTP): the outbox relay (email,
+  OTP email, notifications, fraud signal) and the scheduled jobs. `RUN_WORKER_IN_API=true` runs it
+  inside the API for development.
+- **web**: renders the member area (`(member)/…`), the admin area (`admin/…`) and the auth pages
+  (`(auth)/…`); session-dependent data is fetched on the client with TanStack Query through
+  `/api`. Hiding UI is never the authorization; the API guards are.
+- **PostgreSQL** enforces the money, tree, compliance and segregation-of-duties invariants with
+  constraints and triggers, so a bug in one module cannot corrupt another's data
+  ([ADR-0002](decisions/0002-prisma-with-raw-sql-invariants.md)).
+
+## Module map
+
+Sixteen feature modules in `apps/api/src/modules` (registered in `FEATURE_MODULES`, loaded by
+both the API and the worker), on top of the global core in `src/common` and `src/jobs`.
+
+| Module | Responsibility | Routes | Exports (used by other modules) | Imports |
+|---|---|---|---|---|
+| `auth` | Registration with deferred user creation, email verification, login/logout, password reset, admin MFA (email OTP → TOTP enrollment/verification), one-time-code issuance and limits, security notices. Jobs: `auth-challenge-cleanup`, `auth-session-cleanup` | `/auth/*`, `/auth/mfa/*` | `AuthService`, `MfaService`, `OtpService`, `PasswordService`, `SecurityNoticesService` | referrals, notifications |
+| `users` | Self-service account: profile, password change, email change, sessions, activity, TOTP reset | `/users/me` | `UsersService` | auth |
+| `settings` | Platform settings (unit, currency, points label, defaults) and the currency list, on top of the core `PlatformSettingsService` | `/settings/public`, `/admin/settings`, `/admin/currencies` | `SettingsService` | — |
+| `offerings` | Products/services and their approval | `/admin/offerings` | `OfferingsService` | — |
+| `programs` | Programs, plans (options), lifecycle state machine with reasons, program-admin assignments, member catalogue. Job: `programs-status-transitions` | `/programs`, `/admin/programs` | `ProgramsService`, `ProgramLifecycleService` | — |
+| `enrollments` | Enroll, cancel, offline-payment activation, rejection, coverage periods. Job: `enrollments-expiry` | `/programs/:id/enrollments`, `/users/me/enrollments`, `/admin/enrollments` | `EnrollmentsService` (**`findEligibleEnrollments`**) | notifications |
+| `referrals` | Referral codes, attribution at account creation, upline lookup, member and admin team views, sponsor corrections, member flags, the shared-IP fraud signal (outbox handler) | `/referrals/validate`, `/users/me/{referral-code,parent,referrals,hierarchy}`, `/admin/members/:id/{hierarchy,ancestors,sponsor-correction}`, `/admin/flags` | `ReferralsService` (**`resolveCodeForRegistration`, `attachNewMember`**), `HierarchyService` (**`getAncestors`**) | — |
+| `policies` | Reward policy drafts, validation, dry-run (the engine's pure calculator), publish/retire timeline, member policy view | `/admin/programs/:id/{policies,policy-context}`, `/admin/policies`, `/programs/:id/policy` | `PoliciesService` | referrals, enrollments |
+| `events` | Sale intake: validation, sale-level idempotency and revisions, REJECTED storage, event queries. Job: `events-received-sweeper` | `/admin/events` | `EventIntakeService`, `EventsQueryService` | rewards, ledger |
+| `integrations` | API clients (keys shown once, SHA-256 stored), bearer-key guard, machine ingestion into the same intake | `/admin/integrations/clients`, `/integrations/events` | `IntegrationsService` | events |
+| `rewards` | The reward engine (calculation + persistence), reward queries, approve/reject/reverse/bulk, event reversal, CSV, member rewards and earnings | `/admin/rewards`, `/admin/events/:id/reverse`, `/users/me/{rewards,earnings}` | `RewardEngineService` (**`processEvent`**), `RewardsQueryService`, `RewardDecisionsService`, `EventReversalService` | referrals, enrollments, ledger, notifications |
+| `ledger` | Double-entry posting and reversal, account get-or-create, ledger queries, CSV | `/admin/ledger` | `LedgerService` (**`postReward`, `reverseReward`**), `LedgerQueryService` | — |
+| `reconciliation` | Eight SQL consistency checks, cached report | `/admin/reconciliation` | `ReconciliationService` (**`countExceptions`**) | — |
+| `notifications` | In-app notifications: `notify(tx, …)` enqueues `notification.create`; member read routes | `/users/me/notifications` | `NotificationsService` (**`notify`**) | — |
+| `audit` | Audit log queries and field diffs (writing is the core `AuditService`) | `/admin/audit` | `AuditQueryService` | — |
+| `admin` | Admin overview, member administration (suspend, reactivate, roles), member dashboard | `/admin/overview`, `/admin/members`, `/users/me/dashboard` | `AdminMembersService` | audit, notifications, reconciliation |
+
+Dependency direction (arrows = "imports"). Leaf modules never import `rewards` or `events`, so
+there are no cycles and no `forwardRef`:
+
+```
+ users ──▶ auth ──▶ referrals
+             └────▶ notifications ◀─────────────┐
+ integrations ──▶ events ──▶ rewards ──▶ referrals, enrollments ──▶ notifications
+                    └──────────┴──────▶ ledger
+ policies ──▶ referrals, enrollments            (+ the pure rewards/domain/reward-calculator)
+ admin ──▶ audit, notifications, reconciliation
+ settings, offerings, programs, ledger, reconciliation, audit, notifications, referrals: no feature imports
+```
+
+**Cross-module contracts.** Modules talk through these service methods (and through the database
+invariants), never by writing each other's tables ad hoc:
+
+| Contract | Owner → consumers | Semantics |
+|---|---|---|
+| `ReferralsService.resolveCodeForRegistration(tx, code)` | referrals → auth | Active code owned by an ACTIVE, verified member → `{ sponsorUserId, referralCodeId }`, else `REFERRAL_CODE_INVALID` |
+| `ReferralsService.attachNewMember(tx, { userId, sponsorUserId?, referralCodeId?, registrationIp?, registrationUserAgent? })` | referrals → auth | Runs the registration write protocol inside the caller's transaction (shared tree lock → self row → relationship → ancestor rows → own code) and enqueues `fraud.registration-attributed` |
+| `HierarchyService.getAncestors(db, userId, maxDepth)` | referrals → rewards, policies | Upline `{ userId, depth }[]`, depth ≥ 1 ascending, from the closure table |
+| `EnrollmentsService.findEligibleEnrollments(db, programId, userIds, at)` | enrollments → rewards, policies | Who held an ELIGIBLE enrollment covering instant `at` (ACTIVE/EXPIRED, or CANCELLED before `cancelledAt`); one query |
+| `RewardEngineService.processEvent(eventId)` | rewards → events (intake, sweeper) | Opens its own transaction; idempotent (`ALREADY_PROCESSED`); outcomes `REWARDS_CREATED`, `NO_ELIGIBLE_RECIPIENTS`, `REJECTED` |
+| `LedgerService.postReward(tx, rewardId, actorUserId \| null)` / `reverseReward(tx, rewardId, actorUserId, reason)` | ledger → rewards | Writes the exact two-entry posting / mirror reversal and **moves the reward to POSTED / REVERSED itself**; idempotent by key (`created: false` on replay) |
+| `NotificationsService.notify(tx, { userId, type, title, body, data?, dedupeKey? })` | notifications → everyone | Enqueues `notification.create` in the caller's transaction |
+| `ReconciliationService.countExceptions()` | reconciliation → admin | Exception total from the cached report |
+| `ProgramLifecycleService.transition(...)` | programs (internal + scheduler) | The only writer of program status (with `app.status_reason`) |
+
+## Request and processing flows
+
+### Registration → verification → attribution
+
+```
+ Browser              API (auth, referrals)                                     DB / worker
+ ───────              ─────────────────────                                     ───────────
+ POST /auth/register  validate referralCode (resolveCodeForRegistration)
+ {name,email,pw,ref}  argon2id(password) — always, for equal timing
+                      tx: lock (7302, 'EMAIL_VERIFICATION:<email>')
+                          account exists? → notice to owner (≤ 1/h), nothing else
+                          else invalidate older pending challenge,
+                               INSERT email_challenges (pending name, hash, code id),
+                               OtpMailer.enqueue → outbox 'email.otp' {challengeId, codeCiphertext}
+ ◀── 202 (identical for known and unknown addresses)                            relay: decrypt → SMTP →
+                                                                                scrub ciphertext (SENT)
+ POST /auth/verify-email {email, code, password}
+                      UPDATE … attempts + 1 … RETURNING; constant-time HMAC compare;
+                      argon2 verify password vs pending hash (dummy hash on a wrong code)
+                      tx (one, no savepoints):
+                          consume challenge (conditional UPDATE)
+                          INSERT users (ACTIVE, email verified, pending password hash)
+                          re-validate the stored code (no longer valid → root member, reported)
+                          attachNewMember: lock_shared(7301,1) → self row → relationship
+                                           (+ registration IP/UA) → ancestor rows → own code
+                                           → outbox 'fraud.registration-attributed'
+                          MEMBER role → session → audit 'user.register'
+                      COMMIT: deferred closure-consistency check
+ ◀── 200 + sid cookie + new csrf_token                                          worker: ≥ 3 attributions per
+                                                                                (sponsor, IP, 24 h) → OPEN flag
+```
+
+No users row exists until the mailbox owner proves control, so nobody can squat an address or bind
+it to a sponsor ([ADR-0010](decisions/0010-deferred-user-creation-anti-squatting.md)).
+
+### Admin sign-in (TOTP)
+
+```
+ POST /auth/login ──▶ session WITHOUT a second factor ──▶ { mfaRequired: true, method }
+   method = TOTP_ENROLLMENT (no authenticator yet):
+     POST /auth/mfa/email/send → code bound to THIS session → POST /auth/mfa/email/verify
+        → session rotated, mfaMethod = EMAIL_OTP (no admin access)
+     POST /auth/mfa/totp/setup → otpauth URI (secret stored AES-256-GCM, unconfirmed)
+     POST /auth/mfa/totp/confirm → factor confirmed → session rotated, mfaMethod = TOTP
+   method = TOTP:
+     POST /auth/mfa/totp/verify (replay-safe step) → session rotated, mfaMethod = TOTP
+ /api/v1/admin/** now passes: adminAccess = admin role ∧ mfaMethod = TOTP ∧ verified < 12 h
+```
+
+Details: [ADR-0009](decisions/0009-totp-admin-mfa-session-rotation.md), [api/identity.md](api/identity.md).
+
+### Sale intake → engine → approval → ledger
+
+```
+ POST /admin/events (admin, events:write)      POST /integrations/events (Bearer API key)
+          └──────────────┬─────────────────────────────┘
+                         ▼
+ EventIntakeService.record
+   scope + recorder SoD (an admin never records a sale for self/downline)
+   sale idempotency: (offering, externalId, revision) + requestHash
+       same hash → replay │ other facts, live revision → 409 IDEMPOTENCY_CONFLICT │ REJECTED/REVERSED → revision + 1
+   business validation → INSERT REJECTED (reason)  or  INSERT RECEIVED       [trg_events_insert_guard]
+   audit 'event.record' ─ COMMIT
+                         │ after commit (and every minute: events-received-sweeper, RECEIVED > 2 min)
+                         ▼
+ RewardEngineService.processEvent(eventId)          (own transaction)
+   event FOR UPDATE; skip unless RECEIVED
+   lock_shared(7301,1)  (waits for an in-flight sponsor correction)
+   program ACTIVE at occurredAt? policy in effect? subject ACTIVE? → else event REJECTED
+   bind policy                                          [DB re-checks applicability]
+   HierarchyService.getAncestors + EnrollmentsService.findEligibleEnrollments(at = occurredAt)
+   reward-calculator (pure): base → budget (≤ 50 %) → per-level amounts → allocation
+   INSERT reward_calculations                            [DB re-derives base, checks cap]
+   INSERT rewards  PENDING_APPROVAL  (APPROVED only: auto-approving policy ∧ not ADMIN_MANUAL)
+       auto-approved → LedgerService.postReward → POSTED
+   event PROCESSED; audit; notify recipients (outbox)
+   COMMIT: Σ rewards = calculation total; ledger shape/balance; status ⇔ ledger
+                         │
+                         ▼
+ POST /admin/rewards/:id/approve   (rewards:approve, Idempotency-Key)
+   tx: event FOR SHARE → reward FOR UPDATE → SoD (not own reward, not the sale's recorder)
+       PENDING_APPROVAL → APPROVED → LedgerService.postReward:
+           DEBIT platform expense / CREDIT recipient payable, 'reward-posting:<id>' → POSTED
+       audit 'reward.approve' + notification 'reward.posted'
+   COMMIT: deferred ledger + SoD checks
+ POST /admin/rewards/:id/reverse  → 'reward-reversal:<id>' mirror → REVERSED
+ POST /admin/events/:id/reverse   → event REVERSED first (row lock), then PENDING/APPROVED → REJECTED,
+                                    POSTED → REVERSED; COMMIT refuses any live reward left behind
+```
+
+Members then see the reward (§10 fields only) and their earnings, computed from the ledger
+(`/users/me/rewards`, `/users/me/earnings`). The reconciliation report re-proves the ledger and
+status invariants continuously.
+
+### Sponsor correction protocol
+
+```
+ GET  /admin/members/:id/sponsor-correction/preview?newSponsorId   (referrals:correct)
+      → affected members, issues (SELF_SPONSOR, CYCLE, SAME_SPONSOR, SPONSOR_INACTIVE,
+        SEGREGATION_OF_DUTIES, RECEIVED_EVENTS), canApply
+ POST /admin/members/:id/sponsor-correction { newSponsorId, reason ≥ 10 }
+   tx (one, no savepoints):
+     pg_advisory_xact_lock(7301, 1)              exclusive: no registration or engine read in between
+     re-evaluate every rule under the lock
+     INSERT referral_corrections                 [trigger: lock held, no cycle, performer not an upline of the new sponsor]
+     SET LOCAL app.referral_correction_id = id   (only this transaction can now modify the tree)
+     UPDATE referral_relationships (source = ADMIN_CORRECTION)   [cycle check]
+     DELETE closure rows: old strict ancestors × moved subtree
+     INSERT closure rows: new sponsor's ancestors-or-self × moved subtree
+     audit 'referral.correct'
+   COMMIT: every touched member's closure rows = its sponsor's rows + 1
+```
+
+Only calculations made afterwards use the new placement; past rewards never change. SQL and
+guards: [database.md](database.md#write-protocol-db-enforced), API: [api/network.md](api/network.md).
 
 ## API core & module contracts
 
@@ -22,10 +223,11 @@ src/worker.module.ts           AppConfigModule, LoggingModule, CommonModule, Job
 src/config/                    zod-validated env → typed AppConfig (fails fast)
 src/common/                    cross-cutting code. Import from '../../common' (barrel)
 src/jobs/                      outbox relay, email, notification handler, scheduler
-src/modules/index.ts           FEATURE_MODULES (all 15 modules)
+src/modules/index.ts           FEATURE_MODULES (all 16 modules, see "Module map")
 src/modules/<m>/               <m>.module.ts, <m>.controller.ts, <m>.service.ts, domain/*.ts (pure), dto.ts
 src/generated/prisma/          Prisma 7 client (generated; `import { PrismaClient, Prisma } from '../generated/prisma/client'`)
-prisma/seed.ts, seed-lib.ts    idempotent seed (roles/permissions/settings + SUPER_ADMIN via the referral write protocol); seedDemoData() stub
+prisma/seed.ts, seed-lib.ts    idempotent seed (roles/permissions/settings + SUPER_ADMIN via the referral write protocol)
+prisma/seed-demo.ts            SEED_DEMO_DATA=true: demo program, tree, enrollments, sales, approvals through the real services
 test/                          integration tests + utilities (see "Testing")
 ```
 
@@ -268,8 +470,8 @@ parses the header.
   `lockReferralTreeShared(tx)` (registration: after the users INSERT, then self row → relationship
   → ancestor rows), `lockReferralTreeExclusive(tx)` + `setReferralCorrectionId(tx, correctionId)`
   (corrections: lock first, insert the `referral_corrections` row, set the id, then rewrite).
-  Known DB issue: inside a correction, UPDATE/DELETE on `referral_paths` currently fails (see the
-  `it.fails` case in `test/db-invariants.int-spec.ts`) until `app_referral_modify_guard()` is fixed.
+  UPDATE/DELETE on `referral_paths` inside a correction works since migration
+  `20261010120000_fix_referral_modify_guard` (the original guard failed with `42703`).
 - Revoking any role (`user_roles` UPDATE/DELETE) or deactivating an ACTIVE user runs the deferred
   "≥ 1 ACTIVE SUPER_ADMIN" check at COMMIT.
 
@@ -331,30 +533,27 @@ levels deep. URLs are logged without query strings. Never log OTPs, tokens or fu
   stale schedulers are removed and one run happens at a time. Handlers must be idempotent.
   `registry.runNow(name)` runs a job directly, for example in tests. Core registers
   `outbox-cleanup` (03:17 daily; deletes `SENT` rows older than 14 days), `outbox-otp-expiry`
-  (every 15 min) and `idempotency-keys-cleanup` (hourly). Planned jobs:
-  `programs-status-transitions` (programs slice), `auth-session-cleanup` (auth slice), and
-  enrollment expiry (enrollments slice).
+  (every 15 min) and `idempotency-keys-cleanup` (hourly). Feature modules register
+  `auth-challenge-cleanup` (every 15 min), `auth-session-cleanup` (03:41 daily),
+  `programs-status-transitions` (every 60 s), `enrollments-expiry` (every 5 min) and
+  `events-received-sweeper` (every 60 s).
+- **Outbox topics** (`common/outbox/outbox.topics.ts`): `email.send`, `email.otp`,
+  `notification.create` (core handlers in `src/jobs`) and `fraud.registration-attributed`
+  (handled by `FraudSignalsService` in the referrals module).
 
-### Cross-module contracts (stubs to implement)
+### Cross-module contracts
 
-These exist with typed signatures and full JSDoc. Their bodies throw
-`NotImplementedException('<slice> slice')`, which surfaces as 501 `NOT_IMPLEMENTED`. The owning
-slice implements the body and keeps the signature.
+All contracts are implemented; the signatures and semantics are listed in
+[Module map → Cross-module contracts](#module-map). Rules that keep them safe:
 
-| Service (module) | Signature | Used by |
-|---|---|---|
-| `ReferralsService` (referrals) | `resolveCodeForRegistration(tx, code): Promise<{ sponsorUserId; referralCodeId }>`. Throws `REFERRAL_CODE_INVALID` | auth (register) |
-| | `attachNewMember(tx, { userId, sponsorUserId?, referralCodeId? }): Promise<{ referralCode }>`. Writes the self closure row, the relationship, the ancestor paths and the member's code | auth (register) |
-| `HierarchyService` (referrals) | `getAncestors(db, userId, maxDepth): Promise<{ userId; depth }[]>`, depth ≥ 1, ascending | rewards engine |
-| `EnrollmentsService` (enrollments) | `findEligibleEnrollments(db, programId, userIds, at): Promise<Map<userId, { enrollmentId }>>` | rewards engine |
-| `LedgerService` (ledger) | `postReward(tx, rewardId, actorUserId \| null): Promise<{ transactionId }>` and `reverseReward(tx, rewardId, actorUserId, reason)`. Both are idempotent by key | rewards, events |
-| `RewardEngineService` (rewards) | `processEvent(eventId): Promise<{ outcome: 'REWARDS_CREATED' \| 'NO_ELIGIBLE_RECIPIENTS' \| 'ALREADY_PROCESSED' \| 'REJECTED'; rewardIds }>`. Opens its own transaction | events |
-| `NotificationsService` (notifications) | `notify(tx, { userId, type, title, body, data?, dedupeKey? })`. **Implemented**: enqueues `notification.create` | everyone |
-
-Pre-wired module imports: `AuthModule` imports Referrals and Notifications; `RewardsModule` imports
-Referrals, Enrollments, Ledger and Notifications; `EventsModule` imports Rewards and Ledger. Avoid
-import cycles: referrals, enrollments, ledger and notifications must not import rewards or events.
-If a cycle is unavoidable, use `forwardRef`.
+- Contracts that take a `tx` run inside the caller's transaction and must not open their own
+  (no `tx.$transaction`, which would create a savepoint). `RewardEngineService.processEvent`
+  is the exception: it opens its own transaction, so call it after the caller has committed.
+- `LedgerService.postReward` / `reverseReward` change the reward status themselves; callers only
+  move PENDING_APPROVAL → APPROVED before posting.
+- Module imports follow the dependency direction in the module map: referrals, enrollments,
+  ledger, notifications, reconciliation and audit never import rewards or events, so there are no
+  cycles and no `forwardRef`.
 
 ### Adding to a module (slice checklist)
 

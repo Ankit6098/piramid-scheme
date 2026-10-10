@@ -46,9 +46,14 @@ validate first and turn violations into friendly errors.
   name, password hash and validated referral code on an `EMAIL_VERIFICATION` challenge and emails a code.
   The users row, depth-0 closure row, sponsor relationship and ancestor rows are created in the single
   transaction that verifies the code, after re-validating the referral code (owner ACTIVE + verified).
-  Only the mailbox owner can therefore attach an address to a sponsor. A newer registration for the same
-  address replaces the older pending one. For an address that already has an account the response is
-  identical and the owner gets a "someone tried to register" notice.
+  Only the mailbox owner can therefore attach an address to a sponsor. Verification requires the code
+  **and the password chosen at registration** (argon2 verify against the pending hash; one argon2
+  verification on every path, so a wrong password is indistinguishable from a wrong code: same generic
+  `OTP_INVALID`, counted as a failed attempt). A code from somebody else's registration for your address
+  therefore never activates an account with their password — the owner registers again (a newer
+  registration for the same address replaces the older pending one) and verifies with their own. For an
+  address that already has an account the response is identical and the owner gets a "someone tried to
+  register" notice.
 - **OTP codes:** 6 digits (CSPRNG); stored only as HMAC-SHA-256(pepper, `purpose:email:code`); TTL 10
   min; ≤ 5 attempts per code; single use; **one open challenge per (email, purpose)** [DB] — issuing a
   new code invalidates the old one in the same transaction; resend cooldown 60 s; ≤ 5 sends per hour;
@@ -71,12 +76,20 @@ validate first and turn violations into friendly errors.
   AES-256-GCM encrypted with `MFA_ENCRYPTION_KEY`, replay protection by last used time-step). First admin
   login with no factor: email OTP bound to that session, then forced TOTP enrollment before any
   `/admin/*` access. `/admin/*` requires `session.mfaMethod = TOTP` verified within the last 12 h.
-  Self-service password reset is disabled for admin-role users (a SUPER_ADMIN triggers it, audited);
-  password or email changes of an admin notify all SUPER_ADMINs.
+  Self-service password reset is disabled for admin-role users. Instead a SUPER_ADMIN (never for
+  themselves, reason required) sends an **admin-triggered reset** (`POST /admin/members/:id/password-reset`,
+  also usable for plain members): a `PASSWORD_RESET` code to the account's address that records the
+  issuing SUPER_ADMIN session (`email_challenges.session_id`); the account's sessions are revoked, the
+  owner is told an administrator started it, all SUPER_ADMINs are notified and it is audited
+  (`member.password_reset.send`). The password changes only when the owner enters the code on the normal
+  reset page. An admin-role account accepts a reset code **only** if it was issued this way and the issuer
+  is still an ACTIVE SUPER_ADMIN (a code requested while the account was a member is refused once it
+  holds an admin role). Password or email changes (and completed resets) of an admin notify all
+  SUPER_ADMINs.
 - **Sessions:** opaque 32-byte token in an HttpOnly, SameSite=Lax cookie `sid`; only its SHA-256 is
   stored. Member TTL 7 days, idle 12 h. On MFA success the token is rotated (old row revoked
-  `mfa_rotated`) and expiry capped at now + 12 h. Logout revokes; password change/reset, suspension and
-  **any role grant/revoke** revoke all of that user's sessions. LOGIN_MFA codes elevate only the session
+  `mfa_rotated`) and expiry capped at now + 12 h. Logout revokes; password change/reset, an admin-triggered
+  reset, suspension and **any role grant/revoke** revoke all of that user's sessions. LOGIN_MFA codes elevate only the session
   that requested them [DB]. Permissions are loaded per request.
 - Rate limits (per IP and per account/email): register, login, OTP send/verify, password reset.
 
@@ -105,7 +118,10 @@ validate first and turn violations into friendly errors.
   receive sales [DB].
 - Program lifecycle [DB state machine]: `DRAFT → SCHEDULED | ACTIVE`, `SCHEDULED → ACTIVE` (scheduler at
   `startsAt`), `ACTIVE ↔ PAUSED` (reason), `ACTIVE | PAUSED → COMPLETED` (manual, sets `endsAt = now`
-  if later, or scheduler at `endsAt`), `COMPLETED → ARCHIVED`. Never back to DRAFT. Only DRAFT programs
+  if later, or scheduler at `endsAt`), `COMPLETED → ARCHIVED`, and **cancel** `SCHEDULED → ARCHIVED`
+  (reason required, only while `startsAt` is still ahead; keeps `endsAt` or sets the earliest end the date
+  CHECKs allow, `max(startsAt + 1 s, enrollmentOpensAt + 1 s, enrollmentClosesAt)`) — a scheduled program
+  was never ACTIVE, so it has no enrollments or sales. Never back to DRAFT. Only DRAFT programs
   can be deleted. Every status change is recorded in `program_status_changes` [DB trigger; the reason is
   passed with `set_config('app.status_reason', …, true)` and the actor via `updated_by_id`].
 - Publish requires: ≥ 1 active option, ACTIVE offering, valid dates, ≥ 1 PUBLISHED policy version.
@@ -152,7 +168,9 @@ validate first and turn violations into friendly errors.
   `pg_advisory_xact_lock(7301, 1)` first, insert the `referral_corrections` row, then
   `SET LOCAL app.referral_correction_id = '<id>'`, then rewrite the relationship and the closure rows of
   the moved subtree [DB checks cycles, SoD, consistency]. Rejected if the moved subtree has RECEIVED
-  (unprocessed) sales. Affects only calculations made afterwards; past rewards never change.
+  (unprocessed) sales. Affects only calculations made afterwards; past rewards never change. The reward
+  engine holds the tree lock in **shared** mode while it calculates (§8), so a correction and a sale
+  calculation never interleave and the RECEIVED-sales check cannot be overtaken.
 - Member visibility: own sponsor + ancestors (display name = first name + last initial, depth, joined
   date); descendants up to depth 10 with display name, depth, joined date, status bucket
   (active / inactive), whether they currently hold an ELIGIBLE enrollment, direct-referral count. Never
@@ -211,7 +229,9 @@ lists the type, amount ≥ minimum) [DB when bound].
 4. Per level: FIXED amount or `round(base × bps / 10000, roundingMode)`, then `min(·, capMinor)`.
 5. Allocate in level order against the remaining budget; zero amounts dropped. Σ ≤ budget always.
 
-**Persistence** (one transaction, idempotent): lock the event `FOR UPDATE`; skip unless RECEIVED; bind
+**Persistence** (one transaction, idempotent): lock the event `FOR UPDATE`; skip unless RECEIVED; take
+`pg_advisory_xact_lock_shared(7301, 1)` (waits for an in-flight sponsor correction, blocks new ones until
+commit; ancestors are read under it); bind
 the policy to the event [DB re-checks applicability]; insert the calculation (with base, budget,
 unit/currency/minor units/points rate snapshot) [DB re-derives the base and checks the cap] and rewards
 [DB checks upline, depth, SoD]; mark the event PROCESSED. If the policy doesn't require approval and the

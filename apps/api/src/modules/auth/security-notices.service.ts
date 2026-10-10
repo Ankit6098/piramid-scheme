@@ -126,6 +126,37 @@ export class SecurityNoticesService {
     });
   }
 
+  /**
+   * A SUPER_ADMIN sent this account a password reset (the code itself goes out separately through
+   * OtpMailer). Email + in-app; no code in the payload.
+   */
+  async adminPasswordResetStarted(tx: Db, user: { id: string; email: string; fullName: string }): Promise<void> {
+    await this.outbox.enqueue(tx, {
+      topic: 'email.send',
+      payload: {
+        to: user.email,
+        template: 'generic',
+        data: {
+          subject: 'An administrator started a password reset for your account',
+          paragraphs: [
+            `Hello ${user.fullName},`,
+            'An administrator started a password reset for your account and signed it out on every device.',
+            'We sent a 6-digit code to this address in a separate email. Open the reset page and enter your email address, the code and a new password. The code expires in 10 minutes — if it expires first, ask an administrator to send a new one.',
+            "If you didn't expect this, contact your platform administrator before using the code.",
+          ],
+          actionLabel: 'Reset password',
+          actionUrl: this.url('/reset-password'),
+        },
+      },
+    });
+    await this.notifications.notify(tx, {
+      userId: user.id,
+      type: 'security.password_reset_started',
+      title: 'Password reset started by an administrator',
+      body: 'An administrator sent a password reset code to your email address and signed you out on every device.',
+    });
+  }
+
   /** The sign-in email was changed — sent to the OLD address. */
   async emailChanged(tx: Db, input: { userId: string; oldEmail: string; newEmail: string; name: string }): Promise<void> {
     await this.outbox.enqueue(tx, {

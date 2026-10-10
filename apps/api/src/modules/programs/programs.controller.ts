@@ -3,6 +3,7 @@ import { ApiBody, ApiTags } from '@nestjs/swagger';
 import { Permission, programLifecycleSchema, type ProgramLifecycleAction } from '@app/shared';
 import { CurrentUser, IdParamDto, ok, RequirePermissions, type AuthContext } from '../../common';
 import {
+  CancelProgramDto,
   CreateProgramDto,
   CreateProgramOptionDto,
   ListAdminProgramsQueryDto,
@@ -123,6 +124,14 @@ export class AdminProgramsController {
   @ApiBody({ type: ProgramLifecycleDto, required: false })
   archive(@Param() p: IdParamDto, @Body() body: unknown, @CurrentUser() auth: AuthContext) {
     return this.lifecycleAction(auth, p.id, 'archive', body);
+  }
+
+  /** Withdraws a SCHEDULED program before its start date (→ ARCHIVED, reason required). */
+  @Post(':id/cancel')
+  @HttpCode(200)
+  @RequirePermissions(Permission.ProgramsPublish)
+  async cancel(@Param() p: IdParamDto, @Body() body: CancelProgramDto, @CurrentUser() auth: AuthContext) {
+    return ok(await this.lifecycle.transition(auth, p.id, 'cancel', body));
   }
 
   // ─── options ───────────────────────────────────────────────────────────────

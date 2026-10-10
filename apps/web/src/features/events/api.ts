@@ -2,6 +2,7 @@
 
 import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
+  EventReversalResultDto,
   RecordSaleInput,
   RecordSaleResultDto,
   SaleEventDetailDto,
@@ -11,6 +12,7 @@ import type {
 import { api } from '@/lib/api-client';
 import { queryKeys } from '@/lib/query-keys';
 
+import { financeKeys } from '../finance/query-keys';
 import { eventKeys } from './query-keys';
 
 /** Path of the cursor-paginated sales list (used with `useCursorList`). */
@@ -42,12 +44,21 @@ export function useSaleEvent(id: string | null) {
   return useQuery({ ...saleEventQueryOptions(id ?? ''), enabled: Boolean(id) });
 }
 
+/**
+ * Recording a sale creates rewards (auto-approved ones are posted to the ledger); reversing one
+ * rejects or reverses them with compensating ledger entries. Refresh the sales feature and every
+ * finance view those rewards appear in: approval queue + counts, ledger, reconciliation, the admin
+ * overview counters and members' own rewards/earnings.
+ */
 function useInvalidateSales() {
   const queryClient = useQueryClient();
   return () =>
     Promise.all([
       queryClient.invalidateQueries({ queryKey: eventKeys.all }),
-      // Recording/reversing a sale creates or changes rewards owned by the rewards feature.
+      queryClient.invalidateQueries({ queryKey: financeKeys.adminRewards.all }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.ledger.all }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.reconciliation.all }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.adminOverview }),
       queryClient.invalidateQueries({ queryKey: queryKeys.rewards.all }),
     ]);
 }
@@ -81,14 +92,14 @@ export interface ReverseSaleVariables {
 }
 
 /**
- * POST /admin/events/:id/reverse — rejects or reverses every reward of the sale. Owned by the
- * rewards slice; it may answer 501 NOT_IMPLEMENTED until that slice lands.
+ * POST /admin/events/:id/reverse (`events:reverse`) — rejects every unposted reward of the sale and
+ * reverses every posted one with a compensating ledger entry, in one transaction.
  */
 export function useReverseSale() {
   const invalidate = useInvalidateSales();
   return useMutation({
     mutationFn: ({ eventId, reason, idempotencyKey }: ReverseSaleVariables) =>
-      api.post<unknown>(
+      api.post<EventReversalResultDto>(
         `/admin/events/${encodeURIComponent(eventId)}/reverse`,
         { reason },
         { idempotencyKey },

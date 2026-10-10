@@ -81,8 +81,17 @@ export type RegisterRequest = z.output<typeof registerSchema>;
 export const resendVerificationSchema = z.object({ email: emailSchema });
 export type ResendVerificationRequest = z.output<typeof resendVerificationSchema>;
 
-/** `POST /auth/verify-email` — creates the account, attaches the sponsor, signs in. */
-export const verifyEmailSchema = z.object({ email: emailSchema, code: otpCodeSchema });
+/**
+ * `POST /auth/verify-email` — creates the account, attaches the sponsor, signs in. `password` must be
+ * the one chosen at registration (checked against the pending hash): a code from somebody else's
+ * registration for your address can never activate an account with their password. A mismatch is
+ * the same generic `OTP_INVALID` as a wrong code and counts as a failed attempt.
+ */
+export const verifyEmailSchema = z.object({
+  email: emailSchema,
+  code: otpCodeSchema,
+  password: currentPasswordSchema,
+});
 export type VerifyEmailInput = z.input<typeof verifyEmailSchema>;
 export type VerifyEmailRequest = z.output<typeof verifyEmailSchema>;
 

@@ -30,6 +30,8 @@ type ListQuery = z.output<typeof listSaleEventsQuerySchema>;
 const listCursorSchema = z.object({ c: z.iso.datetime(), id: z.uuid() });
 /** Programs that can receive sales (SCHEDULED/DRAFT ones have not run yet). */
 const RECORDABLE_STATUSES = new Set(['ACTIVE', 'PAUSED', 'COMPLETED', 'ARCHIVED']);
+/** Finished programs take late sales only if they ever ran (a cancelled SCHEDULED program never did). */
+const FINISHED_STATUSES = new Set(['COMPLETED', 'ARCHIVED']);
 
 /** Admin read side of sales events (business rules §8, §10: admin-only details). */
 @Injectable()
@@ -51,15 +53,19 @@ export class EventsQueryService {
         currencyCode: true,
         currencyMinorUnits: true,
         timezone: true,
+        statusChanges: { where: { toStatus: 'ACTIVE' }, select: { id: true }, take: 1 },
       },
       orderBy: [{ name: 'asc' }, { id: 'asc' }],
       take: 500,
     });
     const mayRecord = auth.permissions.has(Permission.EventsWrite);
-    return rows.map((p) => ({
-      ...p,
-      canRecordSales: mayRecord && RECORDABLE_STATUSES.has(p.status) && canAccessProgram(auth, p.id, 'write'),
-    }));
+    return rows.map(({ statusChanges, ...p }) => {
+      const ran = !FINISHED_STATUSES.has(p.status) || statusChanges.length > 0;
+      return {
+        ...p,
+        canRecordSales: mayRecord && RECORDABLE_STATUSES.has(p.status) && ran && canAccessProgram(auth, p.id, 'write'),
+      };
+    });
   }
 
   async list(auth: AuthContext, q: ListQuery): Promise<ApiPage<SaleEventDto>> {

@@ -3,7 +3,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Permission } from '@app/shared';
 import { type AuthContext, CurrentUser, IdParamDto, ok, RequirePermissions } from '../../common';
 import { AdminMembersService } from './admin-members.service';
-import { AdminMemberListQueryDto, AdminMemberRolesUpdateDto, AdminMemberStatusChangeDto } from './dto';
+import { AdminMemberListQueryDto, AdminMemberPasswordResetDto, AdminMemberRolesUpdateDto, AdminMemberStatusChangeDto } from './dto';
 
 /**
  * Member management (/api/v1/admin/members) — HTTP only. PROGRAM_ADMIN scoping (members enrolled in
@@ -50,5 +50,16 @@ export class AdminMembersController {
   @ApiOperation({ summary: 'Replace the roles of a member (reason; not yourself; revokes their sessions)' })
   async updateRoles(@Param() p: IdParamDto, @Body() body: AdminMemberRolesUpdateDto, @CurrentUser() auth: AuthContext) {
     return ok(await this.members.updateRoles(auth, p.id, body));
+  }
+
+  /** SUPER_ADMIN only (both permissions below are SUPER_ADMIN-only by default; the service re-checks the role). */
+  @Post(':id/password-reset')
+  @HttpCode(HttpStatus.OK)
+  @RequirePermissions(Permission.MembersWrite, Permission.RolesAssign)
+  @ApiOperation({
+    summary: 'Email a password reset code (also for admin accounts; reason; not yourself; revokes their sessions; Super Admin only)',
+  })
+  async sendPasswordReset(@Param() p: IdParamDto, @Body() body: AdminMemberPasswordResetDto, @CurrentUser() auth: AuthContext) {
+    return ok(await this.members.sendPasswordReset(auth, p.id, body.reason));
   }
 }

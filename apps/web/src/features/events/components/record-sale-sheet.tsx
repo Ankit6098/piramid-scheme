@@ -14,7 +14,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useEffect, useId, useState, type ReactNode } from 'react';
-import { useForm, useFormState, useWatch } from 'react-hook-form';
+import { useController, useForm, useFormState, useWatch } from 'react-hook-form';
 import { toast } from 'sonner';
 import { z } from 'zod';
 import {
@@ -32,8 +32,10 @@ import {
 import { Amount } from '@/components/app/amount';
 import {
   applyApiFieldErrors,
+  describedBy,
   FormAmountField,
   FormDateTimeField,
+  FormItem,
   FormSelect,
   FormTextarea,
   FormTextField,
@@ -53,10 +55,12 @@ import {
 } from '@/components/ui/sheet';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
+import { useSession } from '@/hooks/use-session';
 import { createIdempotencyKey, getErrorMessage, isApiError } from '@/lib/api-client';
 import { enumLabel, enumOptions } from '@/lib/enum-labels';
 import { cn } from '@/lib/utils';
 
+import { MemberPicker, type PickedMember } from '../../hierarchy/components/member-picker';
 import { useRecordSale } from '../api';
 import { pluralize, programCurrencyFormat, programOptionLabel, programRewardFormat } from '../labels';
 
@@ -68,8 +72,8 @@ export const recordSaleFormSchema = recordSaleSchema.extend({
   subjectUserId: z
     .string()
     .trim()
-    .min(1, 'Enter the ID of the member credited with the sale')
-    .pipe(z.uuid({ error: 'Enter a valid member ID (UUID format)' })),
+    .min(1, 'Choose the member credited with the sale')
+    .pipe(z.uuid({ error: 'Choose a member from the list' })),
   amountMinor: z.string().min(1, 'Enter the sale amount').pipe(positiveMinorAmountSchema),
   occurredAt: z.string().min(1, 'Enter when the sale happened').pipe(isoDateTimeSchema),
 });
@@ -101,6 +105,8 @@ export interface RecordSaleSession {
   /** Changes on every open → fresh form state and a fresh Idempotency-Key. */
   id: string;
   defaults: RecordSaleFormInput;
+  /** The member credited in `defaults.subjectUserId` (shown by the member picker). */
+  subject?: PickedMember;
   /** Set for "Re-record" of a rejected/reversed sale. */
   supersedes?: RecordSaleSupersedes;
 }
@@ -142,6 +148,7 @@ export function createRecordSaleSession(
       occurredAt: prefill.occurredAt,
       description: prefill.description ?? '',
     },
+    subject: { id: prefill.subject.id, fullName: prefill.subject.fullName },
     supersedes: {
       id: prefill.id,
       externalId: prefill.externalId,
@@ -325,7 +332,10 @@ export function RecordSaleSheetContent({
   onViewEvent,
 }: RecordSaleSheetContentProps) {
   const formId = useId();
+  const subjectInputId = useId();
+  const { user } = useSession();
   const [idempotencyKey, setIdempotencyKey] = useState(createIdempotencyKey);
+  const [subject, setSubject] = useState<PickedMember | null>(session.subject ?? null);
   const [supersedes, setSupersedes] = useState(session.supersedes);
   const [result, setResult] = useState<RecordSaleResultDto | null>(null);
   const mutation = useRecordSale();
@@ -336,6 +346,8 @@ export function RecordSaleSheetContent({
   });
   const { isDirty } = useFormState({ control: form.control });
   useUnsavedChangesWarning(form, { enabled: open && !result });
+  const subjectField = useController({ control: form.control, name: 'subjectUserId' });
+  const subjectError = subjectField.fieldState.error?.message;
 
   const recordable = (programs ?? []).filter((p) => p.canRecordSales);
   const programId = useWatch({ control: form.control, name: 'programId' });
@@ -441,6 +453,7 @@ export function RecordSaleSheetContent({
     form.reset(emptyDefaults(new Date().toISOString(), { programId: current.programId, type: current.type }));
     setIdempotencyKey(createIdempotencyKey());
     setSupersedes(undefined);
+    setSubject(null);
     setResult(null);
     mutation.reset();
   }
@@ -565,17 +578,29 @@ export function RecordSaleSheetContent({
               disabled={pending}
             />
           </div>
-          <FormTextField
-            control={form.control}
-            name="subjectUserId"
-            label="Member ID"
-            description="The member credited with the sale; rewards go to their eligible upline."
-            placeholder="00000000-0000-0000-0000-000000000000"
-            autoComplete="off"
-            spellCheck={false}
+          <FormItem
+            id={subjectInputId}
+            label="Member credited"
+            description="The active member credited with the sale; rewards go to their eligible upline."
+            error={subjectError}
             required
             disabled={pending}
-          />
+          >
+            <MemberPicker
+              id={subjectInputId}
+              value={subject}
+              onChange={(member) => {
+                setSubject(member);
+                subjectField.field.onChange(member?.id ?? '');
+              }}
+              status="ACTIVE"
+              // Recorder segregation of duties: never yourself (the API also refuses your downline).
+              excludeIds={user ? [user.id] : []}
+              invalid={Boolean(subjectError)}
+              describedBy={describedBy(subjectInputId, true, Boolean(subjectError))}
+              disabled={pending}
+            />
+          </FormItem>
           <FormAmountField
             control={form.control}
             name="amountMinor"

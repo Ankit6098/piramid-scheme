@@ -28,7 +28,10 @@ export interface IssueChallengeInput {
   email: string;
   purpose: ChallengePurpose;
   userId?: string | null;
-  /** LOGIN_MFA: the session the code may elevate. */
+  /**
+   * LOGIN_MFA: the session the code may elevate. PASSWORD_RESET: the SUPER_ADMIN session that issued
+   * an admin-triggered reset (AuthService.issueAdminPasswordReset) — null for self-service codes.
+   */
   sessionId?: string | null;
   /** EMAIL_VERIFICATION for a not-yet-created account. */
   pending?: PendingRegistration | null;

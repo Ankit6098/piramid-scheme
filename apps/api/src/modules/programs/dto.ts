@@ -1,4 +1,5 @@
 import {
+  cancelProgramSchema,
   createProgramOptionSchema,
   createProgramSchema,
   listAdminProgramsQuerySchema,
@@ -19,6 +20,7 @@ export class ListMemberProgramsQueryDto extends createZodDto(listMemberProgramsQ
 /** Documentation only — lifecycle bodies may be omitted (see parseOptionalBody). */
 export class ProgramLifecycleDto extends createZodDto(programLifecycleSchema) {}
 export class PauseProgramDto extends createZodDto(pauseProgramSchema) {}
+export class CancelProgramDto extends createZodDto(cancelProgramSchema) {}
 export class CreateProgramOptionDto extends createZodDto(createProgramOptionSchema) {}
 export class UpdateProgramOptionDto extends createZodDto(updateProgramOptionSchema) {}
 export class SetProgramAdminsDto extends createZodDto(setProgramAdminsSchema) {}

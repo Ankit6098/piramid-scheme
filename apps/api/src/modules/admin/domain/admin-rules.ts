@@ -41,6 +41,25 @@ export function checkStatusChange(
   return { allowed: true };
 }
 
+export type PasswordResetRefusal =
+  /** Admin-triggered resets are a SUPER_ADMIN action (self-service reset is disabled for admin roles). */
+  | 'NOT_SUPER_ADMIN'
+  /** Your own password is changed in the profile (current password required), never this way. */
+  | 'SELF'
+  /** Only ACTIVE accounts can complete a reset. */
+  | 'INVALID_STATUS';
+
+/** Whether `actor` may email `target` a password reset code (POST /admin/members/:id/password-reset). */
+export function checkAdminPasswordReset(
+  actor: StatusChangeActor,
+  target: Pick<StatusChangeTarget, 'id' | 'status'>,
+): { allowed: true } | { allowed: false; reason: PasswordResetRefusal } {
+  if (!actor.roles.includes('SUPER_ADMIN')) return { allowed: false, reason: 'NOT_SUPER_ADMIN' };
+  if (actor.userId === target.id) return { allowed: false, reason: 'SELF' };
+  if (target.status !== 'ACTIVE') return { allowed: false, reason: 'INVALID_STATUS' };
+  return { allowed: true };
+}
+
 const ROLE_ORDER = new Map<string, number>(RoleKey.map((r, i) => [r, i]));
 
 /** Deduplicated, canonical-ordered role set that always contains MEMBER. */

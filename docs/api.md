@@ -1,25 +1,51 @@
 # API
 
-REST/JSON API served by `apps/api` (NestJS). In production it is reached on the same origin as the
-web app through nginx (`https://<host>/api/v1/...`). In development it runs on `http://localhost:4000`
-(and the web dev server rewrites `/api/*` to it).
+REST/JSON API served by `apps/api` (NestJS). In production nginx serves it on the same origin as
+the web app (`https://<host>/api/v1/...`). In development it runs on `http://localhost:4000`, and the
+web dev server rewrites `/api/*` to it.
 
-- **OpenAPI / Swagger UI:** `/api/docs` (disabled when `NODE_ENV=production`). The spec can be
-  exported with `corepack pnpm --filter @app/api openapi`.
-- **Contracts:** request schemas and response types live in `@app/shared` (`packages/shared/src/contracts/<module>.ts`)
-  and are shared by the API (via `createZodDto`) and the web app. They are the source of truth;
-  this document summarizes conventions and catalogues endpoints.
+This page is the **index**: the conventions every endpoint follows, then a catalogue of every
+implemented route. Request and response contracts, rules and error cases are in the slice
+documents:
+
+| Slice doc | Covers |
+|---|---|
+| [api/identity.md](api/identity.md) | Registration, email verification, login, logout, password reset, admin MFA (email OTP + TOTP), self-service account (`/users/me`) |
+| [api/catalog.md](api/catalog.md) | Platform settings and currencies, offerings, programs and options, program admins, member program catalogue, enrollments |
+| [api/network.md](api/network.md) | Referral codes, sponsor/upline, team tree, admin hierarchy views, sponsor corrections, member flags, the shared-IP fraud signal |
+| [api/engine.md](api/engine.md) | Reward policies (drafts, validation, dry-run, publish, retire), sales intake and events, API clients and machine ingestion |
+| [api/finance.md](api/finance.md) | Reward queue, approve/reject/reverse, event reversal, ledger, reconciliation, member rewards and earnings, CSV exports |
+| [api/adminops.md](api/adminops.md) | Admin overview, member administration (suspend, roles), audit log, notifications, member dashboard |
+
+Other sources of truth:
+
+- **Contracts:** Zod request schemas and response DTO types live in `@app/shared`
+  (`packages/shared/src/contracts/<module>.ts`). The API wraps them with `createZodDto`; the web
+  app imports the same types.
+- **OpenAPI / Swagger UI:** `/api/docs` (JSON at `/api/docs-json`), disabled when
+  `NODE_ENV=production`. Export the spec with `corepack pnpm --filter @app/api openapi`.
+- **Domain rules:** [business-rules.md](business-rules.md). **Security model:** [security.md](security.md).
+
+## Contents
+
+1. [Conventions](#conventions)
+2. [Endpoint catalogue](#endpoint-catalogue)
+3. [Documented vs implemented](#documented-vs-implemented)
+4. [Adding an endpoint](#adding-an-endpoint)
 
 ## Conventions
 
-### Versioning and paths
+### Paths and versioning
 
-- Base path `/api/v1`. Breaking changes → `/api/v2` (both served during a migration window).
-- Member-facing routes: `/api/v1/<module>/...`, with "my" resources under `/me` where natural.
-- Admin routes: `/api/v1/admin/<module>/...`. They require an admin role **and** an MFA-verified
-  session (otherwise `403 MFA_REQUIRED`), plus the route's permission.
-- JSON property names are `camelCase`. Path segments are kebab-case plural nouns. Actions that
-  are not CRUD are sub-resources with POST (`POST /admin/rewards/{id}/approve`).
+- Base path `/api/v1` (global prefix `api` + URI versioning). A breaking change would ship as
+  `/api/v2`, with both versions served during a migration window.
+- Member routes: `/api/v1/<module>/...`; the caller's own resources live under `/users/me/...`.
+- Admin routes: `/api/v1/admin/...`. Every one of them requires an admin role **and** a
+  TOTP-verified session (see [Admin access](#admin-access-and-mfa)), plus the route's permission.
+- JSON properties are `camelCase`. Path segments are kebab-case plural nouns. Non-CRUD actions are
+  POST sub-resources (`POST /admin/rewards/{id}/approve`, `POST /admin/programs/{id}/publish`).
+- Status codes: `200` (also for actions), `201` with the created resource, `202` for "accepted,
+  check your email" flows, `204` for deletes with no body. ETags are disabled.
 
 ### Envelopes
 
@@ -36,253 +62,429 @@ web app through nginx (`https://<host>/api/v1/...`). In development it runs on `
              "requestId": "5e4f8cb6dd275d2118b9710508dcb6d9" } }
 ```
 
-- Never return Prisma entities. Every response is an explicit DTO. Never expose `passwordHash`,
-  `codeHash`, `tokenHash`, or other members' email or phone.
-- `204 No Content` for mutations with nothing to return (e.g. logout). Otherwise `200`, or `201`
-  with the created resource.
+- Every response body is an explicit DTO, never a Prisma entity. `passwordHash`, `codeHash`,
+  `tokenHash`, TOTP secrets (after enrollment), API keys (after creation) and other members'
+  email addresses or phone numbers are never returned.
+- CSV exports are the only non-JSON success responses (see [CSV exports](#csv-exports)).
+
+### Errors
+
+`code` comes from `ErrorCode` in `@app/shared`. `message` is safe to show to users. `details` is
+structured and never contains secrets.
+
+| Status | Codes |
+|---|---|
+| 400 | `VALIDATION_FAILED` (`details.issues[] = { path, message, code }`), `POLICY_INVALID` (`details.issues`), `REFERRAL_CODE_INVALID`, `OTP_INVALID` (every failed code verification, same message) |
+| 401 | `UNAUTHENTICATED` (no/expired/revoked session, bad API key), `INVALID_CREDENTIALS` |
+| 403 | `FORBIDDEN` (`details.missingPermissions` when a permission is missing; program outside the caller's scope), `MFA_REQUIRED` (`details.reason`), `CSRF_FAILED`, `ACCOUNT_SUSPENDED`, `EMAIL_NOT_VERIFIED` |
+| 404 | `NOT_FOUND`. Also used instead of 403 where existence must not leak (another member's reward, a member outside the visible team, a member outside a program admin's scope) |
+| 409 | `CONFLICT` (unique violations; `details.reason` such as `SEGREGATION_OF_DUTIES`, `RECORDER_SOD`, `STALE_SUPERSEDE`; `details.retryable` for serialization failures and in-flight idempotency keys), `INVARIANT_VIOLATION` (a DB trigger refused the write), `REFERRAL_CYCLE`, `PROGRAM_NOT_ENROLLABLE`, `ALREADY_ENROLLED`, `NOT_ELIGIBLE`, `INVALID_STATE_TRANSITION` (`details.status` / `details.checks` / `details.fields`), `STALE_VERSION`, `IDEMPOTENCY_CONFLICT` |
+| 413 | `PAYLOAD_TOO_LARGE` (API body limit 100 kB; nginx limit 2 MB) |
+| 429 | `RATE_LIMITED`, `OTP_TOO_MANY_ATTEMPTS`, `OTP_COOLDOWN` (with `Retry-After` when known) |
+| 500 | `INTERNAL_ERROR` (generic message; correlate with `requestId`) |
+| 501 | `NOT_IMPLEMENTED` |
+| 503 | `SERVICE_UNAVAILABLE` (readiness failure, or nginx when the API is unreachable) |
+
+`ACCOUNT_LOCKED` (423) and `OTP_EXPIRED` exist in the enum but no route emits them: login uses
+throttling instead of account locks, and an expired code is reported as `OTP_INVALID`.
+
+Database guards: trigger violations (SQLSTATE `23001`), CHECK violations (`23514`) and exclusion
+violations (`23P01`) become `409 INVARIANT_VIOLATION` with `details = { sqlState, constraint?,
+reason? }`; unique violations become `409 CONFLICT` (or a domain code such as `ALREADY_ENROLLED`).
+Services validate first, so these mostly indicate a race or a bug. See
+[database.md](database.md#invariants).
 
 ### Pagination, filtering, sorting
 
-- Query: `?cursor=<opaque>&limit=<1..100>` (default 25). The cursor is base64url JSON of the sort
-  key. Clients must treat it as opaque. A tampered cursor → `400 VALIDATION_FAILED`.
-- `nextCursor: null` means the last page. There are no total counts on large lists (use
-  dedicated summary endpoints).
-- Filters are plain query parameters (`?status=PENDING_APPROVAL&programId=…`). Each list endpoint
-  has a documented default sort, usually `createdAt desc, id desc`.
+- Query: `?cursor=<opaque>&limit=<1..100>` (default 25 unless a route says otherwise; team children
+  default 50, team search ≤ 50). The cursor is base64url JSON of the sort key. Treat it as opaque. A
+  tampered cursor → `400 VALIDATION_FAILED`.
+- `nextCursor: null` means the last page. Large lists carry no total counts; dedicated endpoints
+  return counts (`/admin/rewards/counts`, `/users/me/hierarchy/summary`, `/admin/overview`).
+- Filters are plain query parameters (`?status=PENDING_APPROVAL&programId=…`); some accept a
+  repeated parameter (`status=ACTIVE&status=PAUSED`). The default sort is newest first
+  (`createdAt desc, id desc`) unless the slice doc says otherwise.
+- Date filters (`from` / `to`) accept an ISO-8601 date-time with offset, or a calendar date
+  `YYYY-MM-DD` (UTC day) on finance routes. `from` is inclusive, `to` exclusive.
 
 ### Data types
 
 | Type | Wire format |
 |---|---|
-| Amounts (money or points) | **Decimal string of integer minor units**: `"amountMinor": "150000"`. Never JSON numbers. Accompanied by `rewardUnit` + `currencyCode` where ambiguous. Format with `formatAmount()` from `@app/shared`. |
-| Rates | Integer basis points (`"budgetBps": 2000` = 20 %). |
-| Timestamps | ISO-8601 with offset, UTC (`"2026-10-09T19:45:53.123Z"`). Programs carry an IANA `timezone` for display. |
-| IDs | UUID strings. Programs also have a slug `code`. |
+| Amounts (money or points) | **Decimal string of integer minor units**: `"amountMinor": "150000"`. Never a JSON number. Stored as `bigint`. Every amount travels with its own `rewardUnit` + `currencyCode` (+ `currencyMinorUnits` where needed). Format only with `formatAmount()` from `@app/shared`, using the record's own unit and currency, never the live settings. |
+| Sale amounts | Always minor units of the **program currency**. Reward amounts are in the program's **reward unit** (currency minor units for MONEY, whole points for POINTS). |
+| Rates | Integer basis points: `"budgetBps": 2000` = 20 %, `100` = 1 %. |
+| Timestamps | ISO-8601 UTC (`"2026-10-09T19:45:53.123Z"`). Programs carry an IANA `timezone` for display; member reward dates are calendar dates (`YYYY-MM-DD`) in the program time zone. |
+| IDs | UUID strings. Programs also have a slug `code` (`GET /programs/{idOrCode}`). |
 | Enums | Upper-snake strings from `@app/shared` (`"PENDING_APPROVAL"`). |
 
-### Authentication, CSRF, idempotency
+### Authentication and sessions
 
-- **Session cookie** `sid` (HttpOnly) after login. Browsers send it automatically, so clients
-  never handle tokens.
-- **CSRF:** call `GET /api/v1/auth/csrf` once. It sets the `csrf_token` cookie. Send its value
-  in `x-csrf-token` on every POST/PUT/PATCH/DELETE. The `Origin` header must be an allowed
-  origin. Failure → `403 CSRF_FAILED`.
-- **Idempotency:** financial mutations (event intake, approvals, reversals, bulk operations)
-  accept `Idempotency-Key: <8–128 chars [A-Za-z0-9_-:.]>`. A retried request with the same key
-  and the same payload returns the original result. The same key with a different payload →
-  `409 IDEMPOTENCY_CONFLICT`.
-- **Optimistic concurrency:** editable aggregates (programs, platform settings) return `version`.
-  Updates must send it back, and a stale `version` → `409 STALE_VERSION`.
+- **Session cookie** `sid` (opaque 32-byte token, `HttpOnly`, `SameSite=Lax`, `Secure` in
+  production). Only its SHA-256 is stored. Browsers send it automatically; clients never handle
+  tokens. There is no JWT and nothing in `localStorage`.
+- Every route requires a session unless marked `public` (no session) or `optional` (works either
+  way). `GET /auth/session` returns the current user, roles, permissions, `adminAccess`,
+  `mfaMethod` and `hasTotpFactor`.
+- Member sessions last 7 days (idle timeout 12 h); admin-role sessions 12 h. Logout revokes the
+  session. Password or email change and a TOTP reset revoke the user's other sessions; password
+  reset, suspension and any role change revoke all of them. Roles and permissions are re-read on
+  every request.
+- **Machine clients** (`POST /integrations/events`) authenticate with
+  `Authorization: Bearer rpk_…` (an API key scoped to one program), no cookie and no CSRF.
 
-### Errors
+### Admin access and MFA
 
-`code` values come from `ErrorCode` in `@app/shared`. HTTP status defaults:
+- `/api/v1/admin/**` requires a non-MEMBER role (else `403 FORBIDDEN`) and `adminAccess`: a TOTP
+  code verified **in this session** within the last 12 h. Otherwise `403 MFA_REQUIRED` with
+  `details.reason`:
+  - `TOTP_ENROLLMENT_REQUIRED`: the admin has no confirmed authenticator yet;
+  - `TOTP_REQUIRED`: an authenticator exists but this session has no recent TOTP verification.
+- Login never grants admin access by itself. `POST /auth/login` returns
+  `{ mfaRequired: true, method: 'TOTP' | 'TOTP_ENROLLMENT' }` for admin-role users. First login:
+  an email code bound to the session (`/auth/mfa/email/*`, grants `EMAIL_OTP`, never admin access)
+  → `/auth/mfa/totp/setup` → `/auth/mfa/totp/confirm`. Later logins: `/auth/mfa/totp/verify`.
+  Every successful step **rotates** the session cookie. Details:
+  [api/identity.md](api/identity.md), [ADR-0009](decisions/0009-totp-admin-mfa-session-rotation.md).
+- The member area (`/users/me/*`, `/programs/*`) works for admins without MFA.
+- **Permissions:** `@RequirePermissions(...)` requires every listed permission
+  (`403 FORBIDDEN`, `details.missingPermissions`). Role → permission mapping: `ROLE_PERMISSIONS` in
+  `packages/shared/src/permissions.ts` and [business-rules.md §3](business-rules.md#3-roles-permissions-segregation-of-duties).
+- **Program scope:** routes marked *scoped* call `assertProgramAccess`. SUPER_ADMIN sees every
+  program; PROGRAM_ADMIN only assigned programs (lists are filtered, an explicit out-of-scope
+  `programId` → 403, an out-of-scope member → 404); FINANCE_REVIEWER reads every program and writes
+  none.
+- Hiding UI is never authorization. The API guard is.
 
-| Status | Codes |
+### CSRF and origin checks
+
+- Call `GET /api/v1/auth/csrf` once. It sets the `csrf_token` cookie (readable by the SPA) and
+  returns `{ data: { csrfToken } }`. Login, verification and logout issue a fresh token.
+- Every POST/PUT/PATCH/DELETE must send the cookie value in `x-csrf-token` (constant-time compare).
+  When `Origin` is present it must be an allowed origin (`APP_PUBLIC_URL` + `CORS_ORIGINS`;
+  `null` is rejected); otherwise a present `Referer` must be allowed. Failure → `403 CSRF_FAILED`.
+- Only `POST /integrations/events` skips CSRF (bearer API key, no cookie).
+
+### Idempotency
+
+Financial mutations accept an **`Idempotency-Key`** header (8–128 chars of `[A-Za-z0-9_-:.]`),
+stored in `idempotency_keys` per actor for 24 h with a SHA-256 of the canonical request (method,
+route pattern, params, query, body):
+
+- a retry with the same key and the same request returns the stored status and body without
+  re-running the handler, with the header `Idempotent-Replayed: true`;
+- the same key with a different request → `409 IDEMPOTENCY_CONFLICT`;
+- while the first request is still running → `409 CONFLICT` (`details.retryable: true`);
+- failed requests are not stored (the key is released, so a retry runs again).
+
+| Key | Routes |
 |---|---|
-| 400 | `VALIDATION_FAILED`, `POLICY_INVALID`, `REFERRAL_CODE_INVALID`, `OTP_INVALID`, `OTP_EXPIRED` |
-| 401 | `UNAUTHENTICATED`, `INVALID_CREDENTIALS` |
-| 403 | `FORBIDDEN`, `MFA_REQUIRED`, `CSRF_FAILED`, `ACCOUNT_SUSPENDED`, `EMAIL_NOT_VERIFIED` |
-| 404 | `NOT_FOUND` (also used instead of 403 where existence must not leak) |
-| 409 | `CONFLICT`, `INVARIANT_VIOLATION` (DB guard), `REFERRAL_CYCLE`, `PROGRAM_NOT_ENROLLABLE`, `ALREADY_ENROLLED`, `NOT_ELIGIBLE`, `INVALID_STATE_TRANSITION`, `STALE_VERSION`, `IDEMPOTENCY_CONFLICT` |
-| 413 | `PAYLOAD_TOO_LARGE` (nginx limits bodies to 2 MB) |
-| 423 | `ACCOUNT_LOCKED` |
-| 429 | `RATE_LIMITED`, `OTP_TOO_MANY_ATTEMPTS`, `OTP_COOLDOWN` (with `Retry-After` where known) |
-| 500 | `INTERNAL_ERROR` (no internals in `message`; correlate via `requestId`) |
-| 501 | `NOT_IMPLEMENTED` |
-| 503 | `SERVICE_UNAVAILABLE` (readiness failure, or nginx when the API is unreachable) |
+| **Required** (missing → 400) | `POST /admin/rewards/{id}/approve`, `/reject`, `/reverse`, `POST /admin/rewards/bulk-approve`, `POST /admin/events/{id}/reverse` |
+| Optional | `POST /admin/events` (record a sale), `POST /admin/policies/{id}/publish`, `/retire`, `POST /admin/members/{id}/sponsor-correction` |
 
-`message` is safe to show to users. `details` is structured (validation `issues`, conflicting ids)
-and never contains secrets.
+Independently of the header, the domain is idempotent where money is concerned: a sale is unique
+on `(offering, externalId, revision)` with a request hash (a replay returns the existing event, a
+different payload → `409 IDEMPOTENCY_CONFLICT`); a reward is posted at most once
+(`reward-posting:<rewardId>`) and reversed at most once (`reward-reversal:<rewardId>`). See
+[ADR-0012](decisions/0012-idempotency-key-storage.md).
 
-### Rate limits and request ids
+### Optimistic concurrency
 
-- nginx: auth mutations 10/min per IP (burst 20), all API 20 r/s per IP (burst 40). The API adds
-  per-route throttles (`auth`, `otp`) and per-account limits. A rejection is
-  `429 { "error": { "code": "RATE_LIMITED", … } }`. See [security.md](security.md#5-rate-limits).
-- Every response carries `X-Request-Id`, and error bodies include `requestId`. Send your own
-  `X-Request-Id` (8–128 chars `[A-Za-z0-9._:-]`) to correlate client logs.
+Editable aggregates return a `version`: platform settings (`PUT /admin/settings` takes
+`expectedVersion`) and programs (`PATCH /admin/programs/{id}` takes `expectedVersion`; lifecycle
+actions accept it optionally). A stale value → `409 STALE_VERSION`; refetch and retry. Policy
+drafts accept `expectedUpdatedAt`.
+
+### Rate limits
+
+| Layer | Limit | Applies to |
+|---|---|---|
+| nginx `auth_mutations` | 10 req/min per IP, burst 20 | state-changing requests under `/api/v1/auth/` |
+| nginx `api_general` | 20 req/s per IP, burst 40 | all of `/api/` |
+| API `default` throttler | 300 req/min per IP (`THROTTLE_DEFAULT_*`) | every route except health |
+| API `auth` throttler | 10 req/min per IP (`THROTTLE_AUTH_*`) | register, login, password forgot/reset, password change; `POST /referrals/validate` uses it with 20 req/min |
+| API `otp` throttler | 5 req/min per IP (`THROTTLE_OTP_*`) | resend, verify-email, all `/auth/mfa/*`, email change, TOTP reset |
+| Login backoff (Redis) | after 5 failures per (email, IP) or 20 per IP: 30 s · 2^k, max 15 min | login, password change, TOTP confirm/verify/reset, email-change start |
+| One-time code limits (DB) | 60 s resend cooldown, 5 codes/h, ≥ 10 failures/24 h block | per (address, purpose); silent on public flows, explicit on admin email MFA |
+| Machine ingestion | 120 req/min per IP | `POST /integrations/events` |
+
+A rejection is `429 { "error": { "code": "RATE_LIMITED", … } }` with `Retry-After` when known.
+nginx's own 429/503 bodies use the same envelope. Details: [security.md §5](security.md#5-rate-limits).
+
+### Request ids
+
+Every response carries `X-Request-Id`, and every error body includes `requestId`. Send your own
+`X-Request-Id` (8–64 chars of `[A-Za-z0-9._:-]`; anything else is replaced by a generated id) to
+correlate client logs with nginx and API logs.
+
+### CSV exports
+
+`GET …/export.csv` routes stream `text/csv; charset=utf-8` with a UTF-8 BOM, CRLF rows, RFC 4180
+quoting and `Cache-Control: no-store`. Cells starting with `=`, `+`, `-`, `@`, tab or CR are
+prefixed with `'` (CSV-injection safe). Amounts appear as an exact major-unit decimal and as
+minor units. Admin exports need `reports:export` plus the read permission and are audited before
+the first byte; access and filter errors are normal JSON errors. Details:
+[api/finance.md](api/finance.md).
 
 ## Endpoint catalogue
 
-This is the skeleton, grouped by module. **Feature slices fill in the request/response contracts
-and mark rows as implemented.** Paths are relative to `/api/v1`. "Auth" means: `public`
-(no session), `session` (any signed-in user), `member` (signed-in, own resources), or a permission
-key (admin, MFA required). Status: `planned` → `implemented`.
+Paths are relative to `/api/v1`. **Auth** values:
 
-### Health
+- `public`: no session; `optional`: session used when present;
+- `session`: any signed-in user (own resources only);
+- `admin session`: signed-in user holding an admin role, MFA not required (the MFA steps themselves);
+- `API key`: `Authorization: Bearer rpk_…`;
+- a permission key (`rewards:approve`): an `/admin` route; admin role + TOTP session + that
+  permission. *scoped* = program scope applies; *global* = SUPER_ADMIN / FINANCE_REVIEWER only
+  (platform-wide data).
 
-| Method | Path | Auth | Purpose | Status |
+### Health and CSRF (core)
+
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/health` | public | Liveness (process up) | implemented |
-| GET | `/health/ready` | public | Readiness (DB + Redis), 503 when not ready | implemented |
+| GET | `/health` | public | Liveness (process up) | [deployment](deployment.md) |
+| GET | `/health/ready` | public | Readiness: DB + Redis, `503` when not ready | [deployment](deployment.md) |
+| GET | `/auth/csrf` | public | Issue the `csrf_token` cookie, returns `{ csrfToken }` | this page |
 
 ### Auth (`auth`)
 
-Full contracts: [api/identity.md](api/identity.md).
-
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/auth/csrf` | public | Issue `csrf_token` cookie | implemented |
-| POST | `/auth/register` | public | Register (optional `referralCode`); generic 202, no user until verified | implemented |
-| POST | `/auth/register/resend` | public | New verification code (cooldown/caps silent); generic 202 | implemented |
-| POST | `/auth/verify-email` | public | Verify code → create member + attribution + session | implemented |
-| POST | `/auth/login` | public | Email + password → session (admins: `mfaRequired`, `method: TOTP \| TOTP_ENROLLMENT`) | implemented |
-| POST | `/auth/mfa/email/send` · `/auth/mfa/email/verify` | admin session | `LOGIN_MFA` code bound to the session → `EMAIL_OTP` (admins without an authenticator) | implemented |
-| POST | `/auth/mfa/totp/setup` · `/auth/mfa/totp/confirm` | admin session | Enroll an authenticator → `TOTP` (admin access) | implemented |
-| POST | `/auth/mfa/totp/verify` | admin session | Authenticator code (replay-safe) → `TOTP` (admin access) | implemented |
-| POST | `/auth/logout` | optional | Revoke current session | implemented |
-| GET | `/auth/session` | optional | Current user, roles, permissions, `adminAccess`, `mfaMethod`, `hasTotpFactor` (401 when signed out) | implemented |
-| POST | `/auth/password/forgot` | public | Send reset code (generic 202; disabled for admin roles → SUPER_ADMINs notified) | implemented |
-| POST | `/auth/password/reset` | public | Reset with code; revokes all sessions | implemented |
+| POST | `/auth/register` | public | Start registration (optional `referralCode`). Never creates a user; stores the pending registration on an email challenge and emails a code. Generic `202` | [identity](api/identity.md) |
+| POST | `/auth/register/resend` | public | Re-send the verification code (limits are silent). Generic `202` | [identity](api/identity.md) |
+| POST | `/auth/verify-email` | public | Verify the code + registration password → create the member, referral attribution, own referral code and a session | [identity](api/identity.md) |
+| POST | `/auth/login` | public | Email + password → session. Admin roles get `mfaRequired` + `method` | [identity](api/identity.md) |
+| POST | `/auth/logout` | optional | Revoke the current session, clear `sid`, issue a new CSRF token | [identity](api/identity.md) |
+| GET | `/auth/session` | optional | Current `SessionUserDto`; `401` when signed out | [identity](api/identity.md) |
+| POST | `/auth/password/forgot` | public | Email a reset code (generic `202`; admin roles: no email, SUPER_ADMINs are notified) | [identity](api/identity.md) |
+| POST | `/auth/password/reset` | public | Reset with the code; revokes every session; does not sign in | [identity](api/identity.md) |
+| POST | `/auth/mfa/email/send` | admin session | Email a `LOGIN_MFA` code bound to this session (admins without an authenticator) | [identity](api/identity.md) |
+| POST | `/auth/mfa/email/verify` | admin session | Verify it → session rotated with `EMAIL_OTP` (no admin access) | [identity](api/identity.md) |
+| POST | `/auth/mfa/totp/setup` | admin session | Start authenticator enrollment → `otpauthUri` + secret, shown once | [identity](api/identity.md) |
+| POST | `/auth/mfa/totp/confirm` | admin session | Confirm the first code → factor confirmed, session rotated with `TOTP` (admin access) | [identity](api/identity.md) |
+| POST | `/auth/mfa/totp/verify` | admin session | Authenticator code (replay-safe) → session rotated with `TOTP` | [identity](api/identity.md) |
 
-### Me / users (`users`)
+### Self-service account (`users`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/users/me` | member | Own profile | implemented |
-| PATCH | `/users/me` | member | Update name, phone, avatar (https only) | implemented |
-| POST | `/users/me/password` | member | Change password (current required); revokes other sessions | implemented |
-| POST | `/users/me/email-change` | member | Start email change (current password + code to new address); generic 202 | implemented |
-| POST | `/users/me/email-change/confirm` | member | Confirm with code; notify old address; revokes other sessions | implemented |
-| GET | `/users/me/sessions` | member | Open sessions (cursor) | implemented |
-| DELETE | `/users/me/sessions/{id}` | member | Revoke one of your sessions | implemented |
-| POST | `/users/me/sessions/revoke-others` | member | Revoke all other sessions | implemented |
-| GET | `/users/me/activity` | member | Own audit trail (masked, cursor) | implemented |
-| POST | `/users/me/mfa/totp/reset` | admin session | Remove the authenticator (current code required) to re-enroll | implemented |
-| POST | `/users/me/deactivate` | member | Deactivate own account (terminal) | planned |
+| GET | `/users/me` | session | Own profile | [identity](api/identity.md) |
+| PATCH | `/users/me` | session | Update name, phone, avatar URL (https only) | [identity](api/identity.md) |
+| POST | `/users/me/password` | session | Change password (current required); revokes other sessions | [identity](api/identity.md) |
+| POST | `/users/me/email-change` | session | Start an email change (password + code to the new address). Generic `202` | [identity](api/identity.md) |
+| POST | `/users/me/email-change/confirm` | session | Confirm with the code; old address notified; other sessions revoked | [identity](api/identity.md) |
+| GET | `/users/me/sessions` | session | Open sessions (cursor) | [identity](api/identity.md) |
+| DELETE | `/users/me/sessions/{id}` | session | Revoke one of your sessions | [identity](api/identity.md) |
+| POST | `/users/me/sessions/revoke-others` | session | Revoke all other sessions | [identity](api/identity.md) |
+| GET | `/users/me/activity` | session | Own activity trail (masked IPs, cursor) | [identity](api/identity.md) |
+| POST | `/users/me/mfa/totp/reset` | session (admins only) | Remove the authenticator (current code required) to re-enroll | [identity](api/identity.md) |
+
+### Member dashboard and notifications (`admin`, `notifications`)
+
+| Method | Path | Auth | Description | Doc |
+|---|---|---|---|---|
+| GET | `/users/me/dashboard` | session | Enrollments, team counts, reward buckets, recent activity, announcements | [adminops](api/adminops.md) |
+| GET | `/users/me/notifications` | session | In-app notifications (`unread`, cursor) | [adminops](api/adminops.md) |
+| GET | `/users/me/notifications/unread-count` | session | `{ count }` | [adminops](api/adminops.md) |
+| POST | `/users/me/notifications/{id}/read` | session | Mark one read (idempotent) | [adminops](api/adminops.md) |
+| POST | `/users/me/notifications/read-all` | session | Mark all read | [adminops](api/adminops.md) |
 
 ### Settings (`settings`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/settings/public` | public | Reward unit, currency, points label (for formatting) | planned |
-| GET | `/admin/settings` | `settings:write` | Full platform settings | planned |
-| PATCH | `/admin/settings` | `settings:write` | Update (with `version`, reason); audited | planned |
+| GET | `/settings/public` | public | Reward unit, currency + minor units, points label (for formatting) | [catalog](api/catalog.md) |
+| GET | `/admin/settings` | `settings:write` | Full platform settings with `version` and live-program currencies | [catalog](api/catalog.md) |
+| PUT | `/admin/settings` | `settings:write` | Update (`expectedVersion`, `reason`); currency change blocked while live programs use another | [catalog](api/catalog.md) |
+| GET | `/admin/currencies` | `settings:write` | Supported currencies with minor units | [catalog](api/catalog.md) |
 
 ### Offerings (`offerings`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/admin/offerings` | `programs:read` | List / filter | planned |
-| POST | `/admin/offerings` | `offerings:write` | Create | planned |
-| GET | `/admin/offerings/{id}` | `programs:read` | Detail | planned |
-| PATCH | `/admin/offerings/{id}` | `offerings:write` | Edit / activate / deactivate | planned |
+| GET | `/admin/offerings` | `programs:read` | List / filter (status, kind, name/SKU) | [catalog](api/catalog.md) |
+| GET | `/admin/offerings/{id}` | `programs:read` | Detail with program counts | [catalog](api/catalog.md) |
+| POST | `/admin/offerings` | `offerings:write` | Create (starts INACTIVE) | [catalog](api/catalog.md) |
+| PATCH | `/admin/offerings/{id}` | `offerings:write` (+ `offerings:approve` when ACTIVE) | Edit | [catalog](api/catalog.md) |
+| DELETE | `/admin/offerings/{id}` | `offerings:write` | Delete an unused INACTIVE offering | [catalog](api/catalog.md) |
+| POST | `/admin/offerings/{id}/approve` | `offerings:approve` | Approve → ACTIVE (approver recorded) | [catalog](api/catalog.md) |
+| POST | `/admin/offerings/{id}/deactivate` | `offerings:approve` | Deactivate with a reason | [catalog](api/catalog.md) |
 
 ### Programs and options (`programs`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/programs` | member | Enrollable / visible programs | planned |
-| GET | `/programs/{idOrCode}` | member | Program detail with active options and terms | planned |
-| GET | `/admin/programs` | `programs:read` (scoped) | List | planned |
-| POST | `/admin/programs` | `programs:write` | Create DRAFT (snapshots unit + currency) | planned |
-| GET | `/admin/programs/{id}` | `programs:read` (scoped) | Detail | planned |
-| PATCH | `/admin/programs/{id}` | `programs:write` (scoped) | Edit (with `version`) | planned |
-| DELETE | `/admin/programs/{id}` | `programs:write` (scoped) | Delete DRAFT only | planned |
-| POST | `/admin/programs/{id}/publish` | `programs:publish` (scoped) | DRAFT → SCHEDULED/ACTIVE | planned |
-| POST | `/admin/programs/{id}/pause` · `/resume` · `/complete` · `/archive` | `programs:publish` (scoped) | Lifecycle (reason where required) | planned |
-| POST | `/admin/programs/{id}/options` | `programs:write` (scoped) | Add option | planned |
-| PATCH | `/admin/programs/{id}/options/{optionId}` | `programs:write` (scoped) | Edit wording / deactivate | planned |
-| PUT | `/admin/programs/{id}/admins` | `roles:assign` | Assign program admins | planned |
-
-### Reward policies (`policies`)
-
-| Method | Path | Auth | Purpose | Status |
-|---|---|---|---|---|
-| GET | `/admin/programs/{id}/policies` | `programs:read` (scoped) | Versions | planned |
-| POST | `/admin/programs/{id}/policies` | `policies:write` (scoped) | Create DRAFT version (+ rules) | planned |
-| GET | `/admin/policies/{policyId}` | `programs:read` (scoped) | Version detail with rules | planned |
-| PUT | `/admin/policies/{policyId}` | `policies:write` (scoped) | Replace DRAFT fields and rules | planned |
-| DELETE | `/admin/policies/{policyId}` | `policies:write` (scoped) | Delete DRAFT | planned |
-| POST | `/admin/policies/{policyId}/dry-run` | `policies:write` (scoped) | Pure calculation preview (sale amount + synthetic chain) | planned |
-| POST | `/admin/policies/{policyId}/publish` | `policies:publish` (scoped) | Publish at `effectiveFrom` (closes open version) | planned |
-| POST | `/admin/policies/{policyId}/retire` | `policies:publish` (scoped) | Close at now + RETIRED | planned |
+| GET | `/programs` | session | Enrollable / visible programs with active options and my eligibility | [catalog](api/catalog.md) |
+| GET | `/programs/{idOrCode}` | session | Program detail with terms | [catalog](api/catalog.md) |
+| GET | `/admin/programs` | `programs:read` *scoped* | List / filter | [catalog](api/catalog.md) |
+| POST | `/admin/programs` | `programs:write` | Create DRAFT (snapshots unit, currency, minor units) | [catalog](api/catalog.md) |
+| GET | `/admin/programs/{id}` | `programs:read` *scoped* | Detail: options, policy summary, status history, publish checks, allowed actions | [catalog](api/catalog.md) |
+| PATCH | `/admin/programs/{id}` | `programs:write` *scoped* | Edit (`expectedVersion`; editable fields depend on status) | [catalog](api/catalog.md) |
+| DELETE | `/admin/programs/{id}` | `programs:write` *scoped* | Delete a DRAFT | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/publish` | `programs:publish` *scoped* | DRAFT → SCHEDULED / ACTIVE (preconditions checked) | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/pause` | `programs:publish` *scoped* | ACTIVE → PAUSED (reason required) | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/resume` | `programs:publish` *scoped* | PAUSED → ACTIVE | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/complete` | `programs:publish` *scoped* | ACTIVE / PAUSED → COMPLETED | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/archive` | `programs:publish` *scoped* | COMPLETED → ARCHIVED | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/cancel` | `programs:publish` *scoped* | Withdraw a SCHEDULED program before its start → ARCHIVED (reason required) | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/options` | `programs:write` *scoped* | Add a plan (price in program currency) | [catalog](api/catalog.md) |
+| PATCH | `/admin/programs/{id}/options/{optionId}` | `programs:write` *scoped* | Edit a plan (terms frozen once it has enrollments) | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/options/{optionId}/deactivate` | `programs:write` *scoped* | Deactivate a plan | [catalog](api/catalog.md) |
+| POST | `/admin/programs/{id}/options/{optionId}/activate` | `programs:write` *scoped* | Re-activate a plan | [catalog](api/catalog.md) |
+| GET | `/admin/programs/{id}/admins` | `programs:read` *scoped* | Assigned program admins | [catalog](api/catalog.md) |
+| GET | `/admin/programs/{id}/admins/candidates` | `roles:assign` | Active PROGRAM_ADMIN users | [catalog](api/catalog.md) |
+| PUT | `/admin/programs/{id}/admins` | `roles:assign` | Replace the assigned admins | [catalog](api/catalog.md) |
 
 ### Enrollments (`enrollments`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| POST | `/programs/{id}/enrollments` | member | Enroll with an option (free → ACTIVE, paid → PENDING) | planned |
-| GET | `/me/enrollments` | member | Own enrollments | planned |
-| POST | `/me/enrollments/{id}/cancel` | member | Cancel | planned |
-| GET | `/admin/enrollments` | `enrollments:manage` (scoped) | Queue / list (filter PENDING) | planned |
-| POST | `/admin/enrollments/{id}/activate` | `enrollments:manage` (scoped) | Record offline payment → ACTIVE | planned |
-| POST | `/admin/enrollments/{id}/reject` | `enrollments:manage` (scoped) | Reject with reason | planned |
+| POST | `/programs/{id}/enrollments` | session | Enroll with a plan (free → ACTIVE, paid → PENDING) | [catalog](api/catalog.md) |
+| GET | `/users/me/enrollments` | session | Own enrollments | [catalog](api/catalog.md) |
+| POST | `/users/me/enrollments/{id}/cancel` | session | Cancel own enrollment | [catalog](api/catalog.md) |
+| GET | `/admin/enrollments` | `enrollments:manage` *scoped* | Queue / list (status, program, member, payment ref) | [catalog](api/catalog.md) |
+| GET | `/admin/enrollments/{id}` | `enrollments:manage` *scoped* | Detail | [catalog](api/catalog.md) |
+| POST | `/admin/enrollments/{id}/activate` | `enrollments:manage` *scoped* | Record the offline payment → ACTIVE | [catalog](api/catalog.md) |
+| POST | `/admin/enrollments/{id}/reject` | `enrollments:manage` *scoped* | Reject a PENDING enrollment (reason) | [catalog](api/catalog.md) |
+| POST | `/admin/enrollments/{id}/cancel` | `enrollments:manage` *scoped* | Cancel (reason) | [catalog](api/catalog.md) |
 
-### Referrals (`referrals`)
+### Referral network (`referrals`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/referrals/codes/{code}` | public | Validate a code for the registration form (minimal info) | planned |
-| GET | `/me/referral` | member | Own code + share link | planned |
-| GET | `/me/team/upline` | member | Sponsor and ancestors (privacy-filtered) | planned |
-| GET | `/me/team` | member | Descendants ≤ depth 10 (`?depth=`, `?q=`, cursor) | planned |
-| GET | `/me/team/summary` | member | Counts per depth, active, enrolled | planned |
-| GET | `/admin/members/{id}/team` | `members:read` | Full tree view for admins | planned |
-| POST | `/admin/members/{id}/sponsor` | `referrals:correct` | Correction (new sponsor + reason ≥ 10) | planned |
-| GET | `/admin/members/{id}/corrections` | `members:read` | Correction history | planned |
+| POST | `/referrals/validate` | public | Check a referral code for the registration form → `{ valid, sponsorDisplayName? }` | [network](api/network.md) |
+| GET | `/users/me/referral-code` | session | Own code + share link | [network](api/network.md) |
+| GET | `/users/me/parent` | session | Sponsor and ancestors (display names only, ≤ 10) | [network](api/network.md) |
+| GET | `/users/me/referrals` | session | Direct referrals (cursor) | [network](api/network.md) |
+| GET | `/users/me/hierarchy/summary` | session | Team counts per depth (≤ 10), active / eligible counts | [network](api/network.md) |
+| GET | `/users/me/hierarchy/tree` | session | Lazily loaded team tree (`rootId`, `depth` 1..3) | [network](api/network.md) |
+| GET | `/users/me/hierarchy/children` | session | Children of a node (cursor) | [network](api/network.md) |
+| GET | `/users/me/hierarchy/path/{memberId}` | session | Path from me down to a team member | [network](api/network.md) |
+| GET | `/users/me/hierarchy/search` | session | Search the team by display name | [network](api/network.md) |
+| GET | `/admin/members/{id}/hierarchy` | `members:read` *scoped* | Admin tree view (no depth limit) | [network](api/network.md) |
+| GET | `/admin/members/{id}/hierarchy/summary` | `members:read` *scoped* | Whole-subtree counts | [network](api/network.md) |
+| GET | `/admin/members/{id}/hierarchy/children` | `members:read` *scoped* | Children of a node | [network](api/network.md) |
+| GET | `/admin/members/{id}/hierarchy/path/{memberId}` | `members:read` *scoped* | Path inside the subtree | [network](api/network.md) |
+| GET | `/admin/members/{id}/hierarchy/search` | `members:read` *scoped* | Search the subtree (full name) | [network](api/network.md) |
+| GET | `/admin/members/{id}/ancestors` | `members:read` *scoped* | Full upline with attribution source | [network](api/network.md) |
+| GET | `/admin/members/{id}/sponsor-correction/preview` | `referrals:correct` | Preview a sponsor move: affected members, issues, `canApply` | [network](api/network.md) |
+| POST | `/admin/members/{id}/sponsor-correction` | `referrals:correct` | Apply the correction (reason; optional `Idempotency-Key`) | [network](api/network.md) |
+| GET | `/admin/flags` | `flags:manage` | Member flags (status, kind, member) | [network](api/network.md) |
+| GET | `/admin/flags/{id}` | `flags:manage` | Flag detail | [network](api/network.md) |
+| POST | `/admin/flags` | `flags:manage` | Raise a manual flag | [network](api/network.md) |
+| POST | `/admin/flags/{id}/resolve` | `flags:manage` | Resolve or dismiss (`status`, resolution note) | [network](api/network.md) |
 
-### Members and roles (`admin` / `users`)
+### Reward policies (`policies`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/admin/overview` | any admin | Dashboard counters (pending approvals, flags, reconciliation exceptions, dead outbox) | planned |
-| GET | `/admin/members` | `members:read` | Search / list | planned |
-| GET | `/admin/members/{id}` | `members:read` | Profile, enrollments, rewards summary | planned |
-| POST | `/admin/members/{id}/suspend` · `/reactivate` | `members:write` | With reason; revokes sessions on suspend | planned |
-| GET | `/admin/users/{id}/roles` | `roles:assign` | Roles of a user | planned |
-| PUT | `/admin/users/{id}/roles` | `roles:assign` | Grant / revoke (not self; keep ≥ 1 SUPER_ADMIN) | planned |
+| GET | `/programs/{id}/policy` | session | Member view of the policy in effect (or next scheduled) | [engine](api/engine.md) |
+| GET | `/admin/programs/{id}/policy-context` | `programs:read` *scoped* | Program snapshot, draft defaults, hard cap, current / next version ids | [engine](api/engine.md) |
+| GET | `/admin/programs/{id}/policies` | `programs:read` *scoped* | Policy versions of a program | [engine](api/engine.md) |
+| POST | `/admin/programs/{id}/policies` | `policies:write` *scoped* | Create a DRAFT (optionally cloned) | [engine](api/engine.md) |
+| GET | `/admin/policies/{id}` | `programs:read` *scoped* | Version detail with rules | [engine](api/engine.md) |
+| PATCH | `/admin/policies/{id}` | `policies:write` *scoped* | Edit a DRAFT (rules replaced atomically) | [engine](api/engine.md) |
+| DELETE | `/admin/policies/{id}` | `policies:write` *scoped* | Delete a DRAFT | [engine](api/engine.md) |
+| POST | `/admin/policies/{id}/validate` | `policies:write` *scoped* | Validation issues (+ timeline checks for an `effectiveFrom`) | [engine](api/engine.md) |
+| POST | `/admin/policies/{id}/dry-run` | `policies:write` *scoped* | Pure calculation preview (synthetic chain or a real member's upline) | [engine](api/engine.md) |
+| POST | `/admin/policies/{id}/publish` | `policies:publish` *scoped* (+ `policies:auto-approve` for auto-approving versions) | Publish at `effectiveFrom`, closing the open version (optional `Idempotency-Key`) | [engine](api/engine.md) |
+| POST | `/admin/policies/{id}/retire` | `policies:publish` *scoped* | Retire / withdraw (reason; optional `Idempotency-Key`) | [engine](api/engine.md) |
 
-### Qualifying events (`events`)
+### Sales intake and events (`events`, `rewards`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| POST | `/admin/events` | `events:write` (scoped) | Record sale (idempotent on `source` + `externalId`; `Idempotency-Key`) | planned |
-| GET | `/admin/events` | `rewards:read` / `programs:read` (scoped) | List / filter | planned |
-| GET | `/admin/events/{id}` | `rewards:read` (scoped) | Detail with calculation trace and rewards | planned |
-| POST | `/admin/events/{id}/reverse` | `events:reverse` | Refund / chargeback (reason) | planned |
+| GET | `/admin/events/programs` | `programs:read` *scoped* | Programs the caller can view, with `canRecordSales` | [engine](api/engine.md) |
+| GET | `/admin/events` | `rewards:read` *scoped* | Sales list / filter | [engine](api/engine.md) |
+| GET | `/admin/events/{id}` | `rewards:read` *scoped* | Sale detail: calculation trace, rewards, revisions | [engine](api/engine.md) |
+| POST | `/admin/events` | `events:write` *scoped* | Record a sale (idempotent on offering + external id + revision; optional `Idempotency-Key`) → engine runs after commit | [engine](api/engine.md) |
+| POST | `/admin/events/{id}/reverse` | `events:reverse` *scoped* | Refund / chargeback: reject live rewards, reverse posted ones (**`Idempotency-Key` required**) | [finance](api/finance.md) |
 
-### Rewards and earnings (`rewards`)
+### Integrations (`integrations`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/me/rewards` | member | Own rewards (filter by status, program) | planned |
-| GET | `/me/earnings` | member | Earned / pending / reversed per unit + currency | planned |
-| GET | `/admin/rewards` | `rewards:read` (scoped) | List / approval queue | planned |
-| GET | `/admin/rewards/{id}` | `rewards:read` (scoped) | Detail with trace | planned |
-| POST | `/admin/rewards/{id}/approve` | `rewards:approve` | Approve + post (not own reward) | planned |
-| POST | `/admin/rewards/{id}/reject` | `rewards:approve` | Reject with reason | planned |
-| POST | `/admin/rewards/bulk-approve` | `rewards:approve` | Per-item results | planned |
-| POST | `/admin/rewards/{id}/reverse` | `rewards:reverse` | Compensating ledger transaction (reason) | planned |
+| GET | `/admin/integrations/clients` | `integrations:manage` | API clients (program, status) | [engine](api/engine.md) |
+| POST | `/admin/integrations/clients` | `integrations:manage` | Create a client for one program → the key, shown once | [engine](api/engine.md) |
+| POST | `/admin/integrations/clients/{id}/revoke` | `integrations:manage` | Revoke a client | [engine](api/engine.md) |
+| POST | `/integrations/events` | API key | Machine sale ingestion (same intake as the admin route; minimal response; no CSRF; 120/min per IP) | [engine](api/engine.md) |
+
+### Rewards (`rewards`)
+
+| Method | Path | Auth | Description | Doc |
+|---|---|---|---|---|
+| GET | `/admin/rewards` | `rewards:read` *scoped* | Reward queue / list with SoD hints | [finance](api/finance.md) |
+| GET | `/admin/rewards/counts` | `rewards:read` *scoped* | Counts per status for the current filters | [finance](api/finance.md) |
+| GET | `/admin/rewards/facets` | `rewards:read` *scoped* | Programs that have rewards (filter options) | [finance](api/finance.md) |
+| GET | `/admin/rewards/export.csv` | `reports:export` + `rewards:read` *scoped* | CSV export (audited) | [finance](api/finance.md) |
+| GET | `/admin/rewards/{id}` | `rewards:read` *scoped* | Detail: readable trace, siblings, ledger transactions, audit trail | [finance](api/finance.md) |
+| POST | `/admin/rewards/{id}/approve` | `rewards:approve` *scoped* | Approve + post in one transaction (**`Idempotency-Key` required**) | [finance](api/finance.md) |
+| POST | `/admin/rewards/{id}/reject` | `rewards:approve` *scoped* | Reject with a reason (**`Idempotency-Key` required**) | [finance](api/finance.md) |
+| POST | `/admin/rewards/{id}/reverse` | `rewards:reverse` *scoped* | Compensating ledger transaction (**`Idempotency-Key` required**) | [finance](api/finance.md) |
+| POST | `/admin/rewards/bulk-approve` | `rewards:approve` (scope per item) | Up to 100 approvals, per-item results (**`Idempotency-Key` required**) | [finance](api/finance.md) |
+| GET | `/users/me/rewards` | session | Own rewards (§10 fields only) | [finance](api/finance.md) |
+| GET | `/users/me/rewards/facets` | session | Programs of own rewards | [finance](api/finance.md) |
+| GET | `/users/me/rewards/export.csv` | session | CSV of own rewards | [finance](api/finance.md) |
+| GET | `/users/me/rewards/{id}` | session | One own reward (`404` for anyone else's) | [finance](api/finance.md) |
+| GET | `/users/me/earnings` | session | Earned (from the ledger) / pending / reversed per unit + currency | [finance](api/finance.md) |
 
 ### Ledger and reconciliation (`ledger`, `reconciliation`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/admin/ledger/transactions` | `ledger:read` | Transactions with entries | planned |
-| GET | `/admin/ledger/accounts` | `ledger:read` | Accounts with balances | planned |
-| GET | `/admin/reconciliation` | `reconciliation:read` | Exceptions report | planned |
-| GET | `/admin/reports/{report}.csv` | `reports:export` | CSV exports (audited) | planned |
+| GET | `/admin/ledger/summary` | `ledger:read` *global* | Totals per unit / currency: posted, reversed, outstanding liability | [finance](api/finance.md) |
+| GET | `/admin/ledger/transactions` | `ledger:read` *scoped* (via the reward's program) | Ledger transactions | [finance](api/finance.md) |
+| GET | `/admin/ledger/transactions/{id}` | `ledger:read` *scoped* | Transaction with entries | [finance](api/finance.md) |
+| GET | `/admin/ledger/accounts` | `ledger:read` *global* | Accounts with balances | [finance](api/finance.md) |
+| GET | `/admin/ledger/export.csv` | `reports:export` + `ledger:read` | CSV, one row per entry (audited) | [finance](api/finance.md) |
+| GET | `/admin/reconciliation` | `reconciliation:read` *global* | Eight consistency checks + exceptions (`refresh=true` bypasses the 60 s cache) | [finance](api/finance.md) |
 
-### Audit, flags, notifications
+### Admin overview, members and audit (`admin`, `audit`)
 
-| Method | Path | Auth | Purpose | Status |
+| Method | Path | Auth | Description | Doc |
 |---|---|---|---|---|
-| GET | `/admin/audit` | `audit:read` | Audit log (filter by actor, resource, date) | planned |
-| GET | `/admin/flags` | `flags:manage` | Open / resolved flags | planned |
-| POST | `/admin/flags` | `flags:manage` | Raise manual flag | planned |
-| POST | `/admin/flags/{id}/resolve` · `/dismiss` | `flags:manage` | With resolution note | planned |
-| GET | `/me/notifications` | member | In-app notifications | planned |
-| POST | `/me/notifications/{id}/read` · `/me/notifications/read-all` | member | Mark read | planned |
+| GET | `/admin/overview` | any admin (figures *scoped*) | Dashboard counters, 30-day series, recent actions | [adminops](api/adminops.md) |
+| GET | `/admin/members` | `members:read` *scoped* | Search / list members | [adminops](api/adminops.md) |
+| GET | `/admin/members/{id}` | `members:read` *scoped* | Profile, roles, sponsor, team counts, enrollments, reward summary | [adminops](api/adminops.md) |
+| POST | `/admin/members/{id}/suspend` | `members:write` | Suspend (reason); revokes sessions | [adminops](api/adminops.md) |
+| POST | `/admin/members/{id}/reactivate` | `members:write` | Reactivate (reason) | [adminops](api/adminops.md) |
+| PUT | `/admin/members/{id}/roles` | `roles:assign` | Replace the role set (reason); revokes sessions | [adminops](api/adminops.md) |
+| POST | `/admin/members/{id}/password-reset` | SUPER_ADMIN (`members:write` + `roles:assign`) | Email a reset code, also to admin accounts (reason; not yourself); revokes sessions | [adminops](api/adminops.md) |
+| GET | `/admin/audit` | `audit:read` | Audit log (actor, action prefix, resource, program, dates) | [adminops](api/adminops.md) |
+| GET | `/admin/audit/{id}` | `audit:read` | Entry with masked before/after and a field-level diff | [adminops](api/adminops.md) |
 
-## Adding an endpoint (checklist)
+## Documented vs implemented
 
-1. Add the Zod request schema and response type to `packages/shared/src/contracts/<module>.ts`.
-2. Controller (HTTP only) → service (transaction, audit, outbox) → `domain/` (pure rules).
-3. Guards: `@Public()` only if intended; `@RequirePermissions(...)` for admin routes;
-   `assertProgramAccess` for program-scoped data; `@CurrentUser()` for the auth context.
-4. Map to an explicit DTO, with amounts as strings.
-5. Unit tests for domain rules. An integration test for the endpoint, including the forbidden and
+The catalogue above (140 routes on 2026-10-10) was checked against every `@Controller` / `@Get` / `@Post` / `@Put` /
+`@Patch` / `@Delete` in `apps/api/src` and against the six slice docs. Every implemented route is
+documented, and every route in the slice docs exists. Differences from the original plan:
+
+| Planned (earlier skeleton) | Status |
+|---|---|
+| `POST /users/me/deactivate` (member self-deactivation) | **Not implemented.** `DEACTIVATED` exists in the schema and is honoured everywhere (login, sessions, last-SUPER_ADMIN guard), but no endpoint sets it. |
+| `GET /admin/members/{id}/corrections` (correction history) | **Not implemented.** Corrections are append-only rows in `referral_corrections` and appear in the audit log as `referral.correct` (resource `user`); `GET /admin/members/{id}/ancestors` shows the current attribution source. |
+| `GET /admin/users/{id}/roles` | Not implemented as a separate route: roles are part of `GET /admin/members/{id}`. Changes go through `PUT /admin/members/{id}/roles`. |
+| `GET /admin/reports/{report}.csv` | Replaced by `GET /admin/rewards/export.csv` and `GET /admin/ledger/export.csv` (+ `GET /users/me/rewards/export.csv`). |
+| `GET /referrals/codes/{code}` | Implemented as `POST /referrals/validate` (codes stay out of URLs and access logs). |
+| `POST /admin/flags/{id}/dismiss` | Merged into `POST /admin/flags/{id}/resolve` with `status: DISMISSED`. |
+| `PATCH /admin/settings`, `PUT /admin/policies/{id}` | Implemented as `PUT /admin/settings` and `PATCH /admin/policies/{id}`. |
+| `/me/...` member paths | Implemented under `/users/me/...`. |
+
+Code-level note: `EventsController` (`apps/api/src/modules/events/events.controller.ts`,
+`@Controller('events')`) is an empty placeholder that registers no routes; all sale routes are in
+`AdminEventsController` and `IntegrationsIngestController`.
+
+## Adding an endpoint
+
+1. Add the Zod request schema and response type to `packages/shared/src/contracts/<module>.ts`,
+   then `corepack pnpm --filter @app/shared build`.
+2. Controller (HTTP only) → service (transaction, audit and outbox inside it) → `domain/` (pure
+   rules). Admin routes go in an `@Controller('admin/...')` class, which gets the admin + MFA
+   requirement automatically.
+3. Guards: `@Public()` only when intended (never on `/admin`); `@RequirePermissions(...)` on admin
+   routes; `assertProgramAccess` in the service for program-scoped data; `@Idempotent()` on
+   financial mutations; `@RateLimit('auth' | 'otp')` on credential and code routes.
+4. Map rows to an explicit DTO with amounts as decimal strings; return `ok()` / `paginate()`.
+5. Unit tests for domain rules; an integration test covering the forbidden, out-of-scope and
    invalid cases.
-6. Update the row above (status, final path) and the OpenAPI decorators.
+6. Document it in the slice doc (`docs/api/<slice>.md`) and add a row to the catalogue above.
