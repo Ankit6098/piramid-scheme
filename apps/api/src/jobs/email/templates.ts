@@ -5,10 +5,20 @@ import type {
   EmailTemplateName,
   EnrollmentStatusEmailData,
   GenericEmailData,
-  OtpEmailData,
   RegistrationAttemptEmailData,
   RewardStatusEmailData,
 } from '../../common/outbox/outbox.topics';
+
+/**
+ * Render input of the OTP email. Built by the `email.otp` worker from the challenge row and the
+ * decrypted code — it is never stored in an outbox payload.
+ */
+export interface OtpEmailData {
+  code: string;
+  purpose: ChallengePurpose;
+  expiresInMinutes: number;
+  name?: string;
+}
 
 export interface RenderedEmail {
   subject: string;
@@ -78,7 +88,7 @@ const OTP_COPY: Record<ChallengePurpose, { subject: string; intro: string; outro
   },
 };
 
-export function otpEmail(data: OtpEmailData, ctx: TemplateContext): RenderedEmail {
+export function renderOtpEmail(data: OtpEmailData, ctx: TemplateContext): RenderedEmail {
   const copy = OTP_COPY[data.purpose];
   const validity = `The code expires in ${data.expiresInMinutes} minutes and can be used once. Never share it with anyone.`;
   return {
@@ -170,7 +180,6 @@ export function genericEmail(data: GenericEmailData, ctx: TemplateContext): Rend
 type Renderers = { [K in EmailTemplateName]: (data: EmailTemplateData[K], ctx: TemplateContext) => RenderedEmail };
 
 export const EMAIL_TEMPLATES: Renderers = {
-  otp: otpEmail,
   'registration-attempt-existing-account': registrationAttemptEmail,
   'email-changed-notice': emailChangedNotice,
   'reward-status': rewardStatusEmail,

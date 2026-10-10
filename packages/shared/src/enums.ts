@@ -67,3 +67,17 @@ export type FlagStatus = (typeof FlagStatus)[number];
 
 export const ChallengePurpose = ['EMAIL_VERIFICATION', 'LOGIN_MFA', 'PASSWORD_RESET', 'EMAIL_CHANGE'] as const;
 export type ChallengePurpose = (typeof ChallengePurpose)[number];
+
+/** How a session completed its second factor (sessions.mfa_method). Admin access requires TOTP. */
+export const MfaMethod = ['EMAIL_OTP', 'TOTP'] as const;
+export type MfaMethod = (typeof MfaMethod)[number];
+
+/** Kinds of independent second factors a user can enroll (user_mfa_factors.kind). */
+export const MfaFactorKind = ['TOTP'] as const;
+export type MfaFactorKind = (typeof MfaFactorKind)[number];
+
+export const OutboxStatus = ['PENDING', 'PROCESSING', 'SENT', 'FAILED', 'DEAD'] as const;
+export type OutboxStatus = (typeof OutboxStatus)[number];
+
+export const IdempotencyStatus = ['IN_PROGRESS', 'COMPLETED'] as const;
+export type IdempotencyStatus = (typeof IdempotencyStatus)[number];

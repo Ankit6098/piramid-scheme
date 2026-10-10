@@ -5,8 +5,9 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { OutboxHandlerRegistry, PermanentOutboxError, type OutboxMessageView } from '../outbox/outbox-handler.registry';
 
 /**
- * Handles outbox topic `notification.create`: inserts a `notifications` row. The notification id is
- * the outbox message id, so redelivery is idempotent (ON CONFLICT DO NOTHING).
+ * Handles outbox topic `notification.create`: inserts a `notifications` row with
+ * `source_key = <outbox message id>` and ON CONFLICT DO NOTHING, so at-least-once redelivery never
+ * creates duplicates.
  */
 @Injectable()
 export class NotificationOutboxHandler {
@@ -27,7 +28,7 @@ export class NotificationOutboxHandler {
     await this.prisma.notification.createMany({
       data: [
         {
-          id: message.id,
+          sourceKey: message.id,
           userId: p.userId,
           type: p.type.slice(0, 64),
           title: p.title.slice(0, 200),
@@ -35,7 +36,7 @@ export class NotificationOutboxHandler {
           data: p.data === undefined ? Prisma.DbNull : (p.data as Prisma.InputJsonValue),
         },
       ],
-      skipDuplicates: true,
+      skipDuplicates: true, // ON CONFLICT DO NOTHING (source_key unique)
     });
   }
 }

@@ -1,4 +1,4 @@
-import { Injectable, NotImplementedException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import type { Db } from '../../common/prisma/prisma.service';
 
 export interface AncestorRef {
@@ -8,22 +8,25 @@ export interface AncestorRef {
 }
 
 /**
- * CROSS-MODULE CONTRACT (owned by the referrals slice; consumed by the reward engine).
+ * CROSS-MODULE CONTRACT: referral-tree queries backed by the closure table.
+ * The referrals slice extends this service with subtree/team queries.
  */
 @Injectable()
 export class HierarchyService {
   /**
-   * Ancestors of `userId` from the closure table (`referral_paths`), excluding the self row:
-   * `SELECT ancestor_id, depth FROM referral_paths WHERE descendant_id = :userId AND depth BETWEEN 1 AND :maxDepth ORDER BY depth`.
+   * Ancestors of `userId` (self row excluded), ordered by depth ascending; empty for a root member.
+   * Uses the (descendant_id, depth) unique index.
    *
    * @param db       root client or the caller's transaction (the engine passes its tx).
    * @param maxDepth inclusive upper bound (the engine uses up to 50 for COMPRESS mode).
-   * @returns ordered by depth ascending; empty for a root member. Depths are contiguous (tree).
    */
   async getAncestors(db: Db, userId: string, maxDepth: number): Promise<AncestorRef[]> {
-    void db;
-    void userId;
-    void maxDepth;
-    throw new NotImplementedException('referrals slice');
+    if (maxDepth < 1) return [];
+    const rows = await db.referralPath.findMany({
+      where: { descendantId: userId, depth: { gte: 1, lte: maxDepth } },
+      select: { ancestorId: true, depth: true },
+      orderBy: { depth: 'asc' },
+    });
+    return rows.map((r) => ({ userId: r.ancestorId, depth: r.depth }));
   }
 }

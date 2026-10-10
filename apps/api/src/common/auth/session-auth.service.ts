@@ -4,7 +4,7 @@ import { AppConfig } from '../../config/app-config';
 import { sha256Hex } from '../crypto/tokens';
 import { AppError, unauthenticated } from '../errors/app-error';
 import { PrismaService } from '../prisma/prisma.service';
-import type { AuthContext } from './auth-context';
+import { computeAdminAccess, type AuthContext } from './auth-context';
 
 /** lastSeenAt is refreshed at most this often per session. */
 export const LAST_SEEN_UPDATE_INTERVAL_MS = 5 * 60_000;
@@ -18,8 +18,10 @@ export type SessionResolution =
 /**
  * Resolves an opaque session token (cookie `sid`) into an AuthContext:
  * sha256 → sessions row; rejects revoked, expired (absolute) and idle-expired sessions; requires the
- * user to be ACTIVE (SUSPENDED → 403 ACCOUNT_SUSPENDED, others → 401); loads roles, permissions and
- * program scopes; refreshes lastSeenAt at most every 5 minutes.
+ * user to be ACTIVE (SUSPENDED → 403 ACCOUNT_SUSPENDED, others → 401); loads roles, permissions,
+ * program scopes and whether a confirmed TOTP factor exists — on EVERY request (no caching, so role
+ * grants/revocations apply immediately); computes `adminAccess`; refreshes lastSeenAt at most every
+ * 5 minutes.
  */
 @Injectable()
 export class SessionAuthService {
@@ -38,7 +40,8 @@ export class SessionAuthService {
       where: { tokenHash: sha256Hex(rawToken) },
       select: {
         id: true,
-        mfaVerified: true,
+        mfaVerifiedAt: true,
+        mfaMethod: true,
         expiresAt: true,
         lastSeenAt: true,
         revokedAt: true,
@@ -54,6 +57,11 @@ export class SessionAuthService {
               },
             },
             programAssignments: { select: { programId: true } },
+            mfaFactors: {
+              where: { kind: 'TOTP', confirmedAt: { not: null }, revokedAt: null },
+              select: { id: true },
+              take: 1,
+            },
           },
         },
       },
@@ -99,6 +107,8 @@ export class SessionAuthService {
         .catch((err: unknown) => this.logger.warn({ err }, 'Failed to refresh session lastSeenAt'));
     }
 
+    const isAdmin = roles.some(isAdminRole);
+    const mfa = { isAdmin, mfaMethod: session.mfaMethod, mfaVerifiedAt: session.mfaVerifiedAt };
     const auth: AuthContext = {
       userId: user.id,
       sessionId: session.id,
@@ -107,8 +117,11 @@ export class SessionAuthService {
       roles,
       permissions,
       programScopes: user.programAssignments.map((a) => a.programId),
-      isAdmin: roles.some(isAdminRole),
-      mfaVerified: session.mfaVerified,
+      isAdmin,
+      mfaMethod: session.mfaMethod,
+      mfaVerifiedAt: session.mfaVerifiedAt,
+      hasTotpFactor: user.mfaFactors.length > 0,
+      adminAccess: computeAdminAccess(mfa, now),
       sessionExpiresAt: session.expiresAt,
     };
     return { ok: true, auth };

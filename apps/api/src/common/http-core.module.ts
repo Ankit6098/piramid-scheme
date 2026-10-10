@@ -9,6 +9,7 @@ import { CsrfController } from './csrf/csrf.controller';
 import { CsrfGuard } from './csrf/csrf.guard';
 import { AllExceptionsFilter } from './errors/all-exceptions.filter';
 import { HealthController } from './health/health.controller';
+import { IdempotencyInterceptor } from './idempotency/idempotency.interceptor';
 import { JsonSafeInterceptor } from './http/json-safe.interceptor';
 import { RedisService } from './redis/redis.service';
 import { RedisThrottlerStorage } from './throttle/redis-throttler.storage';
@@ -19,7 +20,7 @@ import { AppThrottlerGuard, buildThrottlerOptions } from './throttle/throttle';
  * Guard order (registration order = execution order):
  *   1. AppThrottlerGuard  — rate limits (by IP)
  *   2. CsrfGuard          — double-submit token + Origin check on mutating requests
- *   3. SessionAuthGuard   — cookie session → AuthContext; /admin requires isAdmin + MFA
+ *   3. SessionAuthGuard   — cookie session → AuthContext; /admin requires an admin role + adminAccess (TOTP ≤ 12 h)
  *   4. PermissionsGuard   — @RequirePermissions(...)
  */
 @Module({
@@ -41,6 +42,8 @@ import { AppThrottlerGuard, buildThrottlerOptions } from './throttle/throttle';
     { provide: APP_GUARD, useClass: PermissionsGuard },
     { provide: APP_PIPE, useClass: ZodValidationPipe },
     { provide: APP_INTERCEPTOR, useClass: JsonSafeInterceptor },
+    // Runs inside JsonSafeInterceptor; a no-op unless the route has @Idempotent().
+    { provide: APP_INTERCEPTOR, useClass: IdempotencyInterceptor },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
   ],
 })

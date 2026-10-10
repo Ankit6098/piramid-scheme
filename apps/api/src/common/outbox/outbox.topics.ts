@@ -1,24 +1,40 @@
-import type { ChallengePurpose } from '@app/shared';
-
 /**
  * Outbox topics and their payloads. Adding a topic: add it here (core-owned, coordinate), then
  * register a handler with `OutboxHandlerRegistry.register(topic, handler)` in a worker-side provider.
+ *
+ * PAYLOAD RULES (enforced by DB CHECKs and by `OutboxService.enqueue`):
+ * - no key named `code` or `otp` anywhere in a payload (case-insensitive) — name template fields
+ *   `programCode`, `referralCode`, … instead. One-time codes are sent ONLY via `OtpMailer` (topic
+ *   `email.otp`), which stores an AES-GCM ciphertext under `codeCiphertext`;
+ * - `codeCiphertext` is removed from the row in the same UPDATE that marks it SENT or DEAD.
  */
 export const OutboxTopic = {
   EmailSend: 'email.send',
+  EmailOtp: 'email.otp',
   NotificationCreate: 'notification.create',
 } as const;
 export type OutboxTopic = (typeof OutboxTopic)[keyof typeof OutboxTopic];
 
+/** Top-level payload keys removed from every message when it reaches SENT or DEAD. */
+export const OUTBOX_TERMINAL_SCRUB_KEYS: readonly string[] = ['codeCiphertext'];
+
+// ─── email.otp ──────────────────────────────────────────────────────────────
+
+export type OtpEmailTemplate = 'otp';
+
+/**
+ * Written only by `OtpMailer.enqueue()`. The worker loads the challenge (address, purpose, expiry,
+ * name) itself — nothing else about the recipient lives in the outbox.
+ */
+export interface OtpEmailPayload {
+  challengeId: string;
+  /** base64url AES-256-GCM(OTP_OUTBOX_KEY, code, AAD = challengeId). Scrubbed once SENT/DEAD. */
+  codeCiphertext: string;
+  template: OtpEmailTemplate;
+}
+
 // ─── email.send ─────────────────────────────────────────────────────────────
 
-export interface OtpEmailData {
-  /** The raw one-time code. Scrubbed from the outbox row once delivered or dead. */
-  code: string;
-  purpose: ChallengePurpose;
-  expiresInMinutes: number;
-  name?: string;
-}
 export interface RegistrationAttemptEmailData {
   name?: string;
   /** e.g. `${APP_PUBLIC_URL}/login` and `/forgot-password` */
@@ -27,7 +43,7 @@ export interface RegistrationAttemptEmailData {
 }
 export interface EmailChangedNoticeData {
   name?: string;
-  /** Masked new address, e.g. "j***@example.com". */
+  /** Masked new address, e.g. "j***@e***.com" (maskEmail). */
   newEmailMasked: string;
   supportUrl?: string;
 }
@@ -56,8 +72,8 @@ export interface GenericEmailData {
   actionUrl?: string;
 }
 
+/** Templates deliverable through `email.send` (OTP emails are NOT among them: use OtpMailer). */
 export interface EmailTemplateData {
-  otp: OtpEmailData;
   'registration-attempt-existing-account': RegistrationAttemptEmailData;
   'email-changed-notice': EmailChangedNoticeData;
   'reward-status': RewardStatusEmailData;
@@ -66,7 +82,7 @@ export interface EmailTemplateData {
 }
 export type EmailTemplateName = keyof EmailTemplateData;
 
-/** Discriminated union: `{ to, template: 'otp', data: OtpEmailData }` etc. */
+/** Discriminated union: `{ to, template: 'generic', data: GenericEmailData }` etc. */
 export type EmailSendPayload = {
   [K in EmailTemplateName]: { to: string; template: K; data: EmailTemplateData[K] };
 }[EmailTemplateName];
@@ -79,10 +95,12 @@ export interface NotificationCreatePayload {
   type: string;
   title: string;
   body: string;
+  /** No `code`/`otp` keys (DB CHECK) — e.g. use `programCode`. */
   data?: Record<string, unknown>;
 }
 
 export interface OutboxPayloads {
   'email.send': EmailSendPayload;
+  'email.otp': OtpEmailPayload;
   'notification.create': NotificationCreatePayload;
 }

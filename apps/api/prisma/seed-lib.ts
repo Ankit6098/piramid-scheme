@@ -1,6 +1,14 @@
 import { randomInt } from 'node:crypto';
 import * as argon2 from 'argon2';
-import { ALL_PERMISSIONS, PERMISSION_DESCRIPTIONS, ROLE_LABELS, ROLE_PERMISSIONS, RoleKey } from '@app/shared';
+import {
+  ALL_PERMISSIONS,
+  PERMISSION_DESCRIPTIONS,
+  ROLE_LABELS,
+  ROLE_PERMISSIONS,
+  RoleKey,
+  SUPPORTED_CURRENCIES,
+} from '@app/shared';
+import { lockReferralTreeShared } from '../src/common/prisma/referral-tree-lock';
 import type { PrismaClient } from '../src/generated/prisma/client';
 
 /** Referral code alphabet (business rules §6): upper-case, no 0/O/1/I/L. */
@@ -14,9 +22,9 @@ export function generateReferralCode(): string {
 }
 
 const ROLE_DESCRIPTIONS: Record<RoleKey, string> = {
-  SUPER_ADMIN: 'Everything, including platform settings, role assignment and referral corrections',
-  PROGRAM_ADMIN: 'Manages assigned programs: options, policies, lifecycle, qualifying events',
-  FINANCE_REVIEWER: 'Approves/rejects/reverses rewards; ledger, reconciliation and exports',
+  SUPER_ADMIN: 'Everything: settings, roles, offering approval, auto-approving policies, API clients, referral corrections, audit, flags',
+  PROGRAM_ADMIN: 'Assigned programs only: options, policies (approval-requiring), lifecycle, enrollments, sales',
+  FINANCE_REVIEWER: 'Approves/rejects/reverses rewards, reverses events; ledger, reconciliation, exports, audit (read)',
   MEMBER: 'Own profile, enrollments, referral code, team and rewards',
 };
 
@@ -32,10 +40,17 @@ export function isAcceptablePassword(password: string): boolean {
 
 /**
  * Idempotently syncs roles, permissions and role_permissions with `@app/shared` ROLE_PERMISSIONS
- * (stale role→permission links are removed) and ensures the platform_settings singleton exists.
+ * (stale role→permission links and permissions that no longer exist are removed) and ensures the
+ * platform_settings singleton exists (INSERT … ON CONFLICT DO NOTHING — an existing row, and its
+ * version, are never touched). Currencies are reference data seeded by the integrity migration.
  */
 export async function seedReferenceData(prisma: PrismaClient): Promise<void> {
   await prisma.$transaction(async (tx) => {
+    // Normally seeded by the integrity migration; re-insert any missing row (never updates: immutable).
+    await tx.currency.createMany({
+      data: SUPPORTED_CURRENCIES.map((c) => ({ code: c.code, name: c.name, minorUnits: c.minorUnits })),
+      skipDuplicates: true,
+    });
     for (const key of ALL_PERMISSIONS) {
       await tx.permission.upsert({
         where: { key },
@@ -50,6 +65,7 @@ export async function seedReferenceData(prisma: PrismaClient): Promise<void> {
         update: { name: ROLE_LABELS[key], description: ROLE_DESCRIPTIONS[key] },
       });
     }
+    await tx.permission.deleteMany({ where: { key: { notIn: [...ALL_PERMISSIONS] } } });
     const roles = await tx.role.findMany({ where: { key: { in: [...RoleKey] } }, select: { id: true, key: true } });
     const perms = await tx.permission.findMany({ select: { id: true, key: true } });
     const permId = new Map(perms.map((p) => [p.key, p.id]));
@@ -63,7 +79,7 @@ export async function seedReferenceData(prisma: PrismaClient): Promise<void> {
         });
       }
     }
-    await tx.platformSettings.upsert({ where: { id: 1 }, create: { id: 1 }, update: {} });
+    await tx.platformSettings.createMany({ data: [{ id: 1 }], skipDuplicates: true });
   });
 }
 
@@ -76,27 +92,32 @@ export interface SeedSuperAdminInput {
 }
 
 /**
- * Idempotently ensures a SUPER_ADMIN exists: ACTIVE, verified, argon2id password (only set on
- * creation — an existing password is never overwritten), roles MEMBER + SUPER_ADMIN, depth-0 closure
- * row and a global referral code.
+ * Idempotently ensures a SUPER_ADMIN exists, following the referral write protocol (business rules
+ * §6) in ONE interactive transaction without savepoints:
+ *   INSERT users (ACTIVE + verified, argon2id password) → pg_advisory_xact_lock_shared(7301, 1)
+ *   → depth-0 closure row → global referral code → roles MEMBER + SUPER_ADMIN.
+ * Re-runs find the user by email and only add what is missing (roles, referral code); an existing
+ * password is never overwritten. (Closure rows can only be written by the creating transaction, so a
+ * pre-existing user without one is reported, not repaired.)
  */
 export async function seedSuperAdmin(
   prisma: PrismaClient,
   input: SeedSuperAdminInput,
 ): Promise<{ userId: string; created: boolean; referralCode: string }> {
   const email = input.email.trim().toLowerCase();
-  if (!email.includes('@')) throw new Error('SEED_SUPER_ADMIN_EMAIL is not a valid email address');
+  if (!/^[^\s@]+@[^\s@]+$/.test(email)) throw new Error('SEED_SUPER_ADMIN_EMAIL is not a valid email address');
   if (!isAcceptablePassword(input.password)) {
     throw new Error('SEED_SUPER_ADMIN_PASSWORD must be ≥ 10 characters with at least one letter and one digit');
   }
-  const passwordHash = await hashPassword(input.password);
+  const existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+  const passwordHash = existing ? null : await hashPassword(input.password);
 
   return prisma.$transaction(async (tx) => {
-    let user = await tx.user.findUnique({ where: { email }, select: { id: true } });
+    let userId = existing?.id ?? null;
     let created = false;
-    if (!user) {
+    if (!userId) {
       const now = new Date();
-      user = await tx.user.create({
+      const user = await tx.user.create({
         data: {
           email,
           fullName: input.fullName ?? 'Super Admin',
@@ -107,18 +128,20 @@ export async function seedSuperAdmin(
         },
         select: { id: true },
       });
+      userId = user.id;
       created = true;
+      await lockReferralTreeShared(tx);
+      await tx.referralPath.create({ data: { ancestorId: userId, descendantId: userId, depth: 0 } });
+    } else {
+      const self = await tx.referralPath.findUnique({
+        where: { ancestorId_descendantId: { ancestorId: userId, descendantId: userId } },
+        select: { depth: true },
+      });
+      if (!self) console.warn(`[seed] user ${userId} has no depth-0 closure row (created outside the registration protocol)`);
     }
-    const roles = await tx.role.findMany({ where: { key: { in: ['MEMBER', 'SUPER_ADMIN'] } }, select: { id: true } });
-    if (roles.length !== 2) throw new Error('Roles are missing — run seedReferenceData first');
-    await tx.userRole.createMany({ data: roles.map((r) => ({ userId: user.id, roleId: r.id })), skipDuplicates: true });
-    await tx.referralPath.createMany({
-      data: [{ ancestorId: user.id, descendantId: user.id, depth: 0 }],
-      skipDuplicates: true,
-    });
 
     const existingCode = await tx.referralCode.findFirst({
-      where: { userId: user.id, programId: null, isActive: true },
+      where: { userId, programId: null, isActive: true },
       select: { code: true },
     });
     let referralCode = existingCode?.code;
@@ -128,12 +151,17 @@ export async function seedSuperAdmin(
       for (const code of candidates) {
         const taken = await tx.referralCode.findUnique({ where: { code }, select: { id: true } });
         if (taken) continue;
-        await tx.referralCode.create({ data: { userId: user.id, code } });
+        await tx.referralCode.create({ data: { userId, code } });
         referralCode = code;
         break;
       }
     }
     if (!referralCode) throw new Error('Could not allocate a referral code');
-    return { userId: user.id, created, referralCode };
+
+    const roles = await tx.role.findMany({ where: { key: { in: ['MEMBER', 'SUPER_ADMIN'] } }, select: { id: true } });
+    if (roles.length !== 2) throw new Error('Roles are missing — run seedReferenceData first');
+    const uid = userId;
+    await tx.userRole.createMany({ data: roles.map((r) => ({ userId: uid, roleId: r.id })), skipDuplicates: true });
+    return { userId: uid, created, referralCode };
   });
 }

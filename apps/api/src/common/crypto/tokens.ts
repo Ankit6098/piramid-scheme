@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 
 /** Hex SHA-256 (64 chars) — used for session token hashes. */
 export function sha256Hex(value: string): string {
@@ -17,4 +17,14 @@ export function safeEqual(a: string | undefined | null, b: string | undefined | 
   const bb = Buffer.from(b, 'utf8');
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+/** Alias of `safeEqual` — constant-time string comparison. */
+export const constantTimeEqual = safeEqual;
+
+/** 6-digit numeric one-time code from a CSPRNG (uniform, leading zeros kept). */
+export function randomNumericCode(digits = 6): string {
+  let out = '';
+  for (let i = 0; i < digits; i++) out += randomInt(10).toString();
+  return out;
 }

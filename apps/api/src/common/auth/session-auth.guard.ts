@@ -2,6 +2,7 @@ import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import type { Request, Response } from 'express';
 import { RequestContext } from '../context/request-context';
+import { MfaRequiredReason } from '@app/shared';
 import { forbidden, mfaRequired } from '../errors/app-error';
 import type { AuthContext } from './auth-context';
 import { SESSION_COOKIE } from './cookies';
@@ -16,11 +17,22 @@ export function isAdminPath(path: string): boolean {
   return /^\/api\/v\d+\/admin(\/|$)/i.test(path);
 }
 
+/** Pure admin-area check (unit-tested): FORBIDDEN for non-admins, MFA_REQUIRED (+ reason) otherwise. */
+export function assertAdminAccess(auth: AuthContext): void {
+  if (!auth.isAdmin) throw forbidden();
+  if (!auth.adminAccess) {
+    throw mfaRequired(undefined, {
+      reason: auth.hasTotpFactor ? MfaRequiredReason.TotpRequired : MfaRequiredReason.TotpEnrollmentRequired,
+    });
+  }
+}
+
 /**
  * Global guard (APP_GUARD). Every route requires a valid session unless `@Public()`.
  * - `@OptionalAuth()` routes resolve the session when present but never fail.
- * - Routes under /api/v1/admin additionally require `isAdmin` (403 FORBIDDEN) and a session that
- *   completed MFA (403 MFA_REQUIRED).
+ * - Routes under /api/v1/admin additionally require an admin role (else 403 FORBIDDEN) and
+ *   `auth.adminAccess` — a TOTP verification in this session within 12 h. Otherwise 403 MFA_REQUIRED
+ *   with `details.reason` = TOTP_ENROLLMENT_REQUIRED (no confirmed TOTP factor) or TOTP_REQUIRED.
  * Sets `req.auth` and `RequestContext.auth`.
  */
 @Injectable()
@@ -60,8 +72,7 @@ export class SessionAuthGuard implements CanActivate {
     const routePath = (req.route as { path?: unknown } | undefined)?.path;
     const path = typeof routePath === 'string' ? routePath : req.path;
     if (isAdminPath(path) || isAdminPath(req.path)) {
-      if (!auth.isAdmin) throw forbidden();
-      if (!auth.mfaVerified) throw mfaRequired();
+      assertAdminAccess(auth);
     }
     return true;
   }

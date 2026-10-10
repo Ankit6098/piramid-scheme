@@ -17,7 +17,7 @@ This document explains the controls and where they live. Related decisions:
   settings and roles.
 - Reward and ledger integrity.
 - Personal data (names, emails, phones, IPs).
-- Secrets: `OTP_PEPPER`, DB/Redis/SMTP credentials.
+- Secrets: `OTP_PEPPER`, `OTP_OUTBOX_KEY`, `MFA_ENCRYPTION_KEY`, DB/Redis/SMTP credentials.
 
 **Actors**
 
@@ -37,19 +37,19 @@ This document explains the controls and where they live. Related decisions:
 
 | Threat | Main mitigations |
 |---|---|
-| Credential stuffing / brute force | argon2id hashes; generic login errors; lockout after 5 consecutive failures (15 min); per-IP + per-account rate limits in the API; nginx limit on auth mutations (10 r/min/IP, burst 20). |
+| Credential stuffing / brute force | argon2id hashes; generic login errors with equal timing; Redis failure counters per (email-HMAC, IP) and per IP with exponential backoff (5 failures → 30 s, doubling to 15 min; 20 per IP) — no global account lock, so nobody can lock out an owner; per-IP throttler on auth routes; nginx limit on auth mutations (10 r/min/IP, burst 20). |
 | Account enumeration | Registration and password reset return the same response for known and unknown emails (an existing address gets a "someone tried to register" notice instead); `EMAIL_NOT_VERIFIED` only after a correct password. |
 | Session theft / fixation | Opaque random token, HttpOnly + SameSite=Lax + Secure cookie; only its SHA-256 is stored; new token per login; idle + absolute expiry; revocation on logout, password change/reset and suspension. |
 | CSRF | Double-submit token (`csrf_token` cookie ↔ `x-csrf-token` header, constant-time compare) + Origin/Referer allow-list + SameSite=Lax. |
 | XSS | React escaping; no `dangerouslySetInnerHTML` with user data; CSP baseline; session cookie unreadable by JS; `nosniff`. |
 | Clickjacking | `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`. |
-| Privilege escalation | Server-side permission checks on every route (`@RequirePermissions`); program scoping for PROGRAM_ADMIN (`assertProgramAccess`); admin routes require `mfaVerified`; no self-granting; only SUPER_ADMIN assigns roles; last SUPER_ADMIN protected. |
+| Privilege escalation | Server-side permission checks on every route (`@RequirePermissions`); program scoping for PROGRAM_ADMIN (`assertProgramAccess`); admin routes require a TOTP verification in the current session within 12 h (`adminAccess`); email OTP never grants admin access; no self-granting; only SUPER_ADMIN assigns roles; last SUPER_ADMIN protected. |
 | Insider fraud (rewards) | Policies immutable once published; 50 % budget cap in DB; approvals by FINANCE_REVIEWER with segregation of duties (cannot approve own rewards); every privileged action audited (append-only); ledger append-only and balanced. |
 | Referral manipulation | Attribution only at registration from a valid code of an ACTIVE, verified member; immutable outside the audited correction flow (trigger); cycle checks; shared-IP registration flags. |
 | Data scraping / privacy leaks | Members see only privacy-filtered team data (first name + last initial, depth, join date, status bucket); never other members' email, phone, prices, rewards or sale amounts; DTOs map explicitly, never raw entities. |
 | Injection | Zod validation on every input; Prisma parameterized queries; raw SQL only via tagged templates (`$queryRaw\`…${param}\``), never string-built. |
 | DoS / abuse | nginx `limit_req`, body size 2 MB, header/body timeouts; API throttler (Redis-backed across replicas); pagination limits (max 100). |
-| Secret leakage | Secrets only from environment; never in images, git or logs; log and audit redaction; OTPs stored as HMAC; email payload codes redacted after delivery. |
+| Secret leakage | Secrets only from environment; never in images, git or logs; log and audit redaction; OTPs stored as HMAC; OTP emails carry only an AES-256-GCM ciphertext in the outbox, removed when the message is SENT/DEAD (DB CHECKs forbid plaintext `code`/`otp` keys); TOTP secrets encrypted at rest. |
 | Infrastructure compromise | Only nginx published; DB/Redis on an internal network without internet access; non-root containers, `cap_drop: ALL`, `no-new-privileges`, read-only root filesystems for API/worker; Redis password; pinned images. |
 
 ## 2. Authentication
@@ -57,21 +57,37 @@ This document explains the controls and where they live. Related decisions:
 - **Passwords:** ≥ 10 characters with at least one letter and one digit, hashed with
   **argon2id** (`argon2` library defaults or stronger). Hashes are never returned or logged.
   Password change requires the current password and revokes all sessions.
-- **Login:** a generic `INVALID_CREDENTIALS` for an unknown email or a wrong password. 5
-  consecutive failures set `locked_until = now + 15 min` (`ACCOUNT_LOCKED`, 423). Unverified
-  accounts get `EMAIL_NOT_VERIFIED` only after a correct password. Suspended accounts get
-  `ACCOUNT_SUSPENDED`.
+- **Login:** a generic `INVALID_CREDENTIALS` for an unknown email or a wrong password, with equal
+  timing (a dummy argon2 verify for unknown emails). There is **no account lock**: failures are
+  counted in Redis per (HMAC(email), IP) and per IP (`LoginThrottleService`); after 5 failures for a
+  pair (20 for an IP) each further failure blocks that pair/IP for 30 s · 2^k, capped at 15 min
+  (429 `RATE_LIMITED` with `Retry-After`). Unknown emails use the same counters. A successful login
+  clears the pair counter only. `ACCOUNT_SUSPENDED` (and deactivated) only after a correct password.
 - **Registration:** the same generic response whether or not the email exists, with no account
   enumeration.
-- **Email OTP** (verification, admin MFA, password reset, email change):
-  - 6 digits from a CSPRNG;
-  - stored as `HMAC-SHA-256(OTP_PEPPER, purpose:email:code)`, never in plain text;
+- **Email OTP** (verification, first admin login, password reset, email change):
+  - 6 digits from a CSPRNG (`randomNumericCode()`);
+  - stored as `HMAC-SHA-256(OTP_PEPPER, purpose:email:code)` (`otpCodeHash()`), never in plain text;
   - TTL 10 minutes, max 5 verification attempts (DB CHECK `attempts ≤ max_attempts`), single use;
-  - a new code invalidates older open codes of the same purpose and email;
-  - resend cooldown 60 s (`OTP_COOLDOWN`), max 5 sends per email and purpose per hour.
-- **Admin MFA:** a login by any user with a non-MEMBER role gets a session with
-  `mfa_verified=false` and an emailed `LOGIN_MFA` code. `/api/v1/admin/*` returns `MFA_REQUIRED`
-  until it is verified. Hiding admin UI is never the control. The API guard is.
+    one open challenge per (email, purpose) (partial unique index) — a new code invalidates the old
+    one in the same transaction;
+  - resend cooldown 60 s (`OTP_COOLDOWN`), max 5 sends per email and purpose per hour, and ≥ 10
+    failed attempts in 24 h block further sends/verifications for 24 h;
+  - **delivery:** `OtpMailer.enqueue(tx, …)` writes an `email.otp` outbox message whose payload is
+    only `{ challengeId, codeCiphertext, template }` (AES-256-GCM with `OTP_OUTBOX_KEY`, AAD =
+    challenge id). The worker re-checks that the challenge is open and that the code still matches
+    `code_hash`, sends, and removes the ciphertext in the same UPDATE that marks the message SENT or
+    DEAD (DB CHECKs: no plaintext `code`/`otp` keys in any outbox payload; no ciphertext on
+    SENT/DEAD rows). `last_error` never contains payload values; undelivered OTP messages are given
+    up after an hour.
+- **Admin MFA (TOTP):** every user holding a non-MEMBER role must enroll a TOTP authenticator
+  (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step). The secret is stored AES-256-GCM encrypted with
+  `MFA_ENCRYPTION_KEY` (AAD binds it to the user); the last accepted time-step is stored and older or
+  equal steps are rejected (replay protection). A first admin login without a factor uses an email
+  OTP bound to that session (LOGIN_MFA) and must then enroll TOTP. `/api/v1/admin/*` requires
+  `session.mfaMethod = TOTP` verified within the last 12 h; otherwise 403 `MFA_REQUIRED` with
+  `details.reason` `TOTP_ENROLLMENT_REQUIRED` (no confirmed factor) or `TOTP_REQUIRED`. Hiding admin
+  UI is never the control. The API guard is.
 - **Password reset / email change:** OTP challenges. Email change requires the current password
   and verification of the new address, and the old address is notified.
 
@@ -82,8 +98,12 @@ This document explains the controls and where they live. Related decisions:
   `sha256(token)` is stored (`sessions.token_hash`).
 - Absolute TTL 7 days (`SESSION_TTL_HOURS`), admins 12 h (`ADMIN_SESSION_TTL_HOURS`). Idle timeout
   12 h (`SESSION_IDLE_TIMEOUT_MINUTES`) from `last_seen_at`.
-- Revocation: logout (that session); password change or reset and suspension (all sessions of
-  the user). Expired sessions are rejected and later purged.
+- New sessions carry no second factor. Completing MFA **rotates** the session
+  (`SessionTokenService.elevateSession`): a new token/row with `mfa_verified_at`, `mfa_method` and
+  `expires_at = least(old expiry, now + 12 h)`; the old row is revoked (`mfa_rotated`).
+- Revocation: logout (that session); password change or reset, suspension, deactivation and any
+  role grant/revoke (all sessions of the user). Expired sessions are rejected and later purged.
+- Roles and permissions are loaded from the database on every request (no cache).
 - IP and user agent are stored per session for the member's "active sessions" view and for
   investigations.
 
@@ -108,7 +128,8 @@ This document explains the controls and where they live. Related decisions:
 | API (throttler, Redis-backed when `THROTTLE_STORAGE=redis`) | `default` per IP | `THROTTLE_DEFAULT_LIMIT` / `THROTTLE_DEFAULT_TTL_SECONDS` (300 / 60 s) |
 | API | `auth` routes (login, register, password reset) per IP | `THROTTLE_AUTH_LIMIT` / TTL (10 / 60 s) |
 | API | `otp` routes (send/verify) per IP | `THROTTLE_OTP_LIMIT` / TTL (5 / 60 s) |
-| API (domain, DB counters) | Per account/email | Login lockout (5 failures → 15 min), OTP attempts (5), OTP resend cooldown (60 s) and hourly send cap (5) |
+| API (`LoginThrottleService`, Redis) | Per (email-HMAC, IP) and per IP | Login failures: 5 per pair / 20 per IP free, then 30 s doubling to 15 min (`LOGIN_THROTTLE_*`) |
+| API (domain, DB counters) | Per email and purpose | OTP attempts (5 per code; 10 failed per 24 h → 24 h block), resend cooldown (60 s), hourly send cap (5) |
 
 The nginx allow-list (`infra/nginx/snippets/rate-limit-allowlist.conf`) is empty in production.
 CI fills it only for the e2e runner.
@@ -166,9 +187,13 @@ automatically stops adding the default.
 - Recorded: actor id and roles, action, resource type and id, redacted before/after, reason
   (required for suspensions, rejections, reversals, corrections and settings changes), request id
   and IP.
-- Redaction: `redactForAudit` removes `password`, `passwordHash`, `newPassword`,
-  `currentPassword`, `code`, `codeHash`, `token`, `tokenHash`, `otp`, `otpPepper` and `secret` at
-  any depth. Never store OTPs, tokens or hashes in audit data.
+- Redaction: `redactForAudit` removes, at any depth and case-insensitively, every key the DB CHECK
+  `ck_audit_logs_no_secrets` rejects (`password`, `passwordHash`, `token`, `tokenHash`, `otp`,
+  `otpCode`, `codeHash`, `secret`, `secretEnc`, `sessionToken`, `csrfToken`, `apiKey`, `keyHash`,
+  `codeCiphertext`) plus secret-looking names (`*password*`, `*secret*`, `*hash`, `*token`), and
+  masks `*email` values (`a***@e***.com`) and `*phone` values (`+**********10`). Plain `code`
+  (program/referral codes) is allowed. Never store OTPs, tokens or hashes in audit data.
+- `programId` is set on program-scoped entries so PROGRAM_ADMIN history views can be scoped.
 - Must be audited: every admin mutation (settings, roles, offerings, programs and lifecycle,
   options, policies, enrollment decisions, member suspension and reactivation, referral
   corrections, event recording and reversal, reward approve/reject/reverse, flags, exports) and
@@ -178,7 +203,9 @@ automatically stops adding the default.
 
 | Secret | Notes |
 |---|---|
-| `OTP_PEPPER` | 64 hex chars (`openssl rand -hex 32`); production startup rejects anything else. Rotation invalidates only currently open codes (users request a new one). |
+| `OTP_PEPPER` | 64 hex chars (`openssl rand -hex 32`); production startup rejects anything else. Rotation invalidates only currently open codes (users request a new one) and resets login-throttle counters. |
+| `OTP_OUTBOX_KEY` | 64 hex chars (32-byte AES-256-GCM key) for OTP codes inside outbox email messages. Required; must differ from the other two keys. Rotation only affects OTP emails not yet delivered (they go DEAD; users request a new code). |
+| `MFA_ENCRYPTION_KEY` | 64 hex chars (32-byte AES-256-GCM key) for TOTP secrets at rest. Required. There is no re-encryption tool yet: rotating it means every admin re-enrolls an authenticator. Back it up with the database backups' access controls. |
 | `POSTGRES_PASSWORD` | Also embedded in `DATABASE_URL` by compose: use URL-safe values (hex). Rotate with `ALTER ROLE … PASSWORD`, then update `.env` and restart api/worker. |
 | `REDIS_PASSWORD` | `requirepass`; embedded in `REDIS_URL`. |
 | `SMTP_USER` / `SMTP_PASSWORD` | Provider credentials; use a sending-only key. |
@@ -236,7 +263,7 @@ cannot be changed through configuration ([ADR-0007](decisions/0007-sale-funded-r
 
 - [ ] HTTPS everywhere (TLS at nginx or the LB); `APP_PUBLIC_URL=https://…`; `COOKIE_SECURE=true`;
       HSTS enabled after verification.
-- [ ] Unique random `OTP_PEPPER`, DB, Redis and SMTP credentials; `.env` mode 600; no
+- [ ] Unique random `OTP_PEPPER`, `OTP_OUTBOX_KEY`, `MFA_ENCRYPTION_KEY` (three different values), DB, Redis and SMTP credentials; `.env` mode 600; no
       `SEED_SUPER_ADMIN_PASSWORD` left after the first login.
 - [ ] Client IPs are real: `TRUST_PROXY` = 1 hop behind the bundled nginx (pinned in the prod
       compose), and `set_real_ip_from` is configured for the LB's ranges if an LB sits in front.

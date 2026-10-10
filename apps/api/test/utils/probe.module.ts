@@ -1,19 +1,26 @@
-import { Body, Controller, Get, HttpCode, Module, Post } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { Body, Controller, Get, HttpCode, Module, Param, Post } from '@nestjs/common';
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
 import type { AuthContext } from '../../src/common/auth/auth-context';
 import { CurrentUser, OptionalAuth, Public, RequirePermissions } from '../../src/common/auth/decorators';
 import { SkipCsrf } from '../../src/common/csrf/csrf.guard';
 import { ok } from '../../src/common/http/envelope';
+import { conflict } from '../../src/common/errors/app-error';
 import { IdempotencyKey } from '../../src/common/idempotency/idempotency-key.decorator';
+import { Idempotent } from '../../src/common/idempotency/idempotency.interceptor';
 import { PrismaService } from '../../src/common/prisma/prisma.service';
 import { RateLimit } from '../../src/common/throttle/throttle';
 
 class EchoDto extends createZodDto(z.object({ name: z.string().min(2), amountMinor: z.string().regex(/^\d+$/) })) {}
+class AmountDto extends createZodDto(z.object({ amountMinor: z.string().regex(/^\d+$/) })) {}
 
 function authView(auth: AuthContext) {
   return { ...auth, permissions: [...auth.permissions].sort() };
 }
+
+/** Counts executions of the idempotent probe handlers (replays must not run the handler). */
+export const probeCounters = { idempotentRuns: 0 };
 
 /** Test-only routes that exercise the core guards/pipes/filters (mounted by createTestApp({ imports })). */
 @Controller('__probe')
@@ -92,24 +99,45 @@ export class ProbeController {
     throw new Error('secret internal detail: password=hunter2');
   }
 
-  /** Writes an unbalanced ledger transaction → deferred trigger fails at COMMIT → 409. */
+  /** @Idempotent() financial-style mutation: returns a fresh opId on every real execution. */
+  @Post('idempotent-op/:ref')
+  @HttpCode(201)
+  @Idempotent()
+  idempotentOp(@Param('ref') ref: string, @Body() body: AmountDto) {
+    probeCounters.idempotentRuns += 1;
+    return ok({ opId: randomUUID(), ref, amountMinor: BigInt(body.amountMinor) });
+  }
+
+  /** @Idempotent() route that fails: the key must be released so a retry runs again. */
+  @Post('idempotent-fail')
+  @Idempotent()
+  idempotentFail() {
+    probeCounters.idempotentRuns += 1;
+    throw conflict('probe failure');
+  }
+
+  /** Trigger raising restrict_violation (23001) immediately: currencies are immutable. */
   @Public()
-  @Post('unbalanced-ledger')
-  async unbalancedLedger() {
+  @Post('invariant/immediate')
+  async invariantImmediate() {
+    await this.prisma.$executeRaw`UPDATE "currencies" SET "minor_units" = 3 WHERE "code" = 'INR'`;
+    return ok({ committed: true });
+  }
+
+  /** CHECK violation (23514): a plaintext OTP in an outbox payload (bypassing OutboxService). */
+  @Public()
+  @Post('invariant/check')
+  async invariantCheck() {
+    await this.prisma.outboxMessage.create({ data: { topic: 'email.send', payload: { to: 'a@b.c', data: { otp: '123456' } } } });
+    return ok({ committed: true });
+  }
+
+  /** Deferred constraint trigger failing at COMMIT: removing every SUPER_ADMIN grant. */
+  @Public()
+  @Post('invariant/deferred')
+  async invariantDeferred() {
     await this.prisma.$transaction(async (tx) => {
-      const [expense, payable] = await Promise.all([
-        tx.ledgerAccount.findFirstOrThrow({ where: { type: 'PLATFORM_REWARD_EXPENSE' } }),
-        tx.ledgerAccount.findFirstOrThrow({ where: { type: 'MEMBER_REWARDS_PAYABLE' } }),
-      ]);
-      const txn = await tx.ledgerTransaction.create({
-        data: { type: 'REWARD_POSTING', idempotencyKey: `probe:${Date.now()}:${Math.random()}` },
-      });
-      await tx.ledgerEntry.createMany({
-        data: [
-          { transactionId: txn.id, accountId: expense.id, direction: 'DEBIT', amountMinor: 100n, rewardUnit: 'MONEY', currencyCode: 'INR' },
-          { transactionId: txn.id, accountId: payable.id, direction: 'CREDIT', amountMinor: 60n, rewardUnit: 'MONEY', currencyCode: 'INR' },
-        ],
-      });
+      await tx.userRole.deleteMany({ where: { role: { key: 'SUPER_ADMIN' } } });
     });
     return ok({ committed: true });
   }

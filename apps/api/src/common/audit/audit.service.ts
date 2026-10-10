@@ -10,6 +10,12 @@ export interface AuditEntry {
   /** e.g. 'program', 'reward', 'user', 'platform_settings'. */
   resourceType: string;
   resourceId?: string | null;
+  /**
+   * Program the entry belongs to. Set it for program-scoped resources (programs, options, policies,
+   * enrollments, events, rewards) so PROGRAM_ADMIN history views can be scoped (business rules §13).
+   */
+  programId?: string | null;
+  /** Explicit allow-list of the changed fields (old values). Secrets are stripped, emails/phones masked. */
   before?: unknown;
   after?: unknown;
   reason?: string | null;
@@ -25,8 +31,9 @@ export interface AuditEntry {
  * Append-only audit trail. Call INSIDE the business transaction:
  *   await this.audit.record(tx, { action: 'reward.approve', resourceType: 'reward', resourceId, before, after });
  * requestId / ip come from the request context; actor + roles from the AuthContext.
- * `before`/`after` are JSON-normalized (bigint → string) and stripped of secrets
- * (password, passwordHash, code, codeHash, token, tokenHash, otp, …) recursively.
+ * `before`/`after` are JSON-normalized (bigint → string), stripped of secret-looking keys (password*,
+ * token*, otp, codeHash, secret*, csrfToken, apiKey, keyHash, codeCiphertext, … — the DB CHECK rejects
+ * them) and emails/phones are masked (`a***@e***.com`), recursively. `code` alone is allowed.
  */
 @Injectable()
 export class AuditService {
@@ -46,6 +53,7 @@ export class AuditService {
         action: entry.action.slice(0, 96),
         resourceType: entry.resourceType.slice(0, 64),
         resourceId: entry.resourceId?.slice(0, 64) ?? null,
+        programId: entry.programId ?? null,
         before: toJsonInput(entry.before),
         after: toJsonInput(entry.after),
         reason: entry.reason?.slice(0, 1000) ?? null,

@@ -3,14 +3,15 @@ import { Reflector } from '@nestjs/core';
 import { ROLE_PERMISSIONS, type Permission, type RoleKey } from '@app/shared';
 import { describe, expect, it } from 'vitest';
 import { AppError } from '../errors/app-error';
-import type { AuthContext } from './auth-context';
+import { ADMIN_MFA_MAX_AGE_MS, computeAdminAccess, type AuthContext } from './auth-context';
 import { REQUIRED_PERMISSIONS_KEY } from './decorators';
 import { PermissionsGuard, assertPermissions } from './permissions.guard';
 import { assertProgramAccess, canAccessProgram, programScopeFilter } from './program-access';
-import { isAdminPath } from './session-auth.guard';
+import { assertAdminAccess, isAdminPath } from './session-auth.guard';
 
-function auth(roles: RoleKey[], programScopes: string[] = []): AuthContext {
+function auth(roles: RoleKey[], programScopes: string[] = [], overrides: Partial<AuthContext> = {}): AuthContext {
   const permissions = new Set<Permission>(roles.flatMap((r) => ROLE_PERMISSIONS[r]));
+  const isAdmin = roles.some((r) => r !== 'MEMBER');
   return {
     userId: 'u1',
     sessionId: 's1',
@@ -19,9 +20,13 @@ function auth(roles: RoleKey[], programScopes: string[] = []): AuthContext {
     roles: ['MEMBER', ...roles.filter((r) => r !== 'MEMBER')],
     permissions,
     programScopes,
-    isAdmin: roles.some((r) => r !== 'MEMBER'),
-    mfaVerified: true,
+    isAdmin,
+    mfaMethod: 'TOTP',
+    mfaVerifiedAt: new Date(),
+    hasTotpFactor: isAdmin,
+    adminAccess: isAdmin,
     sessionExpiresAt: new Date(Date.now() + 3_600_000),
+    ...overrides,
   };
 }
 
@@ -125,5 +130,34 @@ describe('isAdminPath', () => {
     expect(isAdminPath('/api/v1/ADMIN/x')).toBe(true);
     expect(isAdminPath('/api/v1/administrators')).toBe(false);
     expect(isAdminPath('/api/v1/programs/admin')).toBe(false);
+  });
+});
+
+describe('admin access (TOTP within 12 h)', () => {
+  const now = new Date('2026-10-10T12:00:00.000Z');
+  const ago = (ms: number) => new Date(now.getTime() - ms);
+
+  it('computeAdminAccess requires an admin role, mfaMethod TOTP and a fresh verification', () => {
+    expect(computeAdminAccess({ isAdmin: true, mfaMethod: 'TOTP', mfaVerifiedAt: ago(1000) }, now)).toBe(true);
+    expect(computeAdminAccess({ isAdmin: true, mfaMethod: 'TOTP', mfaVerifiedAt: ago(ADMIN_MFA_MAX_AGE_MS - 1000) }, now)).toBe(true);
+    expect(computeAdminAccess({ isAdmin: true, mfaMethod: 'TOTP', mfaVerifiedAt: ago(ADMIN_MFA_MAX_AGE_MS) }, now)).toBe(false);
+    expect(computeAdminAccess({ isAdmin: true, mfaMethod: 'EMAIL_OTP', mfaVerifiedAt: ago(1000) }, now)).toBe(false);
+    expect(computeAdminAccess({ isAdmin: true, mfaMethod: null, mfaVerifiedAt: null }, now)).toBe(false);
+    expect(computeAdminAccess({ isAdmin: false, mfaMethod: 'TOTP', mfaVerifiedAt: ago(1000) }, now)).toBe(false);
+    // verification timestamps from the future (clock skew > 1 min) are not trusted
+    expect(computeAdminAccess({ isAdmin: true, mfaMethod: 'TOTP', mfaVerifiedAt: new Date(now.getTime() + 120_000) }, now)).toBe(false);
+  });
+
+  it('assertAdminAccess: FORBIDDEN for members, MFA_REQUIRED with a reason for admins', () => {
+    expect(errorOf(() => assertAdminAccess(auth([]))).code).toBe('FORBIDDEN');
+    expect(() => assertAdminAccess(auth(['FINANCE_REVIEWER']))).not.toThrow();
+
+    const noFactor = errorOf(() => assertAdminAccess(auth(['SUPER_ADMIN'], [], { adminAccess: false, hasTotpFactor: false })));
+    expect(noFactor.code).toBe('MFA_REQUIRED');
+    expect(noFactor.httpStatus).toBe(403);
+    expect(noFactor.details).toEqual({ reason: 'TOTP_ENROLLMENT_REQUIRED' });
+
+    const needsCode = errorOf(() => assertAdminAccess(auth(['PROGRAM_ADMIN'], [], { adminAccess: false, hasTotpFactor: true })));
+    expect(needsCode.details).toEqual({ reason: 'TOTP_REQUIRED' });
   });
 });

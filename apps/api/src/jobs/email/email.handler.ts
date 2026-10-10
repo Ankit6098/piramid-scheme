@@ -7,13 +7,17 @@ import { isEmailTemplateName, renderEmail, type TemplateContext } from './templa
 
 export const APP_NAME = 'Referral Platform';
 
-/** Removes one-time codes from a delivered/dead email payload. */
-export function scrubEmailPayload(payload: EmailSendPayload): unknown {
-  if (payload.template === 'otp') return { ...payload, data: { ...payload.data, code: '[redacted]' } };
-  return payload;
+/**
+ * SMTP failures become a generic error that carries only nodemailer's error code / SMTP status — never
+ * the server response, which may echo the recipient address (last_error must stay free of PII).
+ */
+export function smtpError(err: unknown): Error {
+  const e = (err ?? {}) as { code?: unknown; responseCode?: unknown };
+  const parts = [typeof e.code === 'string' ? e.code : null, typeof e.responseCode === 'number' ? String(e.responseCode) : null].filter(Boolean);
+  return new Error(`SMTP delivery failed${parts.length ? ` (${parts.join(' ')})` : ''}`);
 }
 
-/** Handles outbox topic `email.send`: render template → SMTP. */
+/** Handles outbox topic `email.send`: render template → SMTP. (OTP emails: see OtpEmailOutboxHandler.) */
 @Injectable()
 export class EmailOutboxHandler {
   private readonly ctx: TemplateContext;
@@ -24,10 +28,7 @@ export class EmailOutboxHandler {
     config: AppConfig,
   ) {
     this.ctx = { appName: APP_NAME, appUrl: config.app.publicUrl };
-    registry.register('email.send', {
-      handle: (message) => this.handle(message.payload),
-      scrub: scrubEmailPayload,
-    });
+    registry.register('email.send', { handle: (message) => this.handle(message.payload) });
   }
 
   async handle(payload: EmailSendPayload): Promise<void> {
@@ -38,6 +39,8 @@ export class EmailOutboxHandler {
       throw new PermanentOutboxError(`Unknown email template "${String(payload.template)}"`);
     }
     const rendered = renderEmail(payload.template, payload.data as never, this.ctx);
-    await this.email.send({ to: payload.to, template: payload.template, ...rendered });
+    await this.email.send({ to: payload.to, template: payload.template, ...rendered }).catch((err: unknown) => {
+      throw smtpError(err);
+    });
   }
 }

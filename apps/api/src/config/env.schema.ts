@@ -14,6 +14,10 @@ const bool = (defaultValue: boolean) =>
 const int = (defaultValue: number, min: number, max: number) =>
   z.coerce.number().int().min(min).max(max).default(defaultValue);
 
+/** 32-byte key as 64 hex characters (AES-256-GCM). Generate: `openssl rand -hex 32`. */
+const hexKey32 = (name: string) =>
+  z.string().regex(/^[0-9a-fA-F]{64}$/, `${name} must be 64 hex characters (32 bytes): openssl rand -hex 32`);
+
 const postgresUrl = z
   .string()
   .min(1)
@@ -49,6 +53,12 @@ export const envSchema = z.object({
     .refine((v) => /^rediss?:\/\//.test(v), 'Must be a redis:// or rediss:// URL'),
 
   OTP_PEPPER: z.string().min(32, 'OTP_PEPPER must be at least 32 characters (use 64 hex chars)'),
+  /** AES-256-GCM key for OTP codes carried by outbox email messages (AAD = challenge id). */
+  OTP_OUTBOX_KEY: hexKey32('OTP_OUTBOX_KEY'),
+  /** AES-256-GCM key for TOTP secrets at rest (user_mfa_factors.secret_enc). */
+  MFA_ENCRYPTION_KEY: hexKey32('MFA_ENCRYPTION_KEY'),
+  /** Issuer shown in authenticator apps (otpauth:// URI). */
+  MFA_TOTP_ISSUER: z.string().min(1).max(64).default('Referral Platform'),
   SESSION_TTL_HOURS: int(168, 1, 24 * 90),
   SESSION_IDLE_TIMEOUT_MINUTES: int(720, 5, 60 * 24 * 30),
   ADMIN_SESSION_TTL_HOURS: int(12, 1, 24 * 7),
@@ -78,6 +88,16 @@ export const envSchema = z.object({
   THROTTLE_AUTH_TTL_SECONDS: int(60, 1, 86_400),
   THROTTLE_OTP_LIMIT: int(5, 1, 1_000_000),
   THROTTLE_OTP_TTL_SECONDS: int(60, 1, 86_400),
+
+  /**
+   * Login failure backoff (Redis): after N failures per (email-HMAC, IP) — or M per IP — every further
+   * failure blocks for BASE·2^k seconds, capped at MAX. Counters expire after WINDOW of inactivity.
+   */
+  LOGIN_THROTTLE_FREE_ATTEMPTS: int(5, 1, 1000),
+  LOGIN_THROTTLE_IP_FREE_ATTEMPTS: int(20, 1, 100_000),
+  LOGIN_THROTTLE_BASE_SECONDS: int(30, 1, 3600),
+  LOGIN_THROTTLE_MAX_SECONDS: int(900, 1, 86_400),
+  LOGIN_THROTTLE_WINDOW_SECONDS: int(86_400, 60, 30 * 86_400),
 });
 
 export type RawEnv = z.infer<typeof envSchema>;

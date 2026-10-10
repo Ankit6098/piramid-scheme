@@ -161,7 +161,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
     }
 
     if (res.headersSent) return;
-    if (n.status === 429 && !res.getHeader('retry-after')) res.setHeader('retry-after', '60');
+    if (n.status === 429 && !res.getHeader('retry-after')) {
+      const retry = (n.details as { retryAfterSeconds?: unknown } | undefined)?.retryAfterSeconds;
+      res.setHeader('retry-after', typeof retry === 'number' && retry > 0 ? String(Math.ceil(retry)) : '60');
+    }
     const body: ApiErrorBody = {
       error: {
         code: n.code,

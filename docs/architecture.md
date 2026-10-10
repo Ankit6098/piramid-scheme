@@ -25,7 +25,7 @@ src/jobs/                      outbox relay, email, notification handler, schedu
 src/modules/index.ts           FEATURE_MODULES (all 15 modules)
 src/modules/<m>/               <m>.module.ts, <m>.controller.ts, <m>.service.ts, domain/*.ts (pure), dto.ts
 src/generated/prisma/          Prisma 7 client (generated; `import { PrismaClient, Prisma } from '../generated/prisma/client'`)
-prisma/seed.ts, seed-lib.ts    idempotent seed (roles/permissions/settings + SUPER_ADMIN); seedDemoData() stub
+prisma/seed.ts, seed-lib.ts    idempotent seed (roles/permissions/settings + SUPER_ADMIN via the referral write protocol); seedDemoData() stub
 test/                          integration tests + utilities (see "Testing")
 ```
 
@@ -48,12 +48,13 @@ Global guards run in registration order (`HttpCoreModule`):
 |---|---|---|
 | 1 | `AppThrottlerGuard` | rate limits per client IP → 429 `RATE_LIMITED` |
 | 2 | `CsrfGuard` | POST/PUT/PATCH/DELETE: `x-csrf-token` must equal the `csrf_token` cookie (constant-time compare). When `Origin` is present it must be allowed (`null` is rejected). Otherwise, when `Referer` is present, its origin must be allowed → 403 `CSRF_FAILED` |
-| 3 | `SessionAuthGuard` | cookie `sid` → `AuthContext`; `/api/v1/admin/**` also needs `isAdmin` (403 `FORBIDDEN`) and `mfaVerified` (403 `MFA_REQUIRED`) |
+| 3 | `SessionAuthGuard` | cookie `sid` → `AuthContext`; `/api/v1/admin/**` also needs an admin role (403 `FORBIDDEN`) and `adminAccess` = TOTP verified in this session within 12 h (403 `MFA_REQUIRED`, `details.reason` `TOTP_ENROLLMENT_REQUIRED` or `TOTP_REQUIRED`) |
 | 4 | `PermissionsGuard` | `@RequirePermissions(...)`. All listed permissions are required → 403 `FORBIDDEN` with `details.missingPermissions` |
 
-Global pipe: nestjs-zod `ZodValidationPipe`. Global interceptor: `JsonSafeInterceptor` (bigint →
-decimal string; outside production it warns when a response is not a `{ data }` envelope). Global
-filter: `AllExceptionsFilter`.
+Global pipe: nestjs-zod `ZodValidationPipe`. Global interceptors: `JsonSafeInterceptor` (bigint →
+decimal string; outside production it warns when a response is not a `{ data }` envelope) and,
+inside it, `IdempotencyInterceptor` (only acts on `@Idempotent()` routes). Global filter:
+`AllExceptionsFilter`.
 
 ### Configuration (`src/config`)
 
@@ -61,10 +62,16 @@ filter: `AllExceptionsFilter`.
 win. It then validates everything with zod and throws `ConfigValidationError`, which lists every bad
 variable. Inject the config by class: `constructor(private readonly config: AppConfig)`. The shape
 is `AppConfigShape` (`config.app.corsOrigins`, `config.security.sessionTtlHours`,
-`config.throttle.auth`, …). Variables added by the core, all optional with defaults:
-`TRUST_PROXY` (false | true = 1 hop | hop count | express string), `RUN_WORKER_IN_API` (false),
-`DATABASE_POOL_MAX` (10), `THROTTLE_STORAGE` (memory|redis), `THROTTLE_{DEFAULT,AUTH,OTP}_LIMIT` and
-`_TTL_SECONDS` (300/60, 10/60, 5/60). In production, `OTP_PEPPER` must be 64 hex characters.
+`config.throttle.auth`, `config.loginThrottle`, …).
+
+Required secrets: `OTP_PEPPER` (≥ 32 chars; 64 hex in production), `OTP_OUTBOX_KEY` and
+`MFA_ENCRYPTION_KEY` (64 hex chars = 32-byte AES-256-GCM keys; `openssl rand -hex 32`). The three
+must differ. Optional, with defaults: `TRUST_PROXY` (false | true = 1 hop | hop count | express
+string), `RUN_WORKER_IN_API` (false), `DATABASE_POOL_MAX` (10), `THROTTLE_STORAGE` (memory|redis),
+`THROTTLE_{DEFAULT,AUTH,OTP}_LIMIT` and `_TTL_SECONDS` (300/60, 10/60, 5/60), `MFA_TOTP_ISSUER`
+("Referral Platform"), `LOGIN_THROTTLE_FREE_ATTEMPTS` (5), `LOGIN_THROTTLE_IP_FREE_ATTEMPTS` (20),
+`LOGIN_THROTTLE_BASE_SECONDS` (30), `LOGIN_THROTTLE_MAX_SECONDS` (900),
+`LOGIN_THROTTLE_WINDOW_SECONDS` (86400).
 
 ### Responses, money and pagination
 
@@ -117,9 +124,13 @@ Postgres transaction.
 interface AuthContext {
   userId; sessionId; email; fullName;
   roles: RoleKey[]; permissions: ReadonlySet<Permission>;   // Set → map to an array before returning it
-  programScopes: string[];   // program_admin_assignments (PROGRAM_ADMIN)
-  isAdmin: boolean;          // any non-MEMBER role
-  mfaVerified: boolean; sessionExpiresAt: Date;
+  programScopes: string[];          // program_admin_assignments (PROGRAM_ADMIN)
+  isAdmin: boolean;                 // holds any non-MEMBER role
+  mfaMethod: 'EMAIL_OTP' | 'TOTP' | null;   // second factor completed in THIS session
+  mfaVerifiedAt: Date | null;
+  hasTotpFactor: boolean;           // confirmed, non-revoked user_mfa_factors row of kind TOTP
+  adminAccess: boolean;             // isAdmin && mfaMethod === 'TOTP' && mfaVerifiedAt within 12 h
+  sessionExpiresAt: Date;
 }
 ```
 
@@ -130,25 +141,48 @@ interface AuthContext {
 - **Session resolution** (`SessionAuthService.resolve(token)`): `sha256(token)` → `sessions` row →
   rejects revoked, absolute-expired, and idle sessions. Idle means `lastSeenAt` is older than
   `SESSION_IDLE_TIMEOUT_MINUTES`; the session is then revoked with `idle_timeout`. The user must be
-  `ACTIVE`: `SUSPENDED` → 403 `ACCOUNT_SUSPENDED`, any other status → 401. It loads roles,
-  permissions (from `role_permissions`) and program scopes once per request, and refreshes
-  `lastSeenAt` at most every 5 minutes. A dead cookie is cleared.
+  `ACTIVE`: `SUSPENDED` → 403 `ACCOUNT_SUSPENDED`, any other status → 401. Roles, permissions (from
+  `role_permissions`), program scopes and `hasTotpFactor` are loaded **on every request** (no
+  cache: a role grant/revoke applies to the next request). `adminAccess` is computed by the pure
+  `computeAdminAccess()` (`ADMIN_MFA_MAX_AGE_MS` = 12 h). `lastSeenAt` is refreshed at most every
+  5 minutes. A dead cookie is cleared.
+- **Admin area:** `/api/v1/admin/**` (matched case-insensitively) → non-admin: 403 `FORBIDDEN`;
+  admin without `adminAccess`: 403 `MFA_REQUIRED` with `details.reason` =
+  `TOTP_ENROLLMENT_REQUIRED` (no confirmed TOTP factor yet) or `TOTP_REQUIRED` (factor exists, but
+  this session has no TOTP verification within 12 h). Email OTP never grants admin access.
+  (`MfaRequiredReason` in `@app/shared`; pure check `assertAdminAccess(auth)`.)
 - **`assertProgramAccess(auth, programId, mode = 'write')`**: SUPER_ADMIN can access everything.
   PROGRAM_ADMIN can access only `programScopes`. FINANCE_REVIEWER gets `read` on every program and
   never `write`. Otherwise → 403. `canAccessProgram(...)` returns a boolean. For lists, use
   `programScopeFilter(auth, mode)`, which returns `'ALL' | string[]`.
-- **`SessionTokenService`** (for the auth/users slices):
-  - `createSession(tx, { userId, mfaVerified, ip, ua, ttlHours })` → `{ token, sessionId, expiresAt }`.
-    Only the SHA-256 hash is stored. `ttlHoursFor(roles)` picks the admin TTL (12 h) or the member
-    TTL (168 h).
-  - `markMfaVerified(tx, sessionId)`, `revokeSession(tx, id, reason)`,
-    `revokeAllForUser(tx, userId, reason, { exceptSessionId? })`.
+- **`SessionTokenService`** (auth/users slices; only the SHA-256 of a token is stored):
+  - `createSession(tx, { userId, ip?, ua?, ttlHours }): Promise<{ token, sessionId, expiresAt }>` —
+    a session **without** MFA. `ttlHoursFor(roles)` picks the admin TTL (12 h) or the member TTL
+    (168 h).
+  - `elevateSession(tx, oldSessionId, method: 'EMAIL_OTP' | 'TOTP'): Promise<{ token, sessionId, expiresAt }>`
+    — call it in the transaction that accepts the second factor. It **rotates** the token: inserts a
+    new session row (`mfaVerifiedAt = now`, `mfaMethod`, same ip/ua,
+    `expiresAt = least(old.expiresAt, now + 12 h)`) and revokes the old row with `mfa_rotated`
+    (conditional UPDATE, so two concurrent elevations cannot both win). Set the returned token as the
+    new cookie. 401 if the old session is revoked/expired.
+  - `revokeSession(tx, id, reason)`, `revokeAllForUser(tx, userId, reason, { exceptSessionId? })` —
+    call the latter on password change/reset, suspension, deactivation and **any role grant/revoke**.
   - `setSessionCookie(res, token, expiresAt)` / `clearSessionCookie(res)` set the `sid` cookie:
     HttpOnly, SameSite=Lax, `Secure` = `COOKIE_SECURE`, path `/`.
   - `issueCsrfToken(res)` sets a new `csrf_token` cookie (not HttpOnly) and returns the token.
     Call it on login and logout. `clearCsrfCookie(res)` removes it.
 - `GET /api/v1/auth/csrf` (public, core-owned `CsrfController`) → `{ data: { csrfToken } }` plus the
   cookie. `@SkipCsrf()` is only for non-cookie callers, such as signed webhooks.
+
+### Crypto (`common/crypto`)
+
+| Helper | Contract |
+|---|---|
+| `CryptoService` (global) | `encryptOtpCode(code, challengeId): string` / `decryptOtpCode(ciphertext, challengeId): string` (AES-256-GCM, `OTP_OUTBOX_KEY`, AAD = challenge id, base64url); `encryptTotpSecret(base32, userId): Uint8Array` / `decryptTotpSecret(secretEnc, userId): string` (`MFA_ENCRYPTION_KEY`, AAD = `user_mfa_factors:<userId>`); `otpCodeHash(purpose, email, code)`; `emailHmac(email, domain?)`. Decryption failures throw `DecryptionError` |
+| `otpCodeHash(pepper, purpose, email, code)` | **The** value for `email_challenges.code_hash`: HMAC-SHA-256(`OTP_PEPPER`, `purpose:email:code`), email trimmed + lower-cased. The OTP worker uses it to detect stale messages, `OtpMailer` refuses codes that do not match it |
+| `aesGcmEncrypt/Decrypt(key, data, aad)` | sealed box `[0x01][iv 12][tag 16][ciphertext]`; `…ToString/FromString` = base64url |
+| `hmacSha256Hex`, `hexDigestEquals`, `safeEqual` (= `constantTimeEqual`), `sha256Hex`, `randomToken`, `randomNumericCode(6)` | constant-time compares; CSPRNG tokens/codes |
+| TOTP (RFC 6238; tested against the RFC 4226/6238 vectors) | `generateTotpSecret()` (160-bit base32), `totp(secret, timeMs?)`, `verifyTotp(secret, code, { lastUsedStep?, now?, window = 1 })` → `{ ok: true, step } \| { ok: false, reason: 'malformed' \| 'invalid' \| 'replayed' }` (SHA-1, 6 digits, 30 s, ±1 step). Persist `step` as `user_mfa_factors.last_used_step` with a conditional UPDATE (`… WHERE last_used_step IS NULL OR last_used_step < $step`) for replay protection. `buildOtpauthUri({ secret, accountName, issuer })` → `otpauth://totp/…` (issuer: `config.security.totpIssuer`) |
 
 ### Rate limiting (`common/throttle`)
 
@@ -160,8 +194,24 @@ interface AuthContext {
 
 Storage is pluggable. It is in-memory by default. Set `THROTTLE_STORAGE=redis` to use
 `RedisThrottlerStorage`, an atomic Lua fixed window shared by API replicas. Any other storage must
-implement `ThrottlerStorage`. Per-account and per-email limits from business rules §2 are the auth
-slice's job (DB counters).
+implement `ThrottlerStorage`.
+
+**Login backoff — `LoginThrottleService`** (global; business rules §2: no global account lock).
+Redis counters per (HMAC(email), IP) and per IP; after `LOGIN_THROTTLE_FREE_ATTEMPTS` (5) failures
+for a pair — or 20 for an IP — every further failure blocks for 30 s · 2^k, capped at 15 min;
+counters expire after 24 h without failures. IPv6 addresses are bucketed by /64. Unknown emails use
+the same counters (the key is the HMAC of whatever was typed). Redis errors fail open (logged).
+
+```ts
+const emailKey = loginThrottle.emailKey(dto.email);                 // HMAC(OTP_PEPPER, email)
+loginThrottle.assertAllowed(await loginThrottle.check(emailKey, ip)); // 429 RATE_LIMITED, Retry-After
+if (!passwordOk) { await loginThrottle.recordFailure(emailKey, ip); throw invalidCredentials(); }
+await loginThrottle.reset(emailKey, ip);                            // success: clears the pair only
+```
+`check(emailHmac, ip): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds; scope: 'account' | 'ip' }>`,
+`recordFailure(emailHmac, ip): Promise<{ failures; ipFailures; retryAfterSeconds | null }>`,
+`reset(emailHmac, ip): Promise<void>`. A 429 whose `details.retryAfterSeconds` is set gets that
+value as `Retry-After`. OTP attempt/send caps remain DB counters on `email_challenges` (auth slice).
 
 ### Validation and DTOs
 
@@ -177,8 +227,29 @@ export class CreateProgramDto extends createZodDto(createProgramSchema) {}
 ```
 
 A parameter whose type is not a DTO is not validated. Always use a DTO.
-`@IdempotencyKey({ required })` reads `Idempotency-Key`, which must be 8–128 characters of
-`[A-Za-z0-9_-:.]`, otherwise 400. Scope the key per actor and operation before storing it.
+
+**Idempotency (`common/idempotency`).** Financial mutations use `@Idempotent()` (global
+`IdempotencyInterceptor`, a no-op elsewhere):
+
+```ts
+@Post(':id/approve') @Idempotent() @RequirePermissions('rewards:approve')
+approve(@Param() p: IdParamDto, @CurrentUser() auth: AuthContext) { ... }
+```
+
+The `Idempotency-Key` header (8–128 chars of `[A-Za-z0-9_-:.]`, required by default; `{ required:
+false }` makes it optional) is stored in `idempotency_keys` per **actor** for 24 h with the
+SHA-256 of the canonical request (`method`, route pattern, params, query, body). A retry with the
+same key and request returns the stored status + body (`Idempotent-Replayed: true`) without running
+the handler; the same key with another request → 409 `IDEMPOTENCY_CONFLICT`; while the first request
+is still running → 409 `CONFLICT` (`details.retryable`). Errors are not stored (the key is
+released, so a retry runs again). An IN_PROGRESS key abandoned for > 5 min may be taken over by the
+same request. Non-HTTP callers use `IdempotencyService`:
+`begin({ actorUserId, key, route, requestHash }) → { state: 'new' } | { state: 'replay', status, body }`,
+`complete({ actorUserId, key, status, body })`, `release({ actorUserId, key })`,
+`execute(input, fn, status = 200)`, `purgeExpired(now?)`; hash with
+`computeRequestHash(value)` (stable JSON → SHA-256 hex). The worker job `idempotency-keys-cleanup`
+(hourly) deletes expired keys. The lower-level `@IdempotencyKey({ required })` param decorator only
+parses the header.
 
 ### Data access (`common/prisma`)
 
@@ -190,16 +261,28 @@ A parameter whose type is not a DTO is not validated. Always use a DTO.
 - `createPrismaClient(url)` is a Nest-free client for scripts and tests.
 - Write `AuditService.record(tx, …)` and `OutboxService.enqueue(tx, …)` inside the business
   transaction. Never send email inside a DB transaction.
-- Referral corrections: `await tx.$executeRaw\`SET LOCAL app.referral_correction = 'on'\`` inside the
-  correction transaction.
+- **No savepoints in referral writes.** The integrity triggers recognise "rows created in this
+  transaction" by `xmin`. In Prisma 7 a transaction client also exposes `$transaction`, which opens a
+  nested SAVEPOINT — never call `tx.$transaction(...)` inside a registration or correction.
+- **Referral write protocol helpers** (`common/prisma/referral-tree-lock.ts`):
+  `lockReferralTreeShared(tx)` (registration: after the users INSERT, then self row → relationship
+  → ancestor rows), `lockReferralTreeExclusive(tx)` + `setReferralCorrectionId(tx, correctionId)`
+  (corrections: lock first, insert the `referral_corrections` row, set the id, then rewrite).
+  Known DB issue: inside a correction, UPDATE/DELETE on `referral_paths` currently fails (see the
+  `it.fails` case in `test/db-invariants.int-spec.ts`) until `app_referral_modify_guard()` is fixed.
+- Revoking any role (`user_roles` UPDATE/DELETE) or deactivating an ACTIVE user runs the deferred
+  "≥ 1 ACTIVE SUPER_ADMIN" check at COMMIT.
 
 ### Cross-cutting services (global `CommonModule`; no import needed)
 
 | Service | Contract |
 |---|---|
-| `AuditService.record(db, { action, resourceType, resourceId?, before?, after?, reason?, actorUserId?, actorRoles? })` | Takes `requestId`/`ip` from the request context and the actor + roles from the `AuthContext`. `actorUserId: null` records a system action with roles `['SYSTEM']`. `before`/`after` are JSON-normalized (bigint → string) and these keys are removed recursively: `password`, `passwordHash`, `code`, `codeHash`, `token`, `tokenHash`, `otp`, … |
-| `OutboxService.enqueue(tx, { topic, payload, dedupeKey?, availableAt?, maxAttempts? })` | Returns `{ id, enqueued }`. A duplicate `dedupeKey` is a no-op (`ON CONFLICT DO NOTHING`) and does not abort the transaction. Topics are typed in `common/outbox/outbox.topics.ts`: `email.send` → `{ to, template, data }` with templates `otp`, `registration-attempt-existing-account`, `email-changed-notice`, `reward-status`, `enrollment-status`, `generic`; and `notification.create` → `{ userId, type, title, body, data? }` |
-| `PlatformSettingsService.get(db?)` | The singleton row (created with defaults if missing). Without `db` it uses a 30 s cache. Pass the `tx` when the value drives a write. The settings slice must call `invalidate()` after updates. `toAmountFormat(settings)` (POINTS → 0 minor units) and `toCurrencyFormat(settings)` build `formatAmount()` inputs |
+| `AuditService.record(db, { action, resourceType, resourceId?, programId?, before?, after?, reason?, actorUserId?, actorRoles? })` | Takes `requestId`/`ip` from the request context and the actor + roles from the `AuthContext`. `actorUserId: null` records a system action with roles `['SYSTEM']`. Set `programId` on program-scoped entries (programs, options, policies, enrollments, events, rewards). `before`/`after` must be an allow-list of changed fields; they are JSON-normalized (bigint → string), keys matching the DB CHECK (`password*`, `token*`, `otp`, `otpCode`, `codeHash`, `secret*`, `sessionToken`, `csrfToken`, `apiKey`, `keyHash`, `codeCiphertext`, plus `*password*`, `*secret*`, `*hash`, `*token`) are removed recursively, `*email` values are masked with `maskEmail` (`a***@e***.com`) and `*phone` with `maskPhone` (`+**********10`). Plain `code` is allowed |
+| `OutboxService.enqueue(tx, { topic, payload, dedupeKey?, availableAt?, maxAttempts? })` | Returns `{ id, enqueued }`. A duplicate `dedupeKey` is a no-op (`ON CONFLICT DO NOTHING`) and does not abort the transaction. Topics are typed in `common/outbox/outbox.topics.ts`: `email.send` → `{ to, template, data }` with templates `registration-attempt-existing-account`, `email-changed-notice`, `reward-status`, `enrollment-status`, `generic`; `email.otp` (OtpMailer only); `notification.create` → `{ userId, type, title, body, data? }`. **No key named `code` or `otp` anywhere in a payload** (DB CHECK, mirrored by `assertOutboxPayloadSafe`) — use `programCode`, `referralCode`, … |
+| `OtpMailer.enqueue(tx, { challengeId, code, email, purpose }): Promise<{ outboxId }>` | The only way to email a one-time code. Call it in the transaction that wrote the challenge (whose `code_hash` must be `CryptoService.otpCodeHash(purpose, email, code)` — verified). Payload = `{ challengeId, codeCiphertext, template: 'otp' }`, max 6 attempts |
+| `CryptoService` | see "Crypto" |
+| `IdempotencyService`, `LoginThrottleService` | see "Validation and DTOs" and "Rate limiting" |
+| `PlatformSettingsService` | `get(db?)` = the singleton (created with `INSERT … ON CONFLICT DO NOTHING` if missing; 30 s cache without `db` — pass the `tx` when the value drives a write). `update(tx, { expectedVersion, patch: { rewardUnit?, currencyCode?, pointsLabel?, pointsPerCurrencyUnit?, defaultRewardBudgetBps? }, actorUserId })` → `{ before, after }`: conditional on `version` (else 409 `STALE_VERSION`), never writes `version` (the trigger bumps it once), takes `currencyMinorUnits` from `currencies`; currency changes blocked by the DB while live programs use another currency (409 `INVARIANT_VIOLATION`). Audit in the same tx, `invalidate()` after commit. Helpers: `toAmountFormat(settings)` (only for things without a stored unit), `toRecordAmountFormat({ rewardUnit, currencyCode, currencyMinorUnits \| minorUnits }, pointsLabel)` (from a record's own snapshot), `toCurrencyFormat(settings)`, `programSnapshotFrom(settings)`, `policyDefaultsFrom(settings)` |
 | `SessionTokenService`, `SessionAuthService` | see above |
 | `RedisService` | lazy shared ioredis client (`redis`, `ping()`) |
 | `RequestContext` | `requestId`, `ip`, `userAgent`, `auth`; `RequestContext.run({...}, fn)` for jobs |
@@ -207,8 +290,9 @@ A parameter whose type is not a DTO is not validated. Always use a DTO.
 Logging: inject the Nest `Logger` (`new Logger(Ctx.name)`). nestjs-pino is the app logger, writes
 JSON (pretty only on a dev TTY), and adds `requestId` to every request-scoped line. These are
 redacted: `authorization`, `cookie`, `x-csrf-token` and `set-cookie` headers, plus `password*`,
-`code*`, `otp`, `token*` and `csrfToken` keys up to 4 levels deep. URLs are logged without query
-strings. Never log OTPs, tokens or full email addresses (use `maskEmail()`).
+`code*`, `otp`, `token*`, `csrfToken`, `secret*`, `codeCiphertext`, `apiKey`, `keyHash` keys up to 4
+levels deep. URLs are logged without query strings. Never log OTPs, tokens or full email addresses
+(use `maskEmail()` from `common`).
 
 ### Background jobs (`src/jobs`)
 
@@ -221,23 +305,33 @@ strings. Never log OTPs, tokens or full email addresses (use `maskEmail()`).
   - success → `SENT`;
   - error → `FAILED` with `available_at = now + backoff`, where backoff is 5 s·2^(n−1) ±20 %
     capped at 1 h;
-  - `DEAD` once `attempts >= max_attempts` (8) or on `PermanentOutboxError`.
-  
-  Handlers can `scrub` the payload when the row ends: OTP codes are replaced with `[redacted]`.
-  Delivery is at least once, so handlers must be idempotent. The notification handler uses the
-  outbox id as the notification id.
+  - `DEAD` once `attempts >= max_attempts` (8 by default) or on `PermanentOutboxError`.
+
+  The UPDATE that marks a row `SENT` or `DEAD` also runs `payload = payload - ARRAY['codeCiphertext',
+  …scrubKeys]` (DB CHECK: no ciphertext on SENT/DEAD rows). `last_error` is the error name + message
+  with every payload string value redacted. Delivery is at least once, so handlers must be
+  idempotent. No BullMQ job ever carries a payload (the relay polls the table).
+- **`email.otp`** (`OtpEmailOutboxHandler`): loads the challenge; skips (→ SENT, scrubbed) when it is
+  gone, consumed, invalidated, expired, or when the decrypted code no longer matches `code_hash`
+  (re-issued); a ciphertext that fails to decrypt is permanent (→ DEAD, scrubbed); otherwise sends
+  the purpose-specific OTP email to the challenge address. SMTP errors are reduced to
+  `SMTP delivery failed (<code> <status>)` (no addresses). The `outbox-otp-expiry` job (every 15
+  min) gives up undelivered OTP messages older than an hour (DEAD, scrubbed).
+- **`notification.create`**: inserts with `source_key = <outbox message id>` and
+  `ON CONFLICT DO NOTHING`, so redelivery never duplicates.
 - **Registering an outbox handler:** in a provider of your module,
-  `constructor(r: OutboxHandlerRegistry) { r.register('topic', { handle, scrub? }) }`. New topics
+  `constructor(r: OutboxHandlerRegistry) { r.register('topic', { handle, scrubKeys? }) }`. New topics
   must be added to `outbox.topics.ts`; coordinate this.
 - **Email:** `EmailService` sends over nodemailer SMTP (Mailpit in dev). Templates in
   `jobs/email/templates.ts` are pure functions that return `{ subject, text, html }` with HTML
-  escaped. The OTP template has copy for each purpose. Amounts arrive pre-formatted
-  (`amountFormatted`).
+  escaped. The OTP template (`renderOtpEmail`) is used only by the `email.otp` handler. Amounts
+  arrive pre-formatted (`amountFormatted`).
 - **Scheduled jobs:** `ScheduledJobsRegistry.register({ name, everyMs | cron, tz?, handler })` from
   a provider in your module. They are installed as BullMQ job schedulers on queue `scheduled-jobs`;
   stale schedulers are removed and one run happens at a time. Handlers must be idempotent.
   `registry.runNow(name)` runs a job directly, for example in tests. Core registers
-  `outbox-cleanup` (03:17 daily; deletes `SENT` rows older than 14 days). Planned jobs:
+  `outbox-cleanup` (03:17 daily; deletes `SENT` rows older than 14 days), `outbox-otp-expiry`
+  (every 15 min) and `idempotency-keys-cleanup` (hourly). Planned jobs:
   `programs-status-transitions` (programs slice), `auth-session-cleanup` (auth slice), and
   enrollment expiry (enrollments slice).
 
@@ -286,19 +380,20 @@ Shared and core files (`src/common`, `src/jobs`, `src/config`, `test/utils`, `pr
 - **Unit:** `corepack pnpm --filter @app/api test` runs Vitest with unplugin-swc, so decorator
   metadata works. It covers `src/**/*.spec.ts` and needs no database.
 - **Integration:** `corepack pnpm --filter @app/api test:integration` covers `test/**/*.int-spec.ts`
-  against real Postgres and Redis. It runs one file at a time in one worker. `globalSetup` creates
-  the database named in `TEST_DATABASE_URL` if it is missing and runs `prisma migrate deploy`. The
-  database name must contain `test`; this guards against truncating dev data.
-- **A dedicated database per slice** avoids clashes between slices that run in parallel:
+  against real Postgres, Redis and Mailpit. It runs one file at a time in one worker. `globalSetup`
+  creates the database named in `TEST_DATABASE_URL` if it is missing and runs `prisma migrate
+  deploy`. The database name must contain `test`; this guards against truncating dev data.
+- **A dedicated database per slice** avoids clashes between slices that run in parallel (the core
+  uses `referral_test_core`):
   ```bash
-  docker compose exec -T postgres psql -U referral -d postgres -c 'CREATE DATABASE referral_test_auth'   # optional: globalSetup creates it
   TEST_DATABASE_URL=postgresql://referral:referral_dev_password@localhost:5432/referral_test_auth?schema=public \
     corepack pnpm --filter @app/api exec vitest run --config vitest.integration.config.ts test/auth
   ```
 - `test/utils/db.ts`:
   - `testPrisma()` is a shared client for `TEST_DATABASE_URL`.
-  - `resetDatabase()` runs TRUNCATE on every table except `_prisma_migrations` with
-    `RESTART IDENTITY CASCADE`, then re-seeds roles, permissions and settings.
+  - `resetDatabase()` runs TRUNCATE on every table except `_prisma_migrations` and `currencies`
+    (migration-seeded reference data) with `RESTART IDENTITY CASCADE`, then re-seeds roles,
+    permissions and settings.
   - `disconnectTestPrisma()`.
 - `test/utils/app.ts`:
   - `createTestApp({ env?, imports? })` builds the full `AppModule` with the same `configureApp()`
@@ -307,19 +402,36 @@ Shared and core files (`src/common`, `src/jobs`, `src/config`, `test/utils`, `pr
   - It returns `{ app, config, prisma, server, client(), clientWithSession(token), get(Token), close() }`.
   - `TestClient` sends its cookie jar on every request and adds a matching `csrf_token` cookie and
     `x-csrf-token` header to mutations. `.withoutCsrf()` and `.withHeaders({...})` adjust that.
-- `test/utils/factories.ts`:
-  - `createUser(prisma, { status, verified, roles, sponsorId, password?, programScopes?, … })`
-    writes the user, roles, self and ancestor closure rows, the relationship and the referral code.
-  - `loginAs(t, user, { mfaVerified? })` creates a session through `SessionTokenService` and
-    returns a logged-in `TestClient` with `.sessionId`. `mfaVerified` defaults to true for admins.
-  - `createOffering`, `createProgram(prisma, { status, options[] … })` (non-DRAFT programs get
-    `publishedAt`).
-  - `createPolicy(prisma, { programId, status, rules[], effectiveFrom/To … })`: rules are inserted
-    while the policy is DRAFT, then the policy is published.
-  - `createEnrollment(prisma, { userId, programId, status, … })`.
-- `test/utils/probe.module.ts` shows how to mount test-only controllers:
-  `createTestApp({ imports: [ProbeModule] })`.
-- Core suites: `health`, `session-auth`, `csrf`, `throttle`, `db-invariants` (ledger balance at
-  COMMIT, append-only tables, referral SET LOCAL guard, policy immutability and overlap, reward state
-  machine, partial unique enrollment index) and `core-services` (outbox relay, email via Mailpit,
-  notifications, audit redaction, settings cache).
+- `test/utils/factories.ts` — every factory satisfies the DB triggers and is **now-relative** (the
+  DB refuses back-dated policies, coverage and sales outside the program period). Each accepts the
+  root client (it opens its own transaction) or a transaction client (never one with savepoints):
+  - `createUser(db, { sponsor?, roles?, status?, verified?, password?, programScopes?, referralCode?, createdAt? })`
+    — one transaction per the registration protocol (user → shared tree lock → self row →
+    relationship through the sponsor's active code → ancestor rows → own referral code → roles).
+    The sponsor must be ACTIVE + verified.
+  - `factoryAdmin(db)` — a SUPER_ADMIN (`factory-admin@example.test`, no sponsor/downline) used as
+    approver/publisher/recorder; created on first use after each reset. Revoking a role in a test
+    needs an ACTIVE SUPER_ADMIN to exist (call it first).
+  - `loginAs(t, user, { mfa?: 'NONE' | 'EMAIL_OTP' | 'TOTP', mfaVerifiedAt?, ttlHours? })` — creates
+    the session directly (MFA via `elevateSession`); default `TOTP` for admins, `NONE` for members.
+    `createTotpFactor(t, user, { confirmed? })` → `{ factorId, secret }`.
+  - `createOffering(db, { status = 'ACTIVE' })` (ACTIVE ones are approved by the factory admin).
+  - `createProgram(db, { status, currencyCode, rewardUnit, options[], … })` — inserted DRAFT with the
+    currency snapshot, options added, then walked through the lifecycle (published by the factory
+    admin). Default: started 30 days ago, open enrollment, one free option.
+  - `createPolicy(db, { programId, status = 'PUBLISHED', rules, effectiveFrom = now − 30 s, publishedById?, closeCurrent? })`.
+  - `createEnrollment(db, { userId, programId, status = 'ACTIVE' | 'PENDING' | 'CANCELLED' | 'REJECTED', … })`
+    — program must be ACTIVE with an open window; paid options are activated with a payment record;
+    coverage starts now (EXPIRED cannot be fabricated).
+  - `createEvent(db, { programId, subjectUserId, source = 'ADMIN_MANUAL', amountMinor, … })` (recorded by
+    the factory admin; API/WEBHOOK get an api client), `createApiClient(db, programId)`.
+  - `processEventForTest(db, { eventId, policyVersionId, rewards[] })` (engine stand-in: binds the
+    policy, writes the calculation snapshot and rewards, marks PROCESSED) and
+    `postRewardForTest(db, rewardId, approverId)` (ledger stand-in: approve + exact two-entry posting).
+- `test/utils/probe.module.ts` mounts test-only controllers (`createTestApp({ imports: [ProbeModule] })`):
+  idempotent routes, trigger-error probes (`/__probe/invariant/{immediate,check,deferred}`), etc.
+- Core suites: `health`, `session-auth` (MFA/adminAccess, `elevateSession`, per-request
+  permissions), `csrf`, `throttle` (Nest throttler + `LoginThrottleService` on Redis),
+  `idempotency`, `core-services` (outbox relay, OTP delivery via Mailpit + scrubbing, notifications,
+  audit, settings, seed) and `db-invariants` (factory-level invariants, the raw-SQL happy path and 28
+  attack scenarios that must fail with 23001/23514/23505/23P01, and the HTTP 409 mapping).

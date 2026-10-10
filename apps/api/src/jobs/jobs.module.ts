@@ -2,6 +2,8 @@ import { DynamicModule, Global, Module } from '@nestjs/common';
 import { AppConfig } from '../config/app-config';
 import { EmailOutboxHandler } from './email/email.handler';
 import { EmailService } from './email/email.service';
+import { OtpEmailOutboxHandler } from './email/otp-email.handler';
+import { IdempotencyCleanupJob } from './idempotency/idempotency-cleanup.job';
 import { JOBS_OPTIONS, type JobsModuleOptions } from './jobs.options';
 import { NotificationOutboxHandler } from './notifications/notification.handler';
 import { OutboxCleanupJob } from './outbox/outbox-cleanup.job';
@@ -34,9 +36,11 @@ export class JobsModule {
         ScheduledJobsRegistry,
         EmailService,
         EmailOutboxHandler,
+        OtpEmailOutboxHandler,
         NotificationOutboxHandler,
         OutboxRelay,
         OutboxCleanupJob,
+        IdempotencyCleanupJob,
         SchedulerRunner,
       ],
       exports: [JOBS_OPTIONS, OutboxHandlerRegistry, ScheduledJobsRegistry, EmailService, OutboxRelay],

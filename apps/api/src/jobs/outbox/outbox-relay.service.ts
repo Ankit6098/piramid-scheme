@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } from '@nestjs/common';
 import { RequestContext } from '../../common/context/request-context';
+import { OUTBOX_TERMINAL_SCRUB_KEYS } from '../../common/outbox/outbox.topics';
 import { Prisma } from '../../generated/prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { JOBS_OPTIONS, type JobsModuleOptions } from '../jobs.options';
@@ -27,8 +28,27 @@ export interface RelayRunResult {
   dead: number;
 }
 
-function errorMessage(err: unknown): string {
-  const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+/** String leaves of a payload (≥ 6 chars) — redacted from error messages before they are stored. */
+function payloadStrings(payload: unknown, out: string[] = []): string[] {
+  if (typeof payload === 'string') {
+    if (payload.length >= 6) out.push(payload);
+  } else if (Array.isArray(payload)) {
+    for (const v of payload) payloadStrings(v, out);
+  } else if (payload !== null && typeof payload === 'object') {
+    for (const v of Object.values(payload as Record<string, unknown>)) payloadStrings(v, out);
+  }
+  return out;
+}
+
+/**
+ * `last_error` text: error name + message, with every payload string value redacted (it must never
+ * contain the payload, e.g. a ciphertext or an address), capped at 2000 chars.
+ */
+export function outboxErrorMessage(err: unknown, payload: unknown): string {
+  let msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  for (const value of payloadStrings(payload).sort((a, b) => b.length - a.length)) {
+    msg = msg.split(value).join('[redacted]');
+  }
   return msg.slice(0, 2000);
 }
 
@@ -37,7 +57,8 @@ function errorMessage(err: unknown): string {
  * due rows with `FOR UPDATE SKIP LOCKED` (safe with several workers), marks them PROCESSING
  * (attempts + 1), dispatches each to its topic handler outside any transaction, then marks SENT, or
  * FAILED with exponential backoff + jitter (`available_at`), or DEAD after `max_attempts`
- * (or on PermanentOutboxError / missing handler at the last attempt).
+ * (or on PermanentOutboxError / missing handler at the last attempt). The UPDATE that marks a row SENT
+ * or DEAD also removes `codeCiphertext` (+ the handler's `scrubKeys`) from its payload.
  */
 @Injectable()
 export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdown {
@@ -136,32 +157,14 @@ export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdow
     try {
       if (!registration) throw new Error(`No outbox handler registered for topic "${row.topic}"`);
       await registration.handle(message as OutboxMessageView<never>);
-      await this.prisma.outboxMessage.updateMany({
-        where: { id: row.id, status: 'PROCESSING' },
-        data: {
-          status: 'SENT',
-          processedAt: new Date(),
-          lockedAt: null,
-          lastError: null,
-          ...this.scrubbed(registration.scrub, row.payload),
-        },
-      });
+      await this.finish(row.id, 'SENT', null, registration.scrubKeys);
       return 'sent';
     } catch (err) {
       const permanent = err instanceof PermanentOutboxError;
       const dead = permanent || row.attempts >= row.maxAttempts;
-      const lastError = errorMessage(err);
+      const lastError = outboxErrorMessage(err, row.payload);
       if (dead) {
-        await this.prisma.outboxMessage.updateMany({
-          where: { id: row.id, status: 'PROCESSING' },
-          data: {
-            status: 'DEAD',
-            processedAt: new Date(),
-            lockedAt: null,
-            lastError,
-            ...this.scrubbed(registration?.scrub, row.payload),
-          },
-        });
+        await this.finish(row.id, 'DEAD', lastError, registration?.scrubKeys);
         this.logger.error({ outboxId: row.id, topic: row.topic, attempts: row.attempts, error: lastError }, 'Outbox message is DEAD');
         return 'dead';
       }
@@ -175,12 +178,16 @@ export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdow
     }
   }
 
-  private scrubbed(scrub: ((p: never) => unknown) | undefined, payload: unknown): { payload?: Prisma.InputJsonValue } {
-    if (!scrub) return {};
-    try {
-      return { payload: scrub(payload as never) as Prisma.InputJsonValue };
-    } catch {
-      return {};
-    }
+  /** Marks a claimed row SENT/DEAD and scrubs secret payload keys in the same UPDATE. */
+  private async finish(id: string, status: 'SENT' | 'DEAD', lastError: string | null, extraKeys: readonly string[] = []): Promise<void> {
+    const keys = [...new Set([...OUTBOX_TERMINAL_SCRUB_KEYS, ...extraKeys])];
+    await this.prisma.$executeRaw`
+      UPDATE "outbox_messages"
+         SET "status" = ${status}::"OutboxStatus",
+             "processed_at" = now(),
+             "locked_at" = NULL,
+             "last_error" = ${lastError},
+             "payload" = "payload" - ARRAY[${Prisma.join(keys)}]::text[]
+       WHERE "id" = ${id}::uuid AND "status" = 'PROCESSING'`;
   }
 }

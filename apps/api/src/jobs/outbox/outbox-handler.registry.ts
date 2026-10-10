@@ -18,10 +18,10 @@ export type OutboxHandler<T extends OutboxTopic = OutboxTopic> = (
 export interface OutboxHandlerRegistration<T extends OutboxTopic = OutboxTopic> {
   handle: OutboxHandler<T>;
   /**
-   * Optional: returns the payload to keep once the message is SENT or DEAD (e.g. drop OTP codes).
-   * Must be JSON-compatible.
+   * Optional extra top-level payload keys to delete (`payload - keys`) in the same UPDATE that marks
+   * the message SENT or DEAD. `codeCiphertext` is always removed (OUTBOX_TERMINAL_SCRUB_KEYS).
    */
-  scrub?: (payload: OutboxPayloads[T]) => unknown;
+  scrubKeys?: readonly string[];
 }
 
 /**
@@ -39,7 +39,8 @@ export class PermanentOutboxError extends Error {
  * Topic → handler map used by the OutboxRelay. Register from a provider's constructor/onModuleInit:
  *   constructor(registry: OutboxHandlerRegistry) { registry.register('notification.create', { handle: (m) => ... }) }
  * One handler per topic. Handlers run outside any DB transaction and must be idempotent
- * (delivery is at-least-once).
+ * (delivery is at-least-once). Error messages end up in `last_error`: never put payload values,
+ * codes or addresses in them (the relay additionally redacts payload strings).
  */
 @Injectable()
 export class OutboxHandlerRegistry {

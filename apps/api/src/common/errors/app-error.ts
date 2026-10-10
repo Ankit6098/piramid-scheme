@@ -72,8 +72,9 @@ export const unauthenticated = (message = 'Please sign in to continue') =>
 export const forbidden = (message = 'You do not have permission to perform this action', details?: unknown) =>
   new AppError(ErrorCode.Forbidden, message, 403, details);
 
-export const mfaRequired = (message = 'Complete the verification step to access the admin area') =>
-  new AppError(ErrorCode.MfaRequired, message, 403);
+/** `details.reason`: MfaRequiredReason (TOTP_ENROLLMENT_REQUIRED | TOTP_REQUIRED) on admin routes. */
+export const mfaRequired = (message = 'Complete the verification step to access the admin area', details?: unknown) =>
+  new AppError(ErrorCode.MfaRequired, message, 403, details);
 
 /** `notFound('Program')` → "Program not found". */
 export const notFound = (resource = 'Resource', details?: unknown) =>

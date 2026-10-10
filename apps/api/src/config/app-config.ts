@@ -36,6 +36,11 @@ export interface AppConfigShape {
   readonly redis: { readonly url: string };
   readonly security: {
     readonly otpPepper: string;
+    /** 64 hex chars; AES-256-GCM key for OTP ciphertexts in outbox payloads. */
+    readonly otpOutboxKeyHex: string;
+    /** 64 hex chars; AES-256-GCM key for TOTP secrets at rest. */
+    readonly mfaEncryptionKeyHex: string;
+    readonly totpIssuer: string;
     readonly sessionTtlHours: number;
     readonly adminSessionTtlHours: number;
     readonly sessionIdleTimeoutMinutes: number;
@@ -61,6 +66,14 @@ export interface AppConfigShape {
     readonly default: { readonly limit: number; readonly ttlMs: number };
     readonly auth: { readonly limit: number; readonly ttlMs: number };
     readonly otp: { readonly limit: number; readonly ttlMs: number };
+  };
+  /** Login failure backoff (see LoginThrottleService). */
+  readonly loginThrottle: {
+    readonly freeAttempts: number;
+    readonly ipFreeAttempts: number;
+    readonly baseMs: number;
+    readonly maxMs: number;
+    readonly windowMs: number;
   };
 }
 
@@ -99,6 +112,13 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfigS
   if (e.NODE_ENV === 'production') {
     if (!/^[0-9a-f]{64}$/i.test(e.OTP_PEPPER)) problems.push('OTP_PEPPER: must be 64 hex characters in production');
   }
+  const keys = [e.OTP_PEPPER.toLowerCase(), e.OTP_OUTBOX_KEY.toLowerCase(), e.MFA_ENCRYPTION_KEY.toLowerCase()];
+  if (new Set(keys).size !== keys.length) {
+    problems.push('OTP_PEPPER, OTP_OUTBOX_KEY and MFA_ENCRYPTION_KEY must be three different secrets');
+  }
+  if (e.LOGIN_THROTTLE_MAX_SECONDS < e.LOGIN_THROTTLE_BASE_SECONDS) {
+    problems.push('LOGIN_THROTTLE_MAX_SECONDS must be >= LOGIN_THROTTLE_BASE_SECONDS');
+  }
 
   const corsOrigins = new Set<string>();
   for (const raw of e.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)) {
@@ -128,6 +148,9 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfigS
     redis: { url: e.REDIS_URL },
     security: {
       otpPepper: e.OTP_PEPPER,
+      otpOutboxKeyHex: e.OTP_OUTBOX_KEY.toLowerCase(),
+      mfaEncryptionKeyHex: e.MFA_ENCRYPTION_KEY.toLowerCase(),
+      totpIssuer: e.MFA_TOTP_ISSUER,
       sessionTtlHours: e.SESSION_TTL_HOURS,
       adminSessionTtlHours: e.ADMIN_SESSION_TTL_HOURS,
       sessionIdleTimeoutMinutes: e.SESSION_IDLE_TIMEOUT_MINUTES,
@@ -153,6 +176,13 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfigS
       default: { limit: e.THROTTLE_DEFAULT_LIMIT, ttlMs: e.THROTTLE_DEFAULT_TTL_SECONDS * 1000 },
       auth: { limit: e.THROTTLE_AUTH_LIMIT, ttlMs: e.THROTTLE_AUTH_TTL_SECONDS * 1000 },
       otp: { limit: e.THROTTLE_OTP_LIMIT, ttlMs: e.THROTTLE_OTP_TTL_SECONDS * 1000 },
+    },
+    loginThrottle: {
+      freeAttempts: e.LOGIN_THROTTLE_FREE_ATTEMPTS,
+      ipFreeAttempts: e.LOGIN_THROTTLE_IP_FREE_ATTEMPTS,
+      baseMs: e.LOGIN_THROTTLE_BASE_SECONDS * 1000,
+      maxMs: e.LOGIN_THROTTLE_MAX_SECONDS * 1000,
+      windowMs: e.LOGIN_THROTTLE_WINDOW_SECONDS * 1000,
     },
   };
 }

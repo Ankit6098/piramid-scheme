@@ -31,14 +31,20 @@ export async function disconnectTestPrisma(): Promise<void> {
   clients.clear();
 }
 
+/** Tables kept by `resetDatabase`: migration history and migration-seeded reference data. */
+export const PRESERVED_TABLES = ['_prisma_migrations', 'currencies'] as const;
+
 /**
- * TRUNCATEs every application table (RESTART IDENTITY CASCADE; `_prisma_migrations` is kept), then
- * re-seeds roles, permissions, role_permissions and platform_settings. TRUNCATE does not fire the
- * row-level append-only triggers, so ledger/audit tables are wiped too.
+ * TRUNCATEs every application table (RESTART IDENTITY CASCADE; `_prisma_migrations` and the
+ * `currencies` reference data are kept), then re-seeds roles, permissions, role_permissions and
+ * platform_settings. TRUNCATE does not fire the row-level append-only/guard triggers, so
+ * ledger/audit/referral tables are wiped too.
  */
 export async function resetDatabase(prisma: PrismaClient = testPrisma()): Promise<void> {
-  const tables = await prisma.$queryRaw<Array<{ tablename: string }>>`
-    SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> '_prisma_migrations'`;
+  const preserved = new Set<string>(PRESERVED_TABLES);
+  const tables = (
+    await prisma.$queryRaw<Array<{ tablename: string }>>`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
+  ).filter((t) => !preserved.has(t.tablename));
   if (tables.length) {
     const list = tables.map((t) => `"public"."${t.tablename.replace(/"/g, '""')}"`).join(', ');
     await prisma.$executeRawUnsafe(`TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`);

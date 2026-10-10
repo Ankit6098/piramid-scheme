@@ -19,6 +19,12 @@ const SECRET_KEYS = [
   'tokenHash',
   'csrfToken',
   'otpPepper',
+  'secret',
+  'secretEnc',
+  'codeCiphertext',
+  'apiKey',
+  'keyHash',
+  'pendingPasswordHash',
 ];
 
 export const LOG_REDACT_PATHS: string[] = [
