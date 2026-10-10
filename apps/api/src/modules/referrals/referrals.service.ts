@@ -1,8 +1,10 @@
 import { isIP } from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { ErrorCode } from '@app/shared';
 import { AppError } from '../../common/errors/app-error';
+import { OutboxService } from '../../common/outbox/outbox.service';
+import { OutboxTopic } from '../../common/outbox/outbox.topics';
 import type { Tx } from '../../common/prisma/prisma.service';
 import { generateReferralCode, normalizeReferralCode } from './domain/referral-code';
 
@@ -31,7 +33,7 @@ export interface AttachNewMemberResult {
   referralCode: string;
 }
 
-const MAX_CODE_ATTEMPTS = 12;
+export const MAX_CODE_ATTEMPTS = 12;
 
 /**
  * CROSS-MODULE CONTRACT: referral attribution at account creation (business rules §6).
@@ -39,6 +41,13 @@ const MAX_CODE_ATTEMPTS = 12;
  */
 @Injectable()
 export class ReferralsService {
+  private readonly outbox: OutboxService;
+
+  /** `outbox` is injected by Nest; scripts may construct the service without arguments. */
+  constructor(@Optional() outbox?: OutboxService) {
+    this.outbox = outbox ?? new OutboxService();
+  }
+
   /**
    * Validates a referral code: an active global code whose owner is ACTIVE and email-verified.
    * Normalizes input (trim, remove spaces/dashes, upper-case). Locks the code row FOR SHARE so it
@@ -95,6 +104,15 @@ export class ReferralsService {
         SELECT "ancestor_id", ${userId}::uuid, "depth" + 1
         FROM "referral_paths"
         WHERE "descendant_id" = ${input.sponsorUserId}::uuid`;
+      if (ip) {
+        // Fraud signal (business rules §12): evaluated by the worker after this transaction commits.
+        // The payload carries only the member id; the handler reads sponsor + IP from the committed row.
+        await this.outbox.enqueue(tx, {
+          topic: OutboxTopic.FraudRegistrationAttributed,
+          payload: { childUserId: userId },
+          dedupeKey: `fraud-attribution:${userId}`,
+        });
+      }
     }
 
     return { referralCode: await this.createCodeFor(tx, userId) };

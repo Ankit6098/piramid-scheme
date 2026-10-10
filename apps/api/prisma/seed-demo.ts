@@ -55,16 +55,20 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 25));
 
 export async function seedDemo(superAdminEmail: string): Promise<void> {
   // Services are wired by hand: tsx does not emit the decorator metadata Nest DI relies on.
-  const prisma = new PrismaService(loadConfig() as AppConfig);
-  const referrals = new ReferralsService();
+  const config = loadConfig() as AppConfig;
+  const prisma = new PrismaService(config);
+  const outbox = new OutboxService();
+  const audit = new AuditService();
+  const notifications = new NotificationsService(outbox, prisma);
+  const referrals = new ReferralsService(outbox);
   const ledger = new LedgerService();
   const engine = new RewardEngineService(
     prisma,
     new HierarchyService(),
-    new EnrollmentsService(),
+    new EnrollmentsService(prisma, audit, notifications, outbox, config),
     ledger,
-    new NotificationsService(new OutboxService()),
-    new AuditService(),
+    notifications,
+    audit,
   );
   try {
     await prisma.$connect();

@@ -17,6 +17,7 @@ import {
   Layers,
   LayoutDashboard,
   Network,
+  PlugZap,
   ReceiptText,
   Scale,
   ScrollText,
@@ -252,6 +253,14 @@ export const adminNav: readonly NavGroup[] = [
         permission: Permission.SettingsWrite,
         keywords: ['currency', 'points', 'configuration'],
       },
+      {
+        title: 'Integrations',
+        href: routes.admin.integrations,
+        icon: PlugZap,
+        description: 'API clients that submit sales',
+        permission: Permission.IntegrationsManage,
+        keywords: ['api', 'keys', 'webhooks', 'clients'],
+      },
     ],
   },
 ];
@@ -301,4 +310,15 @@ export function findNavItem(pathname: string): NavItem | undefined {
 export const ROUTE_LABELS: Record<string, string> = {
   ...Object.fromEntries(allNavItems.map((item) => [item.href, item.title])),
   [routes.admin.overview]: 'Admin',
+  '/admin/programs/[id]/policies': 'Reward policies',
+  '/admin/programs/new': 'New program',
+  '/admin/programs/[id]': 'Program',
+  '/admin/programs/[id]/edit': 'Edit',
+  '/admin/programs/[id]/options': 'Options',
+  '/admin/programs/[id]/enrollments': 'Enrollments',
+  '/admin/programs/[id]/admins': 'Admins',
+  '/admin/programs/[id]/history': 'History',
+  '/programs/[id]': 'Program',
+  '/admin/members/[id]': 'Member',
+  '/admin/members/[id]/team': 'Team',
 };

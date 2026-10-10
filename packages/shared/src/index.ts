@@ -12,6 +12,7 @@ export * from './contracts/enrollments';
 export * from './contracts/referrals';
 export * from './contracts/policies';
 export * from './contracts/events';
+export * from './contracts/integrations';
 export * from './contracts/rewards';
 export * from './contracts/ledger';
 export * from './contracts/admin';

@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
-import { SettingsController } from './settings.controller';
+import { AdminCurrenciesController, AdminSettingsController, SettingsController } from './settings.controller';
+import { SettingsService } from './settings.service';
 
-/** Platform settings read (public display format) and SUPER_ADMIN updates (call PlatformSettingsService.invalidate()). */
+/** Platform settings read (public display format) and audited SUPER_ADMIN updates. */
 @Module({
   imports: [],
-  controllers: [SettingsController],
-  providers: [],
-  exports: [],
+  controllers: [SettingsController, AdminSettingsController, AdminCurrenciesController],
+  providers: [SettingsService],
+  exports: [SettingsService],
 })
 export class SettingsModule {}

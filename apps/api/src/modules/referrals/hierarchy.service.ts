@@ -8,8 +8,9 @@ export interface AncestorRef {
 }
 
 /**
- * CROSS-MODULE CONTRACT: referral-tree queries backed by the closure table.
- * The referrals slice extends this service with subtree/team queries.
+ * CROSS-MODULE CONTRACT: referral-tree queries backed by the closure table (used by the reward
+ * engine). Constructor-free on purpose (scripts build it by hand); the member team views live in
+ * `TeamService`, the admin views in `AdminHierarchyService`.
  */
 @Injectable()
 export class HierarchyService {

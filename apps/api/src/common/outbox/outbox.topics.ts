@@ -12,6 +12,8 @@ export const OutboxTopic = {
   EmailSend: 'email.send',
   EmailOtp: 'email.otp',
   NotificationCreate: 'notification.create',
+  /** Referrals slice: shared-IP fraud heuristic after a registration attribution (business rules §12). */
+  FraudRegistrationAttributed: 'fraud.registration-attributed',
 } as const;
 export type OutboxTopic = (typeof OutboxTopic)[keyof typeof OutboxTopic];
 
@@ -99,8 +101,19 @@ export interface NotificationCreatePayload {
   data?: Record<string, unknown>;
 }
 
+// ─── fraud.registration-attributed (referrals slice) ────────────────────────
+
+/**
+ * Enqueued by `ReferralsService.attachNewMember` when a sponsored registration carries an IP. The
+ * handler reads sponsor + IP from the committed relationship (nothing else lives in the outbox).
+ */
+export interface FraudRegistrationAttributedPayload {
+  childUserId: string;
+}
+
 export interface OutboxPayloads {
   'email.send': EmailSendPayload;
   'email.otp': OtpEmailPayload;
   'notification.create': NotificationCreatePayload;
+  'fraud.registration-attributed': FraudRegistrationAttributedPayload;
 }

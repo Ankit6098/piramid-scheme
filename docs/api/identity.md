@@ -1,0 +1,161 @@
+# Identity API — auth & self-service account
+
+Slice 1 (identity). Base path `/api/v1`. Business rules: [business-rules.md §2](../business-rules.md#2-accounts--authentication).
+Schemas: `packages/shared/src/contracts/auth.ts` and `contracts/users.ts`. Every mutation needs the CSRF
+double-submit pair (`csrf_token` cookie ↔ `x-csrf-token` header, from `GET /auth/csrf`, core-owned).
+
+Conventions used below:
+
+- **Auth** — `public` (no session), `optional` (works with or without a session), `session` (any
+  signed-in user), `admin session` (signed-in user with a non-MEMBER role; admin *access* not needed).
+- **Limit** — `auth` / `otp` = per-IP Nest throttlers (`THROTTLE_AUTH_*`, `THROTTLE_OTP_*`); `login` = the
+  Redis login backoff (`LoginThrottleService`, per email-HMAC + IP and per IP); `codes` = the DB-derived
+  one-time-code limits below.
+- Errors use the standard envelope `{ error: { code, message, details?, requestId } }`. Validation errors are
+  `400 VALIDATION_FAILED` with `details.issues[] = { path, message, code }`.
+
+## One-time codes (email)
+
+6 digits (CSPRNG), stored only as `HMAC-SHA-256(OTP_PEPPER, purpose:email:code)`, TTL 10 min, 5 attempts per
+code, single use, one open challenge per (address, purpose) — issuing a new code invalidates the previous one
+in the same transaction. Delivery only via `OtpMailer` (outbox payload `{ challengeId, codeCiphertext,
+template }`, scrubbed when SENT/DEAD). Limits per (address, purpose), derived from `email_challenges`:
+
+| Limit | Value | Public flows (register, resend, forgot, email change) | Admin email MFA |
+|---|---|---|---|
+| Resend cooldown | 60 s | silent (same 202) | `429 OTP_COOLDOWN` + `Retry-After` |
+| Codes per hour | 5 | silent | `429 RATE_LIMITED` + `Retry-After` |
+| Failed attempts in 24 h | ≥ 10 → sends **and** verifications blocked for 24 h; owner emailed once/day | silent / generic `OTP_INVALID` | `429 OTP_TOO_MANY_ATTEMPTS` |
+
+Every failed verification (wrong, expired, used, exhausted, blocked, no code at all) returns the same
+`400 OTP_INVALID` with the same message. A new **registration** for an address always supersedes the pending
+one (no cooldown, but within the hourly cap); if refused by a limit, the older pending payload is invalidated
+so it can never be verified.
+
+## Auth (`/auth`)
+
+### `POST /auth/register` — public · limit `auth` · `202`
+
+Request `{ fullName (2–120), email, password (≥ 10, a letter + a digit), referralCode? }` (email trimmed +
+lower-cased; empty `referralCode` = none).
+
+Never creates a user. Validates `referralCode` (`ReferralsService.resolveCodeForRegistration`), hashes the
+password (argon2id — always, for equal cost), then in one transaction (advisory lock per address): if the
+address has an account → a de-duplicated (1/hour) *registration-attempt* notice to the owner; otherwise the
+pending name, password hash and referral code are stored on a new `EMAIL_VERIFICATION` challenge (the older
+open one is invalidated and scrubbed) and the code is emailed.
+
+Response (identical for known and unknown addresses):
+`{ data: { accepted: true, message, expiresInSeconds: 600, resendAfterSeconds: 60 } }`.
+Errors: `400 REFERRAL_CODE_INVALID` (code unknown/inactive/owner not ACTIVE+verified), `400 VALIDATION_FAILED`.
+
+### `POST /auth/register/resend` — public · limit `otp` · `202`
+
+`{ email }` → same generic body. Re-issues a code for a pending registration (payload copied, `sendCount + 1`,
+old challenge invalidated) subject to the code limits — all refusals are silent. Pending registrations can be
+re-sent until 24 h after their last code expired (then scrubbed by `auth-challenge-cleanup`).
+
+### `POST /auth/verify-email` — public · limit `otp` · `200` · sets `sid` + new `csrf_token`
+
+`{ email, code }`. Atomic attempt (`UPDATE … attempts + 1 … RETURNING`, constant-time compare), then ONE
+transaction without savepoints: consume the challenge (conditional) → create the user (`ACTIVE`, verified,
+pending password hash) → re-validate the stored referral code (if no longer valid: join as a root member and
+report it) → `ReferralsService.attachNewMember` (shared tree lock, self row, relationship with registration
+IP + user agent, ancestor rows, own referral code) → `MEMBER` role → session (member TTL) → audit
+`user.register` (actor = new user; `sponsorUserId`, `referralCodeNoLongerValid`). A session cookie presented
+with the request is revoked.
+
+Response `{ data: { user: SessionUserDto, referral: { applied, codeNoLongerValid } } }`.
+Errors: `400 OTP_INVALID`.
+
+### `POST /auth/login` — public · limits `auth` + `login` · `200` · sets `sid` + new `csrf_token`
+
+`{ email, password }`. Unknown email (dummy argon2 verify) and wrong password → `401 INVALID_CREDENTIALS`
+(same message, same throttle counters, no cookie). After 5 failures per (email, IP) — 20 per IP — each further
+attempt is blocked 30 s · 2^k (max 15 min): `429 RATE_LIMITED` + `Retry-After`, even with the right password;
+other IPs are unaffected. Only after a correct password: `403 ACCOUNT_SUSPENDED` (suspended or deactivated),
+`403 EMAIL_NOT_VERIFIED` (legacy). Success creates a session **without** a second factor (admin TTL 12 h for
+admin roles, else 7 days), updates `lastLoginAt`, audits `auth.login`, revokes a session presented with the
+request.
+
+Response `{ data: { mfaRequired: false, user } }` for members;
+`{ data: { mfaRequired: true, method: 'TOTP' | 'TOTP_ENROLLMENT', user } }` for admin-role users (TOTP when a
+confirmed authenticator exists, else enrollment). The member area works without MFA; `/admin/*` needs it.
+
+### `POST /auth/logout` — optional · `200`
+
+Revokes the current session (`logout`, audited) or whatever session the cookie names; clears `sid`, issues a
+fresh `csrf_token`. `{ data: { signedOut: true } }`.
+
+### `GET /auth/session` — optional
+
+`{ data: { user: SessionUserDto } }`; `401 UNAUTHENTICATED` without a valid session (a dead cookie is cleared).
+
+```ts
+SessionUserDto = { id, fullName, email, emailVerified, avatarUrl, roles, permissions, isAdmin,
+                   adminAccess, mfaMethod: 'EMAIL_OTP' | 'TOTP' | null, hasTotpFactor }
+```
+
+### `POST /auth/password/forgot` — public · limit `auth` · `202`
+
+`{ email }` → generic body. ACTIVE members get a `PASSWORD_RESET` code (limits silent). **Admin-role users:**
+same 202, no email; every ACTIVE SUPER_ADMIN gets an email + in-app notice (1/hour per account, masked
+address) and `auth.password_reset.blocked_admin` is audited. Unknown/suspended addresses: nothing.
+
+### `POST /auth/password/reset` — public · limit `auth` · `200`
+
+`{ email, code, newPassword }`. Code verified atomically; then one transaction: consume → (refused, code
+still consumed, if the account changed address, is not ACTIVE or now holds an admin role) → new hash +
+`passwordChangedAt` → **all** sessions revoked (`password_reset`) → audit `user.password.reset` → owner
+notice. Does not sign in. `{ data: { passwordReset: true } }`. Errors: `400 OTP_INVALID`, `400 VALIDATION_FAILED`.
+
+## Admin MFA (`/auth/mfa`) — admin session
+
+Every success **rotates** the session (`SessionTokenService.elevateSession`: new token/row with
+`mfaMethod`/`mfaVerifiedAt`, expiry ≤ now + 12 h, old row revoked `mfa_rotated`) and sets the new `sid`.
+Members get `403 FORBIDDEN`; no session → `401`.
+
+| Method & path | Limit | Preconditions | Effect / response |
+|---|---|---|---|
+| `POST /auth/mfa/email/send` | `otp`, codes | no confirmed authenticator, session not yet MFA'd | `LOGIN_MFA` code bound to THIS session → `{ sentTo (masked), expiresAt, resendAfterSeconds }`. `409 INVALID_STATE_TRANSITION` if an authenticator exists / already verified; `429 OTP_COOLDOWN \| RATE_LIMITED \| OTP_TOO_MANY_ATTEMPTS` |
+| `POST /auth/mfa/email/verify` `{ code }` | `otp`, codes | as above | elevates with `EMAIL_OTP` (never admin access) → `{ user }`. Only a code requested by this session matches. `400 OTP_INVALID` |
+| `POST /auth/mfa/totp/setup` | `otp` | no confirmed authenticator; session MFA'd (`EMAIL_OTP`, or `TOTP` after a reset) | new secret, stored AES-256-GCM encrypted as an unconfirmed factor (older unconfirmed one revoked) → `{ otpauthUri, secret, issuer, accountName }` (shown once). `403 MFA_REQUIRED` before the email step; `409` if already enrolled |
+| `POST /auth/mfa/totp/confirm` `{ code }` | `otp`, `login` | pending factor < 30 min old | factor confirmed (`last_used_step` set) + elevated with `TOTP` → `{ user }` with `adminAccess: true`. `400 OTP_INVALID`; `409` setup expired |
+| `POST /auth/mfa/totp/verify` `{ code }` | `otp`, `login` | confirmed authenticator | replay-safe (`… WHERE last_used_step IS NULL OR last_used_step < step`) → elevated with `TOTP` → `{ user }`. `400 OTP_INVALID` (wrong or replayed); `403 MFA_REQUIRED` (`details.reason = TOTP_ENROLLMENT_REQUIRED`) without a factor; `429 RATE_LIMITED` after repeated failures |
+
+Audit: `auth.mfa.email_verified`, `auth.mfa.totp_setup_started`, `auth.mfa.totp_enrolled`,
+`auth.mfa.totp_verified`.
+
+## Self-service account (`/users/me`) — session
+
+All routes act only on the caller's account.
+
+| Method & path | Limit | Request | Response / behaviour |
+|---|---|---|---|
+| `GET /users/me` | — | — | `ProfileDto { id, fullName, email, emailVerifiedAt, phone, avatarUrl, createdAt, lastLoginAt, passwordChangedAt, roles, isAdmin, hasTotpFactor, totpEnrolledAt }` |
+| `PATCH /users/me` | — | `{ fullName?, phone?: string \| null, avatarUrl?: https URL \| null }` (≥ 1 field) | updated `ProfileDto`; audit `user.profile.update` with only the changed fields (phone masked); no-op → no audit |
+| `POST /users/me/password` | `auth`, `login` | `{ currentPassword, newPassword }` (must differ) | `ProfileDto`; other sessions revoked (`password_changed`), open reset codes voided, owner notice, SUPER_ADMINs notified for admins; audit `user.password.change`. Wrong current password → `400 VALIDATION_FAILED` on `currentPassword` (shares the login backoff) |
+| `POST /users/me/email-change` | `otp`, `login`, codes | `{ newEmail, password }` | `202` generic body — identical when `newEmail` belongs to another account (that address gets a notice instead of a code); audit `user.email_change.requested` either way. `400` on `password` / `newEmail` (same as current) |
+| `POST /users/me/email-change/confirm` | `otp`, codes | `{ code }` | `ProfileDto` with the new email; other sessions revoked (`email_changed`), the account's open codes voided, OLD address gets `email-changed-notice` (+ in-app), SUPER_ADMINs notified for admins; audit `user.email.change` (masked). `400 OTP_INVALID`; `409 CONFLICT` if the address was taken meanwhile |
+| `GET /users/me/sessions` | — | `?cursor&limit` | page of `UserSessionDto { id, createdAt, lastSeenAt, expiresAt, ipAddress, userAgent, mfaMethod, current }` — open sessions only (not revoked/expired/idle), newest first |
+| `DELETE /users/me/sessions/:id` | — | — | `{ revoked: true, current }`; another account's session → `404`; revoking the current one clears `sid`; audit `user.session.revoke` |
+| `POST /users/me/sessions/revoke-others` | — | — | `{ revoked: n }`; audit `user.sessions.revoke_others` |
+| `GET /users/me/activity` | — | `?cursor&limit` | page of `ActivityEntryDto { id, action, resourceType, createdAt, ipAddress (masked, e.g. 203.0.113.x) }` — entries the caller performed or about the caller's account; no before/after, no actor ids |
+| `POST /users/me/mfa/totp/reset` | `otp`, `login` | `{ code }` (current authenticator code) | admins only (`403 FORBIDDEN` otherwise). Factor revoked (replay-safe), other sessions revoked (`mfa_reset`), SUPER_ADMINs notified; audit `user.mfa.totp_reset` → `ProfileDto`. Then enroll again via `/auth/mfa/totp/setup` |
+
+There is deliberately no "pending email change" field in `ProfileDto`: it would reveal whether the requested
+address is already taken.
+
+## Background jobs
+
+| Job | Schedule | Work |
+|---|---|---|
+| `auth-challenge-cleanup` | every 15 min | scrubs pending registration payloads (name, password hash, referral code) of challenges consumed, invalidated or expired > 24 h ago; deletes challenge rows older than 30 days |
+| `auth-session-cleanup` | 03:41 daily | deletes sessions expired or revoked more than 30 days ago |
+
+## Residual risks (documented decisions)
+
+- A registration started by someone else for your address emails you a code; entering that code would create
+  the account with *their* password. The email says to ignore unsolicited codes, the code is only usable from
+  the mailbox, and any newer registration by the owner replaces the pending one.
+- `POST /auth/mfa/totp/*` failures share the per-IP login backoff budget (20 free failures per IP).

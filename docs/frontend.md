@@ -151,7 +151,8 @@ const logout = useLogout();                                    // POST /auth/log
   - `<Can perm={Permission.RewardsApprove}>…</Can>` — hide individual actions.
 - Endpoints the core relies on (API contract):
   `GET /auth/csrf → { data: { csrfToken } }` (+ `csrf_token` cookie),
-  `GET /auth/session → { data: { user: { id, fullName, email, emailVerified, avatarUrl, roles, permissions, isAdmin, mfaVerified } } }` or 401,
+  `GET /auth/session → { data: { user: { id, fullName, email, emailVerified, avatarUrl, roles, permissions, isAdmin, adminAccess, mfaMethod, hasTotpFactor } } }` or 401
+  (`SessionUserDto` in `@app/shared`; `<RequireAuth area="admin">` sends admins without `adminAccess` to `/mfa`),
   `POST /auth/logout`, `GET /settings/public → { data: { rewardUnit, currencyCode, currencyMinorUnits, pointsLabel } }` (public).
 
 ### Proxy (`src/proxy.ts`)

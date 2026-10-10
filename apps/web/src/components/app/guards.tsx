@@ -20,8 +20,9 @@ function currentPath(): string {
 export interface RequireAuthProps {
   children: ReactNode;
   /**
-   * `admin` additionally requires an admin role and a completed second factor (`mfaVerified`);
-   * non-admins see a permission-denied state, unverified admins are sent to /mfa.
+   * `admin` additionally requires an admin role and admin access (`adminAccess`: an authenticator
+   * code verified in this session within 12 h); non-admins see a permission-denied state, signed-in
+   * admins without admin access are sent to /mfa (email code / authenticator setup / TOTP).
    */
   area?: 'member' | 'admin';
   /** Shown while the session loads or a redirect is in flight. */
@@ -39,7 +40,7 @@ export function RequireAuth({ children, area = 'member', fallback }: RequireAuth
   const redirect: 'login' | 'mfa' | null =
     status === 'unauthenticated'
       ? 'login'
-      : area === 'admin' && user?.isAdmin && !user.mfaVerified
+      : area === 'admin' && user?.isAdmin && !user.adminAccess
         ? 'mfa'
         : null;
 

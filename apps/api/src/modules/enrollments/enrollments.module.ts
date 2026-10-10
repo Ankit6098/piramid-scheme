@@ -1,12 +1,14 @@
 import { Module } from '@nestjs/common';
-import { EnrollmentsController } from './enrollments.controller';
+import { NotificationsModule } from '../notifications/notifications.module';
+import { AdminEnrollmentsController, EnrollmentsController } from './enrollments.controller';
+import { EnrollmentsJobs } from './enrollments.jobs';
 import { EnrollmentsService } from './enrollments.service';
 
-/** Member enrollments, admin activation/rejection, expiry job. */
+/** Member enrollments, admin activation/rejection/cancellation, expiry job. */
 @Module({
-  imports: [],
-  controllers: [EnrollmentsController],
-  providers: [EnrollmentsService],
+  imports: [NotificationsModule],
+  controllers: [EnrollmentsController, AdminEnrollmentsController],
+  providers: [EnrollmentsService, EnrollmentsJobs],
   exports: [EnrollmentsService],
 })
 export class EnrollmentsModule {}

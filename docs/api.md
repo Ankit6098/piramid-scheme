@@ -119,32 +119,38 @@ key (admin, MFA required). Status: `planned` → `implemented`.
 
 ### Auth (`auth`)
 
+Full contracts: [api/identity.md](api/identity.md).
+
 | Method | Path | Auth | Purpose | Status |
 |---|---|---|---|---|
 | GET | `/auth/csrf` | public | Issue `csrf_token` cookie | implemented |
-| POST | `/auth/register` | public | Register (optional `referralCode`); generic response | planned |
-| POST | `/auth/verify-email` | public | Verify email with OTP | planned |
-| POST | `/auth/resend-verification` | public | Resend verification OTP (cooldown) | planned |
-| POST | `/auth/login` | public | Email + password → session (admins: `mfaRequired: true`) | planned |
-| POST | `/auth/mfa/verify` | session | Verify `LOGIN_MFA` code → `mfaVerified` | planned |
-| POST | `/auth/mfa/resend` | session | Resend MFA code | planned |
-| POST | `/auth/logout` | session | Revoke current session | planned |
-| GET | `/auth/session` | public | Current user, roles, permissions, `mfaVerified` (or `null`) | planned |
-| POST | `/auth/password/forgot` | public | Send reset OTP (generic response) | planned |
-| POST | `/auth/password/reset` | public | Reset with OTP; revokes all sessions | planned |
+| POST | `/auth/register` | public | Register (optional `referralCode`); generic 202, no user until verified | implemented |
+| POST | `/auth/register/resend` | public | New verification code (cooldown/caps silent); generic 202 | implemented |
+| POST | `/auth/verify-email` | public | Verify code → create member + attribution + session | implemented |
+| POST | `/auth/login` | public | Email + password → session (admins: `mfaRequired`, `method: TOTP \| TOTP_ENROLLMENT`) | implemented |
+| POST | `/auth/mfa/email/send` · `/auth/mfa/email/verify` | admin session | `LOGIN_MFA` code bound to the session → `EMAIL_OTP` (admins without an authenticator) | implemented |
+| POST | `/auth/mfa/totp/setup` · `/auth/mfa/totp/confirm` | admin session | Enroll an authenticator → `TOTP` (admin access) | implemented |
+| POST | `/auth/mfa/totp/verify` | admin session | Authenticator code (replay-safe) → `TOTP` (admin access) | implemented |
+| POST | `/auth/logout` | optional | Revoke current session | implemented |
+| GET | `/auth/session` | optional | Current user, roles, permissions, `adminAccess`, `mfaMethod`, `hasTotpFactor` (401 when signed out) | implemented |
+| POST | `/auth/password/forgot` | public | Send reset code (generic 202; disabled for admin roles → SUPER_ADMINs notified) | implemented |
+| POST | `/auth/password/reset` | public | Reset with code; revokes all sessions | implemented |
 
 ### Me / users (`users`)
 
 | Method | Path | Auth | Purpose | Status |
 |---|---|---|---|---|
-| GET | `/me` | member | Own profile | planned |
-| PATCH | `/me` | member | Update name, phone, avatar | planned |
-| POST | `/me/password` | member | Change password (current required); revokes other sessions | planned |
-| POST | `/me/email-change` | member | Start email change (current password + OTP to new address) | planned |
-| POST | `/me/email-change/confirm` | member | Confirm with OTP; notify old address | planned |
-| GET | `/me/sessions` | member | Active sessions | planned |
-| DELETE | `/me/sessions/{id}` | member | Revoke a session | planned |
-| POST | `/me/deactivate` | member | Deactivate own account (terminal) | planned |
+| GET | `/users/me` | member | Own profile | implemented |
+| PATCH | `/users/me` | member | Update name, phone, avatar (https only) | implemented |
+| POST | `/users/me/password` | member | Change password (current required); revokes other sessions | implemented |
+| POST | `/users/me/email-change` | member | Start email change (current password + code to new address); generic 202 | implemented |
+| POST | `/users/me/email-change/confirm` | member | Confirm with code; notify old address; revokes other sessions | implemented |
+| GET | `/users/me/sessions` | member | Open sessions (cursor) | implemented |
+| DELETE | `/users/me/sessions/{id}` | member | Revoke one of your sessions | implemented |
+| POST | `/users/me/sessions/revoke-others` | member | Revoke all other sessions | implemented |
+| GET | `/users/me/activity` | member | Own audit trail (masked, cursor) | implemented |
+| POST | `/users/me/mfa/totp/reset` | admin session | Remove the authenticator (current code required) to re-enroll | implemented |
+| POST | `/users/me/deactivate` | member | Deactivate own account (terminal) | planned |
 
 ### Settings (`settings`)
 

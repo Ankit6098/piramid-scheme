@@ -3,6 +3,7 @@ import { AuditModule } from './audit/audit.module';
 import { AuthModule } from './auth/auth.module';
 import { EnrollmentsModule } from './enrollments/enrollments.module';
 import { EventsModule } from './events/events.module';
+import { IntegrationsModule } from './integrations/integrations.module';
 import { LedgerModule } from './ledger/ledger.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { OfferingsModule } from './offerings/offerings.module';
@@ -25,6 +26,7 @@ export const FEATURE_MODULES = [
   ReferralsModule,
   PoliciesModule,
   EventsModule,
+  IntegrationsModule,
   RewardsModule,
   LedgerModule,
   ReconciliationModule,

@@ -1,17 +1,9 @@
-import { LayoutDashboard } from 'lucide-react';
 import type { Metadata } from 'next';
 
-import { ComingSoon } from '@/components/app/coming-soon';
+import { MemberDashboardPage } from '@/features/dashboard/components/member-dashboard-page';
 
-// Route stub — a feature slice replaces this page.
 export const metadata: Metadata = { title: 'Dashboard' };
 
 export default function Page() {
-  return (
-    <ComingSoon
-      title="Dashboard"
-      description="Your programs, referral link and recorded rewards at a glance."
-      icon={LayoutDashboard}
-    />
-  );
+  return <MemberDashboardPage />;
 }

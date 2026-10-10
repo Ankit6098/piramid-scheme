@@ -1,17 +1,10 @@
-import { Gauge } from 'lucide-react';
 import type { Metadata } from 'next';
 
-import { ComingSoon } from '@/components/app/coming-soon';
+import { AdminOverviewPage } from '@/features/admin/components/admin-overview-page';
 
-// Route stub — the admin overview slice replaces this page. (Any admin may open it.)
+// Any admin may open the overview; the API scopes the figures to the caller.
 export const metadata: Metadata = { title: 'Admin overview' };
 
 export default function Page() {
-  return (
-    <ComingSoon
-      title="Overview"
-      description="Platform health, pending reviews and reconciliation exceptions."
-      icon={Gauge}
-    />
-  );
+  return <AdminOverviewPage />;
 }

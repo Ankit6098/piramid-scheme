@@ -47,6 +47,7 @@ export const routes = {
     flags: '/admin/flags',
     audit: '/admin/audit',
     settings: '/admin/settings',
+    integrations: '/admin/integrations',
   },
 } as const;
 

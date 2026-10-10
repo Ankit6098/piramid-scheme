@@ -1,11 +1,20 @@
-import { Controller } from '@nestjs/common';
+import { Controller, Get, Param } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
+import { ok } from '../../common/http/envelope';
+import { IdParamDto } from '../../common/validation/zod';
+import { PoliciesService } from './policies.service';
 
 /**
- * Policies HTTP routes (/api/v1/policies). Owned by the policies slice — HTTP only: validate with
- * createZodDto DTOs, call the service, return `ok(...)` / `paginate(...)` envelopes.
- * Admin routes for this module go in a separate controller under `admin/${d.path}`.
+ * Member transparency (any signed-in user): the reward levels of a program's current policy —
+ * levels, percentages / fixed amounts and the budget — without internal fields.
  */
 @ApiTags('policies')
-@Controller('policies')
-export class PoliciesController {}
+@Controller('programs')
+export class PoliciesController {
+  constructor(private readonly policies: PoliciesService) {}
+
+  @Get(':id/policy')
+  async current(@Param() p: IdParamDto) {
+    return ok(await this.policies.memberPolicy(p.id));
+  }
+}

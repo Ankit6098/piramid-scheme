@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
-import { OfferingsController } from './offerings.controller';
+import { AdminOfferingsController } from './offerings.controller';
+import { OfferingsService } from './offerings.service';
 
-/** Approved products/services (Offering) CRUD. */
+/** Approved products/services (Offering) CRUD + approval. */
 @Module({
   imports: [],
-  controllers: [OfferingsController],
-  providers: [],
-  exports: [],
+  controllers: [AdminOfferingsController],
+  providers: [OfferingsService],
+  exports: [OfferingsService],
 })
 export class OfferingsModule {}

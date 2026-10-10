@@ -1,11 +1,41 @@
-import { Controller } from '@nestjs/common';
-import { ApiTags } from '@nestjs/swagger';
+import { Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { type AuthContext, CurrentUser, IdParamDto, ok } from '../../common';
+import { NotificationListQueryDto } from './dto';
+import { NotificationsService } from './notifications.service';
 
 /**
- * Notifications HTTP routes (/api/v1/notifications). Owned by the notifications slice — HTTP only: validate with
- * createZodDto DTOs, call the service, return `ok(...)` / `paginate(...)` envelopes.
- * Admin routes for this module go in a separate controller under `admin/${d.path}`.
+ * The signed-in user's in-app notifications (/api/v1/users/me/notifications) — HTTP only.
+ * Every route is scoped to `auth.userId`; mutations go through the global CSRF guard.
  */
 @ApiTags('notifications')
-@Controller('notifications')
-export class NotificationsController {}
+@Controller('users/me/notifications')
+export class NotificationsController {
+  constructor(private readonly notifications: NotificationsService) {}
+
+  @Get()
+  @ApiOperation({ summary: 'My notifications, newest first (cursor; `unread=true` for unread only)' })
+  list(@Query() q: NotificationListQueryDto, @CurrentUser() auth: AuthContext) {
+    return this.notifications.list(auth.userId, q);
+  }
+
+  @Get('unread-count')
+  @ApiOperation({ summary: 'Number of unread notifications (polled by the top-bar bell)' })
+  async unreadCount(@CurrentUser() auth: AuthContext) {
+    return ok({ count: await this.notifications.unreadCount(auth.userId) });
+  }
+
+  @Post('read-all')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Mark all my notifications read' })
+  async readAll(@CurrentUser() auth: AuthContext) {
+    return ok(await this.notifications.markAllRead(auth.userId));
+  }
+
+  @Post(':id/read')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Mark one of my notifications read (404 for anyone else’s)' })
+  async read(@Param() p: IdParamDto, @CurrentUser() auth: AuthContext) {
+    return ok(await this.notifications.markRead(auth.userId, p.id));
+  }
+}
