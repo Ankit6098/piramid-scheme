@@ -38,6 +38,8 @@ x-api-env: &api-env
   DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
   REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
   OTP_PEPPER: ${OTP_PEPPER:?set OTP_PEPPER (64 hex chars)}
+  OTP_OUTBOX_KEY: ${OTP_OUTBOX_KEY:?set OTP_OUTBOX_KEY (64 hex chars, distinct from OTP_PEPPER)}
+  MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?set MFA_ENCRYPTION_KEY (64 hex chars; rotating it forces admins to re-enroll TOTP)}
   # nginx always sits in front and overwrites X-Forwarded-For with the client address → trust
   # exactly one hop. Pinned (not taken from .env, whose development value is false): without it
   # every client would share nginx's IP for rate limiting. An LB in front is handled in nginx

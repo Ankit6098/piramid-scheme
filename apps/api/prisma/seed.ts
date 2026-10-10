@@ -10,15 +10,16 @@ import { createPrismaClient } from '../src/common/prisma/create-client';
 import type { PrismaClient } from '../src/generated/prisma/client';
 import { seedReferenceData, seedSuperAdmin } from './seed-lib';
 
-// ════════════════════════════════════════════════════════════════════════════
-// TODO(demo-data phase): seedDemoData()
-// Fill with offerings, programs (+ options, published policy versions), a member tree with
-// enrollments and a few qualifying events processed through the reward engine. Must stay idempotent
-// (look up by unique keys before inserting) and must never pay rewards for recruitment alone.
-// ════════════════════════════════════════════════════════════════════════════
+/** Demo dataset built through the real domain services (see seed-demo.ts). Idempotent. */
 export async function seedDemoData(prisma: PrismaClient): Promise<void> {
   void prisma;
-  console.log('[seed] seedDemoData(): not implemented yet — skipped');
+  const email = process.env.SEED_SUPER_ADMIN_EMAIL;
+  if (!email) {
+    console.log('[seed] demo data needs SEED_SUPER_ADMIN_EMAIL — skipped');
+    return;
+  }
+  const { seedDemo } = await import('./seed-demo');
+  await seedDemo(email);
 }
 
 async function main(): Promise<void> {
