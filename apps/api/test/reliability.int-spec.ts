@@ -364,10 +364,14 @@ describe('outbox relay claim ownership', () => {
         }
       },
     });
-    const first = await t.prisma.outboxMessage.create({ data: { topic: 'zz.fixc.batch', payload: { k: 'first' }, availableAt: new Date(Date.now() - 2_000) } });
-    const second = await t.prisma.outboxMessage.create({ data: { topic: 'zz.fixc.batch', payload: { k: 'second' }, availableAt: new Date(Date.now() - 1_000) } });
+    const first = await t.prisma.outboxMessage.create({ data: { topic: 'zz.fixc.batch', payload: { k: 'first' } } });
+    const second = await t.prisma.outboxMessage.create({ data: { topic: 'zz.fixc.batch', payload: { k: 'second' } } });
+    await t.prisma.$executeRaw`UPDATE "outbox_messages" SET "available_at" = now() - interval '2 seconds' WHERE "id" = ${first.id}::uuid`;
+    await t.prisma.$executeRaw`UPDATE "outbox_messages" SET "available_at" = now() - interval '1 second' WHERE "id" = ${second.id}::uuid`;
     const runA = relayA.runOnce(2);
     await firstEntered.opened;
+    // A claimed both rows and dispatches them oldest-due first: the second one is still waiting.
+    expect(await t.prisma.outboxMessage.findUniqueOrThrow({ where: { id: second.id } })).toMatchObject({ status: 'PROCESSING', attempts: 1 });
     // The second row (claimed by A, not yet dispatched) looks stale: B reclaims and delivers it.
     await t.prisma.$executeRaw`UPDATE "outbox_messages" SET "locked_at" = now() - interval '6 minutes' WHERE "id" = ${second.id}::uuid`;
     expect(await relayB.runOnce(5)).toMatchObject({ claimed: 1, sent: 1 });
@@ -404,9 +408,10 @@ describe('keyset pagination', () => {
     const seen: string[] = [];
     let cursor: string | null = null;
     do {
-      const res = await client.get(`/api/v1/users/me/notifications?limit=2${cursor ? `&cursor=${cursor}` : ''}`).expect(200);
-      seen.push(...res.body.data.map((n: { id: string }) => n.id));
-      cursor = res.body.page.nextCursor;
+      const url: string = `/api/v1/users/me/notifications?limit=2${cursor ? `&cursor=${cursor}` : ''}`;
+      const body = (await client.get(url).expect(200)).body as { data: Array<{ id: string }>; page: { nextCursor: string | null } };
+      seen.push(...body.data.map((n) => n.id));
+      cursor = body.page.nextCursor;
     } while (cursor);
     expect(seen).toEqual(expected);
   });

@@ -8,14 +8,18 @@ contract for feature slices building pages on top of the web core.
 > `apps/web/node_modules/next/dist/docs/` before using an unfamiliar API. `middleware.ts` is now
 > `src/proxy.ts`.
 
-## 1. Rendering model (Cache Components)
+## 1. Rendering model
 
-`next.config.ts` keeps `cacheComponents: true` + `partialPrefetching: true` (the Next 16 default
-direction). What that means for this app:
+`next.config.ts` sets `cacheComponents: false` and `partialPrefetching: false`. With them on, about
+4% of full page loads under load stayed on the loading skeleton (an out-of-order streamed Suspense
+boundary was revealed but never hydrated, React 19.3 / Next 16.4). The app never used `"use cache"`,
+so nothing is lost. Re-evaluate after a React/Next upgrade, and keep the rules below so turning it
+back on stays possible. What this means for this app:
 
-- Public pages (`/`, auth screens, error pages) are fully static.
-- The member/admin shells prerender a **static shell** (sidebar frame, nav labels, top bar). Every
-  session- or URL-dependent part renders inside a `<Suspense>` boundary.
+- Public pages (`/`, auth screens, error pages) and the member/admin pages without dynamic segments
+  are prerendered as static HTML; `[id]` routes render on demand.
+- The member/admin shells render a static frame (sidebar, nav labels, top bar). Every session- or
+  URL-dependent part renders inside a `<Suspense>` boundary.
 - Page content is rendered inside `<Suspense>` + `<RequireAuth>` in `AppShell`, and `loading.tsx`
   adds another boundary per navigation. `RequireAuth` renders a skeleton until the session query
   resolves in the browser, so **page components never run during prerender**. In practice slices can
@@ -23,16 +27,16 @@ direction). What that means for this app:
   without adding their own Suspense (verified with probe routes during setup).
 - All data is fetched **in the browser** with TanStack Query against `/api/v1` (cookie auth). No
   server-side data fetching, no Server Actions, no `cookies()` reads in pages.
-- Navigation keeps up to 3 recent routes mounted but hidden (React `<Activity>`): component state
-  (form drafts, open dialogs) survives back/forward. Reset transient UI state on success yourself.
-  The auth screens (login, register, verify-email, forgot/reset password) call
+- With Cache Components on, navigation keeps up to 3 recent routes mounted but hidden (React
+  `<Activity>`). It is off now, but code stays written for it: reset transient UI state on success
+  yourself. The auth screens (login, register, verify-email, forgot/reset password) call
   `useResetWhenHidden()` (`features/auth/lib/use-reset-when-hidden.ts`, a `useLayoutEffect` cleanup) to
   clear mutation results, errors and typed secrets when hidden, so a return visit starts clean.
 
 Rules:
 
-1. Never export `dynamic`, `revalidate`, `runtime` or `fetchCache` from a route. Cache Components
-   does not allow them.
+1. Never export `dynamic`, `revalidate`, `runtime` or `fetchCache` from a route (Cache Components
+   rejects them, and they are not needed).
 2. Do not call `Date.now()`, `new Date()` (no args) or `Math.random()` during render in components
    that can render outside a page body (shell, layouts, public pages). Use `useNow()`
    (`src/hooks/use-now.ts`) or `<RelativeTime>`; compute times in effects/handlers.

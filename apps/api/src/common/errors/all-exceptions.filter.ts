@@ -195,6 +195,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
         res.setHeader('retry-after', typeof retry === 'number' && retry > 0 ? String(Math.ceil(retry)) : '60');
       }
     }
+    // A bounded DB wait gave up (lock/statement/pool timeout): nothing was written, retry shortly.
+    if (n.status === 503 && (n.details as { retryable?: unknown } | undefined)?.retryable === true && !res.getHeader('retry-after')) {
+      res.setHeader('retry-after', '1');
+    }
     const body: ApiErrorBody = {
       error: {
         code: n.code,

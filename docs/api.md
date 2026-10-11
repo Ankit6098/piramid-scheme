@@ -83,7 +83,7 @@ structured and never contains secrets.
 | 429 | `RATE_LIMITED`, `OTP_TOO_MANY_ATTEMPTS`, `OTP_COOLDOWN` (with `Retry-After` when known) |
 | 500 | `INTERNAL_ERROR` (generic message; correlate with `requestId`) |
 | 501 | `NOT_IMPLEMENTED` |
-| 503 | `SERVICE_UNAVAILABLE` (readiness failure, or nginx when the API is unreachable) |
+| 503 | `SERVICE_UNAVAILABLE` (readiness failure, or nginx when the API is unreachable; with `details.retryable: true` and `Retry-After: 1` when a bounded database wait gave up — a lock held by a sponsor correction, a statement or pool timeout — nothing was written, retry) |
 
 `ACCOUNT_LOCKED` (423) and `OTP_EXPIRED` exist in the enum but no route emits them: login uses
 throttling instead of account locks, and an expired code is reported as `OTP_INVALID`.

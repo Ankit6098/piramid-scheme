@@ -307,6 +307,7 @@ Throw `AppError(code, message, httpStatus?, details?)` or a helper: `validationF
 | Prisma `P2025` | 404 `NOT_FOUND` |
 | Prisma `P2034` / `40001` / `40P01` | 409 `CONFLICT` with `details.retryable` |
 | invalid input value (`22P02`, `22001`, `P2000`, `P2007`, `P2023`) | 400 `VALIDATION_FAILED` |
+| bounded wait gave up: `55P03` lock_timeout, `57014` statement_timeout, Prisma `P2024` / `P2028` / `P2037`, pg-pool "timeout exceeded when trying to connect" | 503 `SERVICE_UNAVAILABLE`, `details.retryable`, `Retry-After: 1` (logged as a warning; see database.md "Concurrency strategy" §11) |
 | body-parser: too large / malformed JSON | 413 `PAYLOAD_TOO_LARGE` / 400 `VALIDATION_FAILED` |
 | Nest `HttpException` | mapped by status (404 `NOT_FOUND`, 501 `NOT_IMPLEMENTED`, …) |
 | anything else | 500 `INTERNAL_ERROR`, generic message. The stack is logged with the requestId |

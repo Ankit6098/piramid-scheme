@@ -92,6 +92,7 @@ validate first and turn violations into friendly errors.
   Because LOGIN_MFA bootstraps from the mailbox, an admin-role account can **change its email only from a
   TOTP-verified session** (`adminAccess`, checked on start and confirm, else 403 `MFA_REQUIRED`), and a
   LOGIN_MFA code is refused for a session created before the account's email was last changed/verified.
+  The same TOTP step-up applies to an admin-role account's **password change** (`POST /users/me/password`).
   **TOTP guesses are capped per account** (independent of IP, across verify, enrollment confirm and
   authenticator reset): 10 consecutive wrong codes pause TOTP verification for the account for 15 min
   (doubling with each further failure, max 24 h; a correct code resets the count), revoke the session that
@@ -153,6 +154,9 @@ validate first and turn violations into friendly errors.
   was never ACTIVE, so it has no enrollments or sales. Never back to DRAFT. Only DRAFT programs
   can be deleted. Every status change is recorded in `program_status_changes` [DB trigger; the reason is
   passed with `set_config('app.status_reason', …, true)` and the actor via `updated_by_id`].
+  The scheduler's transitions are recorded at the instant they were due (`startsAt` / `endsAt`, never
+  later than the run, never before the previous change) [DB], so sales made between `startsAt` and a late
+  scheduler run still count as made while the program was ACTIVE; manual transitions are recorded at now.
 - Publish requires: ≥ 1 active option, ACTIVE offering, valid dates, ≥ 1 PUBLISHED policy version.
 - After publish: code, offering, unit, currency, max depth frozen [DB]; `startsAt` frozen once started;
   `endsAt` cannot move into the past; dates frozen once COMPLETED [DB]. Name, description, terms (new
@@ -202,7 +206,11 @@ validate first and turn violations into friendly errors.
   the moved subtree [DB checks cycles, SoD, consistency]. Rejected if the moved subtree has RECEIVED
   (unprocessed) sales. Affects only calculations made afterwards; past rewards never change. The reward
   engine holds the tree lock in **shared** mode while it calculates (§8), so a correction and a sale
-  calculation never interleave and the RECEIVED-sales check cannot be overtaken.
+  calculation never interleave and the RECEIVED-sales check cannot be overtaken. Registrations and sale
+  calculations wait at most 3 s for an in-flight correction, then fail with a retryable 503 (nothing is
+  written; an unprocessed sale stays RECEIVED for the sweeper). A correction that would rewrite more than
+  50 000 closure rows (moved members × (old ancestors + new sponsor chain)) is refused
+  (409 `CORRECTION_TOO_LARGE`) and needs a planned maintenance window.
 - Member visibility: own sponsor + ancestors (display name = first name + last initial, depth, joined
   date); descendants up to depth 10 with display name, depth, joined date, status bucket
   (active / inactive), whether they currently hold an ELIGIBLE enrollment, direct-referral count. Never
@@ -270,8 +278,8 @@ external id can then be re-recorded as `revision + 1`. Serializes with the engin
 5. Allocate in level order against the remaining budget; zero amounts dropped. Σ ≤ budget always.
 
 **Persistence** (one transaction, idempotent): lock the event `FOR UPDATE`; skip unless RECEIVED; take
-`pg_advisory_xact_lock_shared(7301, 1)` (waits for an in-flight sponsor correction, blocks new ones until
-commit; ancestors are read under it); bind
+`pg_advisory_xact_lock_shared(7301, 1)` (waits at most 3 s for an in-flight sponsor correction, blocks new ones
+until commit; ancestors are read under it); bind
 the policy to the event [DB re-checks applicability]; insert the calculation (with base, budget,
 unit/currency/minor units/points rate snapshot) [DB re-derives the base and checks the cap] and rewards
 [DB checks upline, depth, SoD]; mark the event PROCESSED. If the policy doesn't require approval, the

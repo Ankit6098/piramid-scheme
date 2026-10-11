@@ -224,6 +224,23 @@ describe('users: self-service profile & security (/users/me)', () => {
       expect((await verified.post('/api/v1/users/me/email-change/confirm').send({ code }).expect(200)).body.data.email).toBe(target);
     });
 
+    it('an admin password change also needs an authenticator-verified session', async () => {
+      const admin = await createUser(t.prisma, { roles: ['FINANCE_REVIEWER'], password: PASSWORD });
+      await createTotpFactor(t, admin);
+      const emailOtp = await signedIn(admin, { mfa: 'EMAIL_OTP' });
+      const refused = await emailOtp
+        .post('/api/v1/users/me/password')
+        .send({ currentPassword: PASSWORD, newPassword: 'Fresh-password-9' })
+        .expect(403);
+      expect(refused.body.error).toMatchObject({ code: 'MFA_REQUIRED', details: { reason: 'TOTP_REQUIRED' } });
+      const unchanged = await t.prisma.user.findUniqueOrThrow({ where: { id: admin.id }, select: { passwordChangedAt: true } });
+
+      const verified = await signedIn(admin, { mfa: 'TOTP' });
+      await verified.post('/api/v1/users/me/password').send({ currentPassword: PASSWORD, newPassword: 'Fresh-password-9' }).expect(200);
+      const changed = await t.prisma.user.findUniqueOrThrow({ where: { id: admin.id }, select: { passwordChangedAt: true } });
+      expect(changed.passwordChangedAt?.getTime()).not.toBe(unchanged.passwordChangedAt?.getTime());
+    });
+
     it('a change started as a member cannot be confirmed once the account holds an admin role', async () => {
       const user = await createUser(t.prisma, { password: PASSWORD });
       const c = await signedIn(user);

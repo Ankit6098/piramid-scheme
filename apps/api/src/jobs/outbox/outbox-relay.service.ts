@@ -148,18 +148,25 @@ export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdow
   }
 
   private async claim(batchSize: number): Promise<ClaimedRow[]> {
+    // RETURNING has no defined order: dispatch the batch oldest-due first (CTE + ORDER BY).
     return this.prisma.$queryRaw<ClaimedRow[]>`
-      UPDATE "outbox_messages" AS o
-         SET "status" = 'PROCESSING', "locked_at" = now(), "attempts" = o."attempts" + 1
-       WHERE o."id" IN (
-         SELECT "id" FROM "outbox_messages"
-          WHERE ("status" IN ('PENDING', 'FAILED') AND "available_at" <= now())
-             OR ("status" = 'PROCESSING' AND "locked_at" < now() - make_interval(secs => ${OUTBOX_STALE_LOCK_SECONDS}))
-          ORDER BY "available_at"
-          LIMIT ${batchSize}
-          FOR UPDATE SKIP LOCKED
-       )
-      RETURNING o."id", o."topic", o."payload", o."attempts", o."max_attempts" AS "maxAttempts", o."created_at" AS "createdAt"`;
+      WITH claimed AS (
+        UPDATE "outbox_messages" AS o
+           SET "status" = 'PROCESSING', "locked_at" = now(), "attempts" = o."attempts" + 1
+         WHERE o."id" IN (
+           SELECT "id" FROM "outbox_messages"
+            WHERE ("status" IN ('PENDING', 'FAILED') AND "available_at" <= now())
+               OR ("status" = 'PROCESSING' AND "locked_at" < now() - make_interval(secs => ${OUTBOX_STALE_LOCK_SECONDS}))
+            ORDER BY "available_at"
+            LIMIT ${batchSize}
+            FOR UPDATE SKIP LOCKED
+         )
+        RETURNING o."id", o."topic", o."payload", o."attempts", o."max_attempts" AS "maxAttempts",
+                  o."created_at" AS "createdAt", o."available_at" AS "availableAt"
+      )
+      SELECT "id", "topic", "payload", "attempts", "maxAttempts", "createdAt"
+        FROM claimed
+       ORDER BY "availableAt", "createdAt", "id"`;
   }
 
   private async process(row: ClaimedRow): Promise<Outcome> {

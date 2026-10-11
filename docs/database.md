@@ -29,6 +29,7 @@ concurrency rules and retention policies. **Keep it in sync with every migration
 | `20261010120000_fix_referral_modify_guard` | Hand-written fix-forward | Replaces `app_referral_modify_guard()`. The original evaluated `NEW."child_user_id"` for every guarded table, so any UPDATE/DELETE on `referral_paths` inside an audited correction failed with `42703` (record "new" has no field "child_user_id"), making corrections impossible. The cycle check now runs only for UPDATEs of `referral_relationships`; PL/pgSQL resolves record fields lazily per branch. Covered by `test/db-invariants.int-spec.ts` and the sponsor-correction suites. |
 | `20261010150000_program_cancel_scheduled` | Hand-written | Replaces `app_programs_guard()` unchanged except for one transition: `SCHEDULED → ARCHIVED` is now allowed, so a published program can be withdrawn (`POST /admin/programs/{id}/cancel`) before its start date. Safe because enrollments and sales both require a program that is or was ACTIVE; `ck_programs_completed_has_end` still requires `ends_at`, which the service sets, and the reason is logged through `app.status_reason`. |
 | `20261011100000_compliance_payment_guard` | Hand-written | Plan payments never fund rewards (business rules §0.1). Adds `app_plan_payment_matches(subject, amount, currency, occurred_at, recorded_at)` — the plan payments a sale resembles: same amount, a program in the sale's currency, recorded within ±2 days of the sale date **or** of the recording time, paid by the subject (depth 0) or a member of the subject's downline (depth ≥ 1) — and the index `ix_enrollments_payment_amount` it uses. Replaces `app_events_insert_guard()` unchanged except for the plan-payment block: the payment-reference check and the own-payment amount match now span **every program** (references are globally unique; a payment in program A recorded as a sale in program B was accepted before), and the window also applies to `now()` (a back-dated `occurred_at` escaped it before). New `trg_rewards_lookalike_guard`: no APPROVED reward for a sale resembling an own or downline plan payment (judged with the event's `created_at`), so such rewards always wait for a reviewer. Covered by `test/compliance-plan-payment.int-spec.ts`. |
+| `20261011110000_reliability_indexes_and_triggers` | Prisma-generated indexes + hand-written triggers | No rule changes. (1) Indexes for keyset lists and searches (declared in `schema.prisma`, see [Indexes](#indexes)). (2) Referral closure consistency is checked **once per touched member** instead of once per closure row: statement-level AFTER triggers (transition tables) queue the distinct touched members in `app_private.referral_pending_checks` and one DEFERRABLE INITIALLY DEFERRED constraint trigger on that queue runs the unchanged `app_referral_assert_consistent()` at COMMIT; relationship DELETEs and the old child of a relationship UPDATE are now checked too. The `referral_paths` UPDATE/DELETE guard and the correction branch of its INSERT guard became statement-level (the correction authorization is evaluated once per statement, not per row); registrations keep the per-row insert guard. A 3 000-member subtree correction dropped from ~43 s to ~3 s. (3) `app_programs_log_status()` records a scheduler transition at the instant it was due (see [Program](#program)). Covered by `test/referral-consistency.int-spec.ts`, `test/reliability.int-spec.ts` and `test/db-invariants.int-spec.ts`. |
 
 Applied migrations are never edited (Prisma checksums them). Defects are fixed with a new
 migration, as above. See [Working with migrations](#working-with-migrations).
@@ -38,6 +39,7 @@ migration, as above. See [Working with migrations](#working-with-migrations).
 | Aspect | Rule |
 |---|---|
 | Keys | `uuid` primary keys, except `platform_settings.id = 1` (singleton), `currencies.code`, and composite keys on join tables, closure rows and `idempotency_keys (actor_user_id, key)`. |
+| Internal schema | `app_private` holds trigger plumbing that is not part of the Prisma model (today only the transient `referral_pending_checks` queue; its rows never outlive their transaction). `prisma migrate diff` only compares `public`. |
 | Naming | snake_case tables and columns (`@@map` / `@map`). Prefixes: `ck_` CHECK, `uq_` partial unique index, `ex_` exclusion constraint, `ix_` partial/extra index, `trg_` trigger, `app_` SQL function. Prisma-generated names are `<table>_<cols>_key` / `_idx`. |
 | Time | `timestamptz(3)`, always UTC. Program dates are displayed in the program's IANA `timezone`. Ranges are half-open `[from, to)`. |
 | Money / points | `BIGINT` integer minor units in `*_minor` columns; rates in integer basis points (`*_bps`, 10 000 = 100 %). See [ADR-0004](decisions/0004-integer-minor-units-reward-unit.md). |
@@ -216,9 +218,9 @@ helpers read the session's own advisory locks from `pg_locks`.
 | `app_referral_lock_mode()` | `'exclusive'` / `'shared'` / NULL for advisory lock `(7301, 1)` held by this backend | Lets triggers verify the caller took the tree lock. |
 | `app_in_referral_correction()` | True only if `app.referral_correction_id` names a `referral_corrections` row **inserted in this transaction** and the exclusive tree lock is held | A setting leaked on a pooled connection is harmless; there is no "magic flag" that opens the tree. |
 | `trg_referral_relationships_insert_guard` | Outside a correction: tree lock held (any mode), child created in this transaction, child's self row created in this transaction, child has no descendants yet, `source = REGISTRATION`, code active and owned by the ACTIVE + verified sponsor. Inside a correction: cycle check | Attribution happens once, in the transaction that creates the member, from a valid code. Nobody can attach an existing member to a sponsor later. |
-| `trg_referral_paths_insert_guard` | Outside a correction: tree lock held, descendant created in this transaction, and for depth > 0 its self row was created in this transaction first | Closure rows cannot be fabricated for existing members. |
-| `trg_referral_relationships_guard`, `trg_referral_paths_guard` → `app_referral_modify_guard()` | UPDATE/DELETE only inside a correction; relationship UPDATEs are cycle-checked (fixed by `20261010120000_fix_referral_modify_guard`) | Attribution decides who earns rewards. It changes only through the audited correction protocol. |
-| `trg_referral_paths_consistent`, `trg_referral_relationships_consistent` → `app_referral_assert_consistent()` (deferred) | At COMMIT every touched member has its depth-0 row, and its closure rows equal its sponsor's rows shifted by one | The closure table can never disagree with the adjacency list, whatever order the statements ran in. |
+| `trg_referral_paths_insert_guard` (per row, `WHEN` no correction id is set) + `trg_referral_paths_insert_guard_correction` (per statement, `WHEN` a correction id is set) | Outside a correction: tree lock held, descendant created in this transaction, and for depth > 0 its self row was created in this transaction first. With `app.referral_correction_id` set, the statement guard checks `app_in_referral_correction()` once; if that fails it applies the same registration rules to every inserted row | Closure rows cannot be fabricated for existing members; a stray correction id authorizes nothing. |
+| `trg_referral_relationships_guard` → `app_referral_modify_guard()` (per row); `trg_referral_paths_guard_update`, `trg_referral_paths_guard_delete` → `app_referral_paths_modify_guard()` (per statement, transition table) | UPDATE/DELETE only inside a correction (a closure statement that changed ≥ 1 row outside one is rolled back); relationship UPDATEs are cycle-checked | Attribution decides who earns rewards. It changes only through the audited correction protocol. |
+| `trg_referral_paths_queue_{insert,update,delete}`, `trg_referral_relationships_queue_{insert,update,delete}` → `app_private.referral_pending_checks` → `trg_referral_pending_checks` → `app_referral_assert_consistent()` (deferred) | Each statement queues its distinct touched members (closure descendants; relationship children, old and new); at COMMIT (or `SET CONSTRAINTS … IMMEDIATE`) every queued member must have its depth-0 row and closure rows equal to its sponsor's rows shifted by one — checked once per member | The closure table can never disagree with the adjacency list, whatever order the statements ran in. The deferred event is queued with the row, so deleting queue rows cannot skip a check. |
 | `ck_referral_corrections_not_self`, `ck_referral_corrections_reason` | `child <> new_sponsor`; reason ≥ 10 non-blank chars | Every correction is justified. |
 | `ck_referral_corrections_sod` | Performer ≠ new sponsor, ≠ moved member, ≠ previous sponsor | Segregation of duties ([ADR-0011](decisions/0011-db-enforced-segregation-of-duties.md)). |
 | `trg_referral_corrections_insert_guard` | Exclusive tree lock held; performer is not an upline of the new sponsor; new sponsor not inside the moved subtree | No moving members under one's own downline; no cycles. |
@@ -352,6 +354,14 @@ report the same cases first as `409 INVALID_STATE_TRANSITION`.
   PUBLISHED policy version (API publish checks).
 - Every transition writes `program_status_changes` (actor from `updated_by_id`, reason from
   `app.status_reason`; the scheduler is `changed_by = NULL`).
+- **Scheduled transitions are dated when they were due.** The scheduler passes
+  `set_config('app.status_changed_at', <starts_at | ends_at>, true)`; `trg_programs_log_status`
+  honours it only for SCHEDULED → ACTIVE (never before `starts_at`) and ACTIVE|PAUSED → COMPLETED
+  (never before `ends_at`), clamped to ≤ `now()` and ≥ the previous change + 1 ms. A late
+  scheduler run (60 s tick, restart, row lock contention) therefore never leaves sales after
+  `starts_at` looking like "program not active". Manual transitions are always logged at `now()`.
+  The scheduler waits up to 2 s for the program row (`FOR UPDATE` with `lock_timeout`; enrollments
+  hold it `FOR SHARE` briefly) instead of `SKIP LOCKED`, and reports a row still locked as `busy`.
 - Frozen after DRAFT: code, offering, unit, currency, minor units, max depth. Frozen once started:
   `starts_at`. Frozen once COMPLETED: `ends_at`, enrollment close, grace days.
 
@@ -464,10 +474,21 @@ WHERE up.descendant_id = $s;
 -- + AuditService.record(tx, { action: 'referral.correct', ... }) in the same transaction
 ```
 
-At COMMIT the deferred consistency triggers re-check every touched member against its sponsor
-chain. Past rewards are never recalculated; only calculations made afterwards see the new
+At COMMIT the deferred consistency check re-checks every touched member (once each) against its
+sponsor chain. Past rewards are never recalculated; only calculations made afterwards see the new
 placement. The reward engine takes the tree lock in shared mode while it reads an upline, so it
 waits for an in-flight correction.
+
+**Lock waits and size.** Shared-lock takers (registration, reward engine) wait at most **3 s**
+(`lockReferralTreeShared` sets `lock_timeout` for that one statement) and then fail with SQLSTATE
+55P03 → HTTP 503 `SERVICE_UNAVAILABLE` (`details.retryable`); nothing is written, the challenge is
+not consumed, and an unprocessed sale stays RECEIVED for the sweeper. A correction raises its own
+limits with `SET LOCAL` (statements 110 s, lock wait 10 s, transaction 120 s) and is refused with
+409 `CORRECTION_TOO_LARGE` when it would rewrite more than **50 000** closure rows
+(moved members × (old ancestors + new sponsor chain); `CORRECTION_LIMITS` in
+`sponsor-correction.service.ts`). Measured on PostgreSQL 17 with fresh statistics: 18 k rows ≈ 3 s,
+120 k rows ≈ 11 s (≈ 30 s right after a bulk import, before autovacuum analyzed `referral_paths`).
+Larger moves need a planned maintenance window.
 
 ### Read patterns
 
@@ -510,7 +531,7 @@ SELECT EXISTS (SELECT 1 FROM referral_paths WHERE ancestor_id = $y AND descendan
 
 ### Consistency check
 
-The deferred triggers enforce this per touched member at COMMIT. The full-table version below
+The deferred check enforces this once per touched member at COMMIT. The full-table version below
 returns zero rows when consistent; use it after a restore or in investigations:
 
 ```sql
@@ -575,7 +596,7 @@ Besides primary keys (names are Prisma's `<table>_<cols>_idx` / `_key` unless pr
 | offerings / programs | `sku` (unique), `code` (unique), `programs.status` | Lookups; scheduler scans |
 | program_status_changes | `(program_id, changed_at)` | "Was the program ACTIVE at T"; timeline |
 | program_options | `(program_id, is_active)` | Active plans |
-| program_enrollments | `(user_id, program_id)`, `(program_id, status)`, `payment_reference` (unique), partial unique PENDING, gist exclusion, `ix_enrollments_eligibility (program_id, user_id, effective_from) WHERE eligibility_status = 'ELIGIBLE'`, `ix_enrollments_active_expiry (effective_to) WHERE status = 'ACTIVE'`, `ix_enrollments_payment_amount (payment_amount_minor, payment_recorded_at) WHERE payment_amount_minor IS NOT NULL` | Engine eligibility at `occurred_at`; member and admin lists; expiry sweep; plan-payment checks (`app_plan_payment_matches` looks payments up by amount and window, then checks the relation to the subject) |
+| program_enrollments | `(user_id, program_id)`, `(program_id, status)`, `(created_at, id)`, `payment_reference` (unique), partial unique PENDING, gist exclusion, `ix_enrollments_eligibility (program_id, user_id, effective_from) WHERE eligibility_status = 'ELIGIBLE'`, `ix_enrollments_active_expiry (effective_to) WHERE status = 'ACTIVE'`, `ix_enrollments_payment_amount (payment_amount_minor, payment_recorded_at) WHERE payment_amount_minor IS NOT NULL` | Engine eligibility at `occurred_at`; member and admin lists; expiry sweep; plan-payment checks (`app_plan_payment_matches` looks payments up by amount and window, then checks the relation to the subject) |
 | referral_codes | `code` (unique), `user_id`, partial unique active global code | Attribution; member's code |
 | referral_relationships | `child_user_id` (unique), `(sponsor_user_id, attributed_at)`, `(sponsor_user_id, registration_ip, attributed_at)` | Sponsor lookup; direct children; the shared-IP fraud signal |
 | referral_paths | PK `(ancestor_id, descendant_id)`, unique `(descendant_id, depth)`, `(ancestor_id, depth)` | Upline scans; downline by level; subtree membership |
@@ -583,16 +604,22 @@ Besides primary keys (names are Prisma's `<table>_<cols>_idx` / `_key` unless pr
 | reward_policy_versions | `(program_id, version)` (unique), `(program_id, status, effective_from)`, gist exclusion | Applicable version at `occurred_at`; version list |
 | reward_rules | `(policy_version_id, level)` (unique) | Rules in level order |
 | api_clients | `key_hash` (unique), `program_id` | Key lookup; clients of a program |
-| qualifying_events | `uq_events_sale_revision`, `supersedes_event_id` (unique), `(program_id, status, occurred_at)`, `subject_user_id`, `created_at`, `ix_events_received (created_at) WHERE status = 'RECEIVED'` | Idempotent intake; admin lists; the RECEIVED sweeper and reconciliation |
+| qualifying_events | `uq_events_sale_revision`, `supersedes_event_id` (unique), `(program_id, status, occurred_at)`, `subject_user_id`, `created_at`, `external_id`, `customer_reference`, `ix_events_received (created_at) WHERE status = 'RECEIVED'` | Idempotent intake; admin lists; exact sale search (BitmapOr of the two); the RECEIVED sweeper and reconciliation |
 | reward_calculations | `event_id` (unique) | One calculation per event |
-| rewards | `(event_id, level)` + `(event_id, recipient_user_id)` (unique), `(recipient_user_id, status, created_at)`, `(status, created_at)`, `(program_id, status, created_at)`, `created_at` | Member rewards and earnings; approval queue; scoped admin lists |
-| ledger_accounts | `user_id`, partial uniques | Member accounts; get-or-create |
+| rewards | `(event_id, level)` + `(event_id, recipient_user_id)` (unique), `(recipient_user_id, status, created_at)`, `(recipient_user_id, created_at DESC, id DESC)`, `(recipient_user_id, updated_at DESC, id DESC)`, `(status, created_at)`, `(program_id, status, created_at)`, `created_at` | Member rewards and earnings; approval queue; scoped admin lists |
+| ledger_accounts | `user_id`, `(created_at, id)`, partial uniques | Member accounts; accounts list (page the accounts, then sum only their entries); get-or-create |
 | ledger_transactions | `idempotency_key` (unique), `reverses_transaction_id` (unique), `(reward_id, type)` (unique), `posted_at` | Exactly-once; per-reward reconciliation; by date |
 | ledger_entries | `(account_id, created_at)`, `transaction_id` | Statements and balances; transaction detail and the commit check |
 | audit_logs | `(resource_type, resource_id, created_at)`, `(actor_user_id, created_at)`, `(program_id, created_at)`, `created_at` | Resource and actor history; program-scoped feeds; global feed |
-| notifications | `(user_id, read_at, created_at)`, `source_key` (unique) | Unread first; idempotent delivery |
+| notifications | `(user_id, read_at, created_at)`, `(user_id, created_at DESC, id DESC)`, `source_key` (unique) | Unread first; member list keyset; idempotent delivery |
 | outbox_messages | `dedupe_key` (unique), `(status, available_at)` | Relay claim; idempotent enqueue |
 | member_flags | `(status, created_at)`, `user_id`, partial unique open dedupe key | Open-flag queue; flags of a member; heuristic upsert |
+
+**Keyset predicates.** Lists page with `keysetWhere` / `keysetSql`
+(`apps/api/src/common/pagination/keyset.ts`): `col <= c AND (col < c OR id < cid)` (desc) instead
+of `col < c OR (col = c AND id < cid)`. PostgreSQL cannot use a top-level OR as an index condition,
+so the textbook form scanned every list from the head (a 450 000-deep rewards page: 168 ms →
+0.6 ms; the full 529 k-row rewards CSV now streams at a constant ~70 ms per 500-row batch).
 
 **Candidates when data grows** (each in its own migration with `CREATE INDEX CONCURRENTLY`): BRIN on
 `audit_logs.created_at` and `ledger_entries.created_at`; partitioning `audit_logs` by month.
@@ -630,12 +657,24 @@ Binding for every service that writes these tables.
 7. **Ledger** entries are written in the same transaction as the reward status change; deferred
    checks validate shape, balance and status coupling at COMMIT.
 8. **Outbox relay** claims rows with `FOR UPDATE SKIP LOCKED` (safe with several workers) and
-   reclaims PROCESSING rows locked for more than 5 minutes.
+   reclaims PROCESSING rows locked for more than 5 minutes. The claimed `attempts` value is the
+   claim token: `locked_at` is refreshed right before each row is dispatched, and every later
+   UPDATE (SENT / FAILED / DEAD) requires `status = 'PROCESSING' AND attempts = <token>`, so a relay
+   whose claim was reclaimed cannot overwrite the other relay's result (its outcome is `lost`).
 9. **Isolation:** READ COMMITTED plus the locks and constraints above. `runInTransaction({ retries })`
    re-runs idempotent work on `40001`/`40P01`; serialization failures otherwise surface as
    `409 CONFLICT` with `details.retryable`.
 10. **Idempotent HTTP mutations** store the key and response in `idempotency_keys`
     ([ADR-0012](decisions/0012-idempotency-key-storage.md)).
+11. **Bounded waits.** Every pooled session starts with `TimeZone=UTC`, `statement_timeout`
+    (15 s) and `lock_timeout` (5 s), and the pool waits at most 5 s for a connection
+    (`DATABASE_*` settings, `apps/api/src/common/prisma/create-client.ts`). Prisma's transaction
+    timeout does not cancel a statement that is running on the server; these do. SQLSTATE 55P03 /
+    57014, Prisma P2024 / P2028 / P2037 and a pool timeout map to HTTP 503 `SERVICE_UNAVAILABLE` with
+    `details.retryable = true` and `Retry-After: 1`. Long, deliberate work raises the limits for
+    its own transaction only (`setLocalTimeouts`, `withLockTimeout` in `local-settings.ts`).
+    Read fan-outs on the root client are capped with `allLimited` (admin overview: 3 connections;
+    reconciliation report: 2), so one request never takes the whole pool.
 
 ## Deletion and retention policies
 

@@ -109,6 +109,8 @@ export class UsersService {
    * reset that committed meanwhile is never overwritten with a password chosen from the old one.
    */
   async changePassword(auth: AuthContext, dto: ChangePasswordRequest): Promise<ProfileDto> {
+    // Same step-up as email change: a password alone must never let someone take over an admin account.
+    this.assertAdminStepUp(auth, 'the password');
     const verifiedHash = await this.verifyCurrentPassword(auth, dto.currentPassword, 'currentPassword');
     const newHash = await this.passwords.hash(dto.newPassword);
     const now = new Date();
@@ -351,12 +353,12 @@ export class UsersService {
    * rules §2 "Admin MFA"): otherwise a password alone would redirect the LOGIN_MFA code that
    * bootstraps the authenticator enrollment.
    */
-  private assertAdminStepUp(auth: AuthContext): void {
-    if (auth.isAdmin && !auth.adminAccess) throw this.stepUpRequired(auth);
+  private assertAdminStepUp(auth: AuthContext, what = 'the email address'): void {
+    if (auth.isAdmin && !auth.adminAccess) throw this.stepUpRequired(auth, what);
   }
 
-  private stepUpRequired(auth: AuthContext) {
-    return mfaRequired('Verify with your authenticator app before changing the email address of an administrator account', {
+  private stepUpRequired(auth: AuthContext, what = 'the email address') {
+    return mfaRequired(`Verify with your authenticator app before changing ${what} of an administrator account`, {
       reason: auth.hasTotpFactor ? MfaRequiredReason.TotpRequired : MfaRequiredReason.TotpEnrollmentRequired,
     });
   }

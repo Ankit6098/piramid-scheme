@@ -34,13 +34,13 @@ const nextConfig: NextConfig = {
   // client/server bundling identical regardless of how pnpm links it.
   transpilePackages: ['@app/shared'],
 
-  // Cache Components (+ Partial Prefetching) stay enabled: the public pages and the dashboard
-  // shells are prerendered as static shells, and everything session-dependent renders inside
-  // <Suspense> boundaries on the client (TanStack Query). Rules for slices are in docs/frontend.md
-  // ("Rendering model"): no `export const dynamic/revalidate/runtime`, keep runtime reads
-  // (Date.now(), useSearchParams, useParams, cookies()) inside Suspense.
-  cacheComponents: true,
-  partialPrefetching: true,
+  // Cache Components (+ Partial Prefetching) are OFF. The app never used `"use cache"`: every page is
+  // a client shell that loads session data with TanStack Query, so the static prerender gives the
+  // same result. With them on, ~4% of full page loads under load stayed on the loading skeleton
+  // (an out-of-order streamed Suspense boundary revealed but never hydrated — React 19.3 /
+  // Next 16.4). Re-evaluate after upgrading React/Next. See docs/frontend.md ("Rendering model").
+  cacheComponents: false,
+  partialPrefetching: false,
 
   turbopack: {
     root: workspaceRoot,

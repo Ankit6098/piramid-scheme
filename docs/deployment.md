@@ -147,9 +147,12 @@ start with a readable list of problems. In the production compose, the variables
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | **required** | | postgres, compose | Database credentials. Use URL-safe passwords (hex), because compose embeds them in `DATABASE_URL`. |
 | `DATABASE_URL` | dev only | compose builds it | api, worker, migrate | `postgresql://user:pass@host:5432/db?schema=public`. |
 | `DATABASE_POOL_MAX` | | `10` | api, worker | pg pool size per process (see section 5). |
+| `DATABASE_CONNECT_TIMEOUT_MS` | | `5000` | api, worker | Longest wait for a pooled (or new) connection; then the request fails with 503 `SERVICE_UNAVAILABLE` (`details.retryable`, `Retry-After: 1`) instead of queueing. |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | | `15000` | api, worker | Session `statement_timeout`. Keep it ≤ the 15 s default transaction timeout: Prisma's transaction timeout does not cancel a running statement, this does. Sponsor corrections raise it for their own transaction only. |
+| `DATABASE_LOCK_TIMEOUT_MS` | | `5000` | api, worker | Session `lock_timeout` (row and advisory locks). Registration and sale processing wait at most 3 s for the referral-tree lock regardless. |
 | `TEST_DATABASE_URL` | tests | | integration tests | Separate database (`referral_test`). Tests truncate it. |
 | `REDIS_PASSWORD` | **required** (prod) | | redis, compose | `requirepass`, embedded into `REDIS_URL`. |
-| `REDIS_URL` | dev only | `redis://localhost:6379` (compose builds it) | api, worker | BullMQ and throttler storage. |
+| `REDIS_URL` | dev only | `redis://localhost:6379` (compose builds it) | api, worker | BullMQ and throttler storage. If Redis is unreachable the HTTP rate limits fall back to per-process counters (same limits per API replica; one warning per minute) instead of failing requests. |
 | `OTP_PEPPER` | **required** | | api, worker | HMAC key for OTP hashes. 64 hex chars in production (`openssl rand -hex 32`). |
 | `SESSION_TTL_HOURS` | | `168` | api | Absolute member session lifetime. |
 | `ADMIN_SESSION_TTL_HOURS` | | `12` | api | Absolute session lifetime for users with admin roles. |
@@ -216,13 +219,27 @@ In both cases:
   and admin sessions must stay below PostgreSQL `max_connections` (default 100), with headroom.
   Beyond that, add PgBouncer in **transaction** pooling mode. The application relies only on
   transaction-scoped state (`SET LOCAL`, `pg_advisory_xact_lock`), which is compatible with
-  transaction pooling.
+  transaction pooling. PgBouncer does not forward the startup `options` the API sends
+  (`-c TimeZone=UTC`) or the `statement_timeout` / `lock_timeout` startup parameters: add them to
+  `ignore_startup_parameters` and set the same defaults on the role instead
+  (`ALTER ROLE <app> SET TimeZone = 'UTC'; … SET statement_timeout = '15s'; … SET lock_timeout = '5s';`).
+  The API refuses to start when its sessions are not in UTC (JS dates are sent as UTC wall-clock
+  text, so another session time zone would shift every timestamp).
+- **Timeouts and 503s:** every DB wait is bounded (section 3, `DATABASE_*_TIMEOUT_MS`). Under
+  overload or behind a long sponsor correction (exclusive referral-tree lock, typically 1–15 s,
+  capped by the 50 000-closure-row limit) requests answer 503 `SERVICE_UNAVAILABLE` with
+  `details.retryable = true` and `Retry-After: 1`; nothing was written, clients may retry. Sales
+  that could not be processed stay RECEIVED and are picked up by the sweeper. Read fan-outs are
+  capped per request (admin overview 3 connections, reconciliation report 2), and the overview shows
+  the last reconciliation count (≤ 15 min old) while a refresh runs in the background.
 - **PostgreSQL:** scale vertically first (memory for the closure and ledger indexes). Tune
   `shared_buffers` (~25 % RAM), `effective_cache_size`, `work_mem` and autovacuum for the
   append-heavy tables. Read replicas can serve reports and exports later. Writes and the reward
   engine stay on the primary.
 - **Redis:** a single instance with AOF is enough. Use `noeviction` (BullMQ requirement) and size
-  memory for queue depth. PostgreSQL remains the source of truth (outbox).
+  memory for queue depth. PostgreSQL remains the source of truth (outbox). An outage degrades the
+  shared rate limits to per-replica limits (logged as "Rate-limit storage (Redis) unavailable") and
+  pauses scheduled jobs; it does not take the API down.
 - **nginx:** one instance handles thousands of requests per second. Raise
   `limit_req_zone … 10m` sizes only if many distinct client IPs (millions) are expected.
 - **Resource limits:** add `deploy.resources.limits` (memory/cpus) per service once real usage is
