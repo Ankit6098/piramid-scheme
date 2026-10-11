@@ -60,13 +60,20 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 12
+      # Captures outgoing email; the OTP/outbox suites read delivered messages from its API.
+      mailpit:
+        image: axllent/mailpit:latest
+        ports: ['1025:1025', '8025:8025']
     env:
       NODE_ENV: test
+      MAILPIT_URL: http://127.0.0.1:8025
       DATABASE_URL: postgresql://referral:referral_ci_password@localhost:5432/referral_test?schema=public
       TEST_DATABASE_URL: postgresql://referral:referral_ci_password@localhost:5432/referral_test?schema=public
       REDIS_URL: redis://localhost:6379
-      # Test-only value (not a secret).
+      # Test-only values (not secrets). The three keys must differ.
       OTP_PEPPER: 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
+      OTP_OUTBOX_KEY: 1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809
+      MFA_ENCRYPTION_KEY: 9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0
       APP_PUBLIC_URL: http://localhost:8080
       SMTP_HOST: localhost
       SMTP_PORT: '1025'
