@@ -28,4 +28,4 @@ export { FormSwitch, type FormSwitchProps } from './form-switch';
 export { FormDateTimeField, type FormDateTimeFieldProps } from './form-date-time-field';
 export { FormAmountField, type FormAmountFieldProps } from './form-amount-field';
 export { useUnsavedChangesWarning } from './use-unsaved-changes-warning';
-export { applyApiFieldErrors } from './apply-api-errors';
+export { applyApiFieldErrors, type ApiErrorFormTarget } from './apply-api-errors';

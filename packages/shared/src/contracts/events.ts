@@ -9,9 +9,11 @@ import {
   QualifyingEventType,
   RewardStatus,
   RewardUnit,
+  type FlagStatus,
 } from '../enums';
 import { currencyCodeSchema, cursorPageQuerySchema, isoDateTimeSchema, positiveMinorAmountSchema, uuidSchema } from '../api';
 import type { CalcTraceStepDto } from './policies';
+import { financeReasonSchema } from './rewards';
 
 /** What happened to a recorded sale (derived from the stored event + calculation). */
 export const SaleIntakeOutcome = ['REWARDS_CREATED', 'NO_ELIGIBLE_RECIPIENTS', 'REJECTED', 'PENDING', 'REVERSED'] as const;
@@ -65,6 +67,13 @@ export const listSaleEventsQuerySchema = cursorPageQuerySchema.extend({
   subjectUserId: uuidSchema.optional(),
 });
 export type ListSaleEventsQuery = z.input<typeof listSaleEventsQuerySchema>;
+
+/**
+ * POST /admin/events/:id/reject (events:reverse; Idempotency-Key) — rejects a sale that is stuck in
+ * RECEIVED (it can never be processed), so the same external id can be re-recorded as a new revision.
+ */
+export const rejectPendingSaleSchema = z.object({ reason: financeReasonSchema });
+export type RejectPendingSaleInput = z.infer<typeof rejectPendingSaleSchema>;
 
 // ─── Responses ───────────────────────────────────────────────────────────────
 
@@ -170,6 +179,39 @@ export interface SaleEventCalculationDto {
   warnings: string[];
 }
 
+/**
+ * Compliance review (business rules §0.1): a plan payment the sale resembles — same amount, a
+ * program in the sale's currency, recorded within ±2 days of the sale date or of its recording.
+ */
+export const PlanPaymentRelation = ['OWN', 'DOWNLINE'] as const;
+export type PlanPaymentRelation = (typeof PlanPaymentRelation)[number];
+
+export interface PlanPaymentMatchDto {
+  /** OWN: the credited member's own plan payment; DOWNLINE: paid by a member of their downline. */
+  relation: PlanPaymentRelation;
+  /** 0 for OWN, otherwise the payer's depth below the credited member (1 = direct recruit). */
+  depth: number;
+  enrollmentId: string;
+  program: { id: string; name: string };
+  payer: { id: string; fullName: string };
+  /** Payment amount in the program currency (minor units) — equal to the sale amount. */
+  amountMinor: string;
+  currencyCode: string;
+  paymentRecordedAt: string;
+}
+
+/** Admin-only compliance view of a sale. */
+export interface SaleComplianceDto {
+  /** The sale resembles a plan payment (now, or when it was processed): its rewards are never auto-approved. */
+  planPaymentLookalike: boolean;
+  /** Reviewer-facing explanation; null when there is nothing to review. */
+  message: string | null;
+  /** Matching plan payments (own first, then by depth), at most 10. */
+  matches: PlanPaymentMatchDto[];
+  /** The PLAN_PAYMENT_LOOKALIKE flag raised on the credited member for this sale, if any. */
+  flag: { id: string; status: FlagStatus } | null;
+}
+
 export interface SaleEventRevisionDto {
   id: string;
   revision: number;
@@ -183,6 +225,8 @@ export interface SaleEventDetailDto extends SaleEventDto {
   rewards: SaleEventRewardDto[];
   /** All revisions of this sale (same offering + external id), oldest first. */
   revisions: SaleEventRevisionDto[];
+  /** Plan-payment compliance review (shown to reviewers before they approve). */
+  compliance: SaleComplianceDto;
 }
 
 /** POST /admin/events → 201 (new) or 200 (replay of an identical request). */

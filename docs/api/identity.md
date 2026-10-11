@@ -36,14 +36,15 @@ so it can never be verified.
 
 ### `POST /auth/register` — public · limit `auth` · `202`
 
-Request `{ fullName (2–120), email, password (≥ 10, a letter + a digit), referralCode? }` (email trimmed +
-lower-cased; empty `referralCode` = none).
+Request `{ fullName (2–120, no control characters, no web addresses — `://` / `www.`), email, password (≥ 10, a
+letter + a digit), referralCode? }` (email trimmed + lower-cased; empty `referralCode` = none).
 
 Never creates a user. Validates `referralCode` (`ReferralsService.resolveCodeForRegistration`), hashes the
 password (argon2id — always, for equal cost), then in one transaction (advisory lock per address): if the
 address has an account → a de-duplicated (1/hour) *registration-attempt* notice to the owner; otherwise the
 pending name, password hash and referral code are stored on a new `EMAIL_VERIFICATION` challenge (the older
-open one is invalidated and scrubbed) and the code is emailed.
+open one is invalidated and scrubbed) and the code is emailed. The verification email never greets by name: the
+pending name is unverified input anybody can type for any address.
 
 Response (identical for known and unknown addresses):
 `{ data: { accepted: true, message, expiresInSeconds: 600, resendAfterSeconds: 60 } }`.
@@ -84,7 +85,9 @@ attempt is blocked 30 s · 2^k (max 15 min): `429 RATE_LIMITED` + `Retry-After`,
 other IPs are unaffected. Only after a correct password: `403 ACCOUNT_SUSPENDED` (suspended or deactivated),
 `403 EMAIL_NOT_VERIFIED` (legacy). Success creates a session **without** a second factor (admin TTL 12 h for
 admin roles, else 7 days), updates `lastLoginAt`, audits `auth.login`, revokes a session presented with the
-request.
+request. The transaction proceeds only while the account still holds the hash that was verified and is ACTIVE
+(conditional UPDATE of `lastLoginAt` + optional argon2 rehash): a password reset/change or suspension that
+commits during the login wins → `401 INVALID_CREDENTIALS`, and a rehash never overwrites a newer password.
 
 Response `{ data: { mfaRequired: false, user } }` for members;
 `{ data: { mfaRequired: true, method: 'TOTP' | 'TOTP_ENROLLMENT', user } }` for admin-role users (TOTP when a
@@ -135,14 +138,23 @@ Members get `403 FORBIDDEN`; no session → `401`.
 
 | Method & path | Limit | Preconditions | Effect / response |
 |---|---|---|---|
-| `POST /auth/mfa/email/send` | `otp`, codes | no confirmed authenticator, session not yet MFA'd | `LOGIN_MFA` code bound to THIS session → `{ sentTo (masked), expiresAt, resendAfterSeconds }`. `409 INVALID_STATE_TRANSITION` if an authenticator exists / already verified; `429 OTP_COOLDOWN \| RATE_LIMITED \| OTP_TOO_MANY_ATTEMPTS` |
-| `POST /auth/mfa/email/verify` `{ code }` | `otp`, codes | as above | elevates with `EMAIL_OTP` (never admin access) → `{ user }`. Only a code requested by this session matches. `400 OTP_INVALID` |
+| `POST /auth/mfa/email/send` | `otp`, codes | no confirmed authenticator, session not yet MFA'd | `LOGIN_MFA` code bound to THIS session → `{ sentTo (masked), expiresAt, resendAfterSeconds }`. `409 INVALID_STATE_TRANSITION` if an authenticator exists / already verified, or when the account's email was changed (re-verified) after this session signed in (sign in again); `429 OTP_COOLDOWN \| RATE_LIMITED \| OTP_TOO_MANY_ATTEMPTS` |
+| `POST /auth/mfa/email/verify` `{ code }` | `otp`, codes | as above | elevates with `EMAIL_OTP` (never admin access) → `{ user }`. Only a code requested by this session matches. `400 OTP_INVALID`; `409` as above when the email changed after sign-in |
 | `POST /auth/mfa/totp/setup` | `otp` | no confirmed authenticator; session MFA'd (`EMAIL_OTP`, or `TOTP` after a reset) | new secret, stored AES-256-GCM encrypted as an unconfirmed factor (older unconfirmed one revoked) → `{ otpauthUri, secret, issuer, accountName }` (shown once). `403 MFA_REQUIRED` before the email step; `409` if already enrolled |
-| `POST /auth/mfa/totp/confirm` `{ code }` | `otp`, `login` | pending factor < 30 min old | factor confirmed (`last_used_step` set) + elevated with `TOTP` → `{ user }` with `adminAccess: true`. `400 OTP_INVALID`; `409` setup expired |
-| `POST /auth/mfa/totp/verify` `{ code }` | `otp`, `login` | confirmed authenticator | replay-safe (`… WHERE last_used_step IS NULL OR last_used_step < step`) → elevated with `TOTP` → `{ user }`. `400 OTP_INVALID` (wrong or replayed); `403 MFA_REQUIRED` (`details.reason = TOTP_ENROLLMENT_REQUIRED`) without a factor; `429 RATE_LIMITED` after repeated failures |
+| `POST /auth/mfa/totp/confirm` `{ code }` | `otp`, `login` | pending factor < 30 min old | factor confirmed (`last_used_step` set) + elevated with `TOTP` → `{ user }` with `adminAccess: true`. `400 OTP_INVALID`; `409` setup expired; `429 RATE_LIMITED` (per-account lockout, see below) |
+| `POST /auth/mfa/totp/verify` `{ code }` | `otp`, `login` | confirmed authenticator | replay-safe (`… WHERE last_used_step IS NULL OR last_used_step < step`) → elevated with `TOTP` → `{ user }`. `400 OTP_INVALID` (wrong or replayed); `403 MFA_REQUIRED` (`details.reason = TOTP_ENROLLMENT_REQUIRED`) without a factor; `429 RATE_LIMITED` after repeated failures (per (user, IP) / IP backoff, or the per-account lockout) |
+
+**Per-account authenticator lockout.** Besides the login backoff (per (user, IP) and per IP), wrong codes on
+`/auth/mfa/totp/verify`, `/auth/mfa/totp/confirm` and `/users/me/mfa/totp/reset` count against the ACCOUNT,
+whatever the client IP: the 10th consecutive failure pauses TOTP verification for that account for 15 min
+(each further failure after a pause doubles it, max 24 h; a correct code resets the counter; counters expire
+24 h after the last failure or pause). The failure that locks returns `429 RATE_LIMITED` (`retryAfterSeconds`)
+and revokes the calling session (`totp_locked`); the first lock of an episode is audited
+(`auth.mfa.totp_locked`) and notifies the owner (email + in-app) and every SUPER_ADMIN (once per day). While
+paused, every TOTP route answers `429` — also with the right code.
 
 Audit: `auth.mfa.email_verified`, `auth.mfa.totp_setup_started`, `auth.mfa.totp_enrolled`,
-`auth.mfa.totp_verified`.
+`auth.mfa.totp_verified`, `auth.mfa.totp_locked`.
 
 ## Self-service account (`/users/me`) — session
 
@@ -153,13 +165,13 @@ All routes act only on the caller's account.
 | `GET /users/me` | — | — | `ProfileDto { id, fullName, email, emailVerifiedAt, phone, avatarUrl, createdAt, lastLoginAt, passwordChangedAt, roles, isAdmin, hasTotpFactor, totpEnrolledAt }` |
 | `PATCH /users/me` | — | `{ fullName?, phone?: string \| null, avatarUrl?: https URL \| null }` (≥ 1 field) | updated `ProfileDto`; audit `user.profile.update` with only the changed fields (phone masked); no-op → no audit |
 | `POST /users/me/password` | `auth`, `login` | `{ currentPassword, newPassword }` (must differ) | `ProfileDto`; other sessions revoked (`password_changed`), open reset codes voided, owner notice, SUPER_ADMINs notified for admins; audit `user.password.change`. Wrong current password → `400 VALIDATION_FAILED` on `currentPassword` (shares the login backoff) |
-| `POST /users/me/email-change` | `otp`, `login`, codes | `{ newEmail, password }` | `202` generic body — identical when `newEmail` belongs to another account (that address gets a notice instead of a code); audit `user.email_change.requested` either way. `400` on `password` / `newEmail` (same as current) |
-| `POST /users/me/email-change/confirm` | `otp`, codes | `{ code }` | `ProfileDto` with the new email; other sessions revoked (`email_changed`), the account's open codes voided, OLD address gets `email-changed-notice` (+ in-app), SUPER_ADMINs notified for admins; audit `user.email.change` (masked). `400 OTP_INVALID`; `409 CONFLICT` if the address was taken meanwhile |
+| `POST /users/me/email-change` | `otp`, `login`, codes | `{ newEmail, password }` | `202` generic body — identical when `newEmail` belongs to another account (that address gets a notice instead of a code); audit `user.email_change.requested` either way. `400` on `password` / `newEmail` (same as current). **Admin-role accounts:** `403 MFA_REQUIRED` (`details.reason`) unless the session is TOTP-verified (`adminAccess`) — checked before the password |
+| `POST /users/me/email-change/confirm` | `otp`, codes | `{ code }` | `ProfileDto` with the new email; other sessions revoked (`email_changed`), the account's open codes voided, OLD address gets `email-changed-notice` (+ in-app), SUPER_ADMINs notified for admins; audit `user.email.change` (masked). `400 OTP_INVALID`; `409 CONFLICT` if the address was taken meanwhile; `403 MFA_REQUIRED` for an admin-role account without `adminAccess` (also when the role was granted after the change started) |
 | `GET /users/me/sessions` | — | `?cursor&limit` | page of `UserSessionDto { id, createdAt, lastSeenAt, expiresAt, ipAddress, userAgent, mfaMethod, current }` — open sessions only (not revoked/expired/idle), newest first |
 | `DELETE /users/me/sessions/:id` | — | — | `{ revoked: true, current }`; another account's session → `404`; revoking the current one clears `sid`; audit `user.session.revoke` |
 | `POST /users/me/sessions/revoke-others` | — | — | `{ revoked: n }`; audit `user.sessions.revoke_others` |
 | `GET /users/me/activity` | — | `?cursor&limit` | page of `ActivityEntryDto { id, action, resourceType, createdAt, ipAddress (masked, e.g. 203.0.113.x) }` — entries the caller performed or about the caller's account; no before/after, no actor ids |
-| `POST /users/me/mfa/totp/reset` | `otp`, `login` | `{ code }` (current authenticator code) | admins only (`403 FORBIDDEN` otherwise). Factor revoked (replay-safe), other sessions revoked (`mfa_reset`), SUPER_ADMINs notified; audit `user.mfa.totp_reset` → `ProfileDto`. Then enroll again via `/auth/mfa/totp/setup` |
+| `POST /users/me/mfa/totp/reset` | `otp`, `login` | `{ code }` (current authenticator code) | admins only (`403 FORBIDDEN` otherwise). Factor revoked (replay-safe), other sessions revoked (`mfa_reset`), SUPER_ADMINs notified; audit `user.mfa.totp_reset` → `ProfileDto`. Then enroll again via `/auth/mfa/totp/setup`. Wrong codes count against the per-account lockout (`429`) |
 
 There is deliberately no "pending email change" field in `ProfileDto`: it would reveal whether the requested
 address is already taken.

@@ -146,7 +146,7 @@ export function RulesEditor({ control, program, rewardFormat, hardCapBps }: Rule
         {fixedCount > 0 ? (
           <p className="text-xs text-muted-foreground">
             Fixed levels add up to <Amount value={fixedTotal.toString()} format={rewardFormat} />{' '}
-            per sale. They are paid only while the sale&apos;s budget allows, so small sales may
+            per sale. They are credited only while the sale&apos;s budget allows, so small sales may
             fund only the first levels.
           </p>
         ) : null}
@@ -247,13 +247,13 @@ function RuleRow({
       </div>
       {beyondDepth ? (
         <p className="mt-2 text-xs text-warning">
-          Level {level} is deeper than the maximum depth ({maxDepth}) and would never pay. Remove it
+          Level {level} is deeper than the maximum depth ({maxDepth}) and would never be credited. Remove it
           or increase the maximum depth.
         </p>
       ) : null}
       {calcType === 'FIXED' ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          Paid in {program.rewardUnit === 'POINTS' ? 'points' : program.currencyCode} per qualifying
+          Credited in {program.rewardUnit === 'POINTS' ? 'points' : program.currencyCode} per qualifying
           sale, and only while the sale&apos;s budget allows.
         </p>
       ) : null}

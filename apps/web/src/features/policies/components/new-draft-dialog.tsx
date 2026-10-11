@@ -99,7 +99,7 @@ function NewDraftForm({
       onClose();
       onCreated(policy);
     } catch (error) {
-      if (!applyApiFieldErrors(error, form.setError)) setSubmitError(getErrorMessage(error));
+      if (!applyApiFieldErrors(error, form)) setSubmitError(getErrorMessage(error));
     }
   });
 

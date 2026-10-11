@@ -1,6 +1,7 @@
 import type {
   CalcTraceStepDto,
   IntegrationSaleResultDto,
+  SaleComplianceDto,
   SaleCalculationAncestorDto,
   SaleEventCalculationDto,
   SaleEventDetailDto,
@@ -116,7 +117,7 @@ export function parseTrace(trace: unknown): ParsedTrace {
 
 export function toSaleEventDetailDto(
   row: SaleEventDetailRow,
-  extras: { names: ReadonlyMap<string, string>; revisions: SaleEventRevisionDto[] },
+  extras: { names: ReadonlyMap<string, string>; revisions: SaleEventRevisionDto[]; compliance: SaleComplianceDto },
 ): SaleEventDetailDto {
   const totalMinor = row.rewards.reduce((sum, r) => sum + r.amountMinor, 0n);
   let calculation: SaleEventCalculationDto | null = null;
@@ -148,6 +149,7 @@ export function toSaleEventDetailDto(
     calculation,
     rewards: row.rewards.map(toRewardDto),
     revisions: extras.revisions,
+    compliance: extras.compliance,
   };
 }
 

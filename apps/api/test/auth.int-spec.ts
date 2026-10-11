@@ -1,22 +1,35 @@
 import { randomInt } from 'node:crypto';
 import type { ChallengePurpose } from '@app/shared';
+import * as argon2 from 'argon2';
 import type { Response } from 'supertest';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SESSION_COOKIE } from '../src/common/auth/cookies';
+import { SessionTokenService } from '../src/common/auth/session-token.service';
 import { CryptoService } from '../src/common/crypto/crypto.service';
 import { sha256Hex } from '../src/common/crypto/tokens';
 import { RedisService } from '../src/common/redis/redis.service';
 import { ScheduledJobsRegistry } from '../src/jobs/scheduler/scheduled-jobs.registry';
 import { AuthJobs } from '../src/modules/auth/auth.jobs';
+import { PasswordService } from '../src/modules/auth/password.service';
+import { ReferralsService } from '../src/modules/referrals/referrals.service';
 import { createTestApp, type TestApp, type TestClient } from './utils/app';
 import { disconnectTestPrisma, resetDatabase } from './utils/db';
-import { createUser, factoryAdmin, loginAs } from './utils/factories';
+import { createUser, factoryAdmin, loginAs, type Db } from './utils/factories';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 const PASSWORD = 'Correct-horse-42';
 const ip = () => `198.19.${randomInt(256)}.${randomInt(1, 255)}`;
 const uniqueEmail = (tag: string) => `${tag}-${Date.now().toString(36)}-${randomInt(1e9)}@example.test`;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > until) throw new Error('waitFor: timed out');
+    await sleep(10);
+  }
+}
 
 function cookieFrom(res: Response, name: string): string | null {
   const raw = res.headers['set-cookie'] as unknown as string[] | string | undefined;
@@ -39,6 +52,9 @@ describe('auth: registration, verification, login, password reset', () => {
   });
   beforeEach(async () => {
     await resetDatabase();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
   afterAll(async () => {
     const redis = t.get(RedisService).redis;
@@ -143,6 +159,12 @@ describe('auth: registration, verification, login, password reset', () => {
       expect(paths).toEqual(expect.arrayContaining(['email', 'password']));
       const noDigit = await register(anon(), { email: uniqueEmail('nd'), password: 'onlyletterspassword' }).expect(400);
       expect(noDigit.body.error.details.issues[0].message).toMatch(/digit/);
+      // names land in emails and team views: no web addresses
+      for (const fullName of ['Visit https://evil.example', 'Get rich at WWW.evil.example', 'ftp://x']) {
+        const link = await register(anon(), { email: uniqueEmail('url'), fullName }).expect(400);
+        expect(link.body.error.details.issues[0]).toMatchObject({ path: 'fullName', message: 'A name cannot contain a web address' });
+      }
+      expect(await t.prisma.emailChallenge.count({ where: { purpose: 'EMAIL_VERIFICATION' } })).toBe(0);
     });
   });
 
@@ -219,6 +241,67 @@ describe('auth: registration, verification, login, password reset', () => {
       expect(await t.prisma.referralPath.count({ where: { descendantId: user.id } })).toBe(1);
       const audit = await t.prisma.auditLog.findFirstOrThrow({ where: { action: 'user.register', resourceId: user.id } });
       expect(audit.after).toMatchObject({ sponsorUserId: null, referralCodeNoLongerValid: true });
+    });
+
+    const suspendSponsor = (db: Db, id: string) =>
+      db.user.update({ where: { id }, data: { status: 'SUSPENDED', suspendedAt: new Date(), suspensionReason: 'race' } });
+
+    it('a sponsor suspension in flight is waited for: the member then joins without a sponsor', async () => {
+      await factoryAdmin(t.prisma); // a suspension needs another ACTIVE SUPER_ADMIN to exist (DB)
+      const sponsor = await createUser(t.prisma);
+      const email = uniqueEmail('inflight');
+      const c = anon();
+      await register(c, { email, referralCode: sponsor.referralCode }).expect(202);
+      const { code } = await latestCode(email, 'EMAIL_VERIFICATION');
+
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let suspendedUncommitted = false;
+      const suspending = t.prisma.$transaction(
+        async (tx) => {
+          await suspendSponsor(tx, sponsor.id);
+          suspendedUncommitted = true;
+          await gate;
+        },
+        { timeout: 20_000 },
+      );
+      await waitFor(() => suspendedUncommitted);
+      const verifying = c
+        .post('/api/v1/auth/verify-email')
+        .send({ email, code, password: PASSWORD })
+        .then((r) => r);
+      await sleep(400); // verification now waits on the sponsor row
+      release();
+      await suspending;
+      const res = await verifying;
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.referral).toEqual({ applied: false, codeNoLongerValid: true });
+      const user = await t.prisma.user.findUniqueOrThrow({ where: { email } });
+      expect(await t.prisma.referralRelationship.count({ where: { childUserId: user.id } })).toBe(0);
+    });
+
+    it('a sponsor suspended between the code check and the tree insert never turns verification into a 409', async () => {
+      await factoryAdmin(t.prisma);
+      const sponsor = await createUser(t.prisma);
+      const email = uniqueEmail('race');
+      const c = anon();
+      await register(c, { email, referralCode: sponsor.referralCode }).expect(202);
+      const { code } = await latestCode(email, 'EMAIL_VERIFICATION');
+
+      const referrals = t.get(ReferralsService);
+      const realAttach = referrals.attachNewMember.bind(referrals);
+      let suspension: Promise<unknown> | undefined;
+      vi.spyOn(referrals, 'attachNewMember').mockImplementationOnce(async (tx, input) => {
+        // An admin suspends the sponsor right now (it has to wait for this registration to commit).
+        suspension = suspendSponsor(t.prisma, sponsor.id).then(() => 'committed');
+        await Promise.race([suspension, sleep(400)]);
+        return realAttach(tx, input);
+      });
+      const res = await c.post('/api/v1/auth/verify-email').send({ email, code, password: PASSWORD });
+      await suspension;
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.referral).toEqual({ applied: true, codeNoLongerValid: false });
+      expect((await t.prisma.user.findUniqueOrThrow({ where: { id: sponsor.id } })).status).toBe('SUSPENDED');
     });
 
     it('anti-squatting: an attacker registration never attaches; the owner registration replaces it', async () => {
@@ -470,6 +553,45 @@ describe('auth: registration, verification, login, password reset', () => {
       await withSession(token2).get('/api/v1/auth/session').expect(401);
       // logout without a session is harmless
       await anon().post('/api/v1/auth/logout').expect(200);
+    });
+
+    it('a password reset that commits while a login checks the old password wins: no session, the new hash is kept', async () => {
+      const user = await createUser(t.prisma);
+      // An outdated (weaker) hash, so the login would also rehash the OLD password.
+      const weak = await argon2.hash(PASSWORD, { type: argon2.argon2id, memoryCost: 8192, timeCost: 2, parallelism: 1 });
+      await t.prisma.user.update({ where: { id: user.id }, data: { passwordHash: weak, passwordChangedAt: new Date() } });
+      const passwords = t.get(PasswordService);
+      expect(passwords.needsRehash(weak)).toBe(true);
+      const resetHash = await passwords.hash('Brand-new-pass-7');
+      const realVerify = passwords.verify.bind(passwords);
+      vi.spyOn(passwords, 'verify').mockImplementationOnce(async (hash, password) => {
+        const ok = await realVerify(hash, password);
+        // the owner completes a password reset in the meantime (same writes as AuthService.resetPassword)
+        await t.prisma.runInTransaction(async (tx) => {
+          await tx.user.update({ where: { id: user.id }, data: { passwordHash: resetHash, passwordChangedAt: new Date() } });
+          await t.get(SessionTokenService).revokeAllForUser(tx, user.id, 'password_reset');
+        });
+        return ok;
+      });
+      const res = await anon().post('/api/v1/auth/login').send({ email: user.email, password: PASSWORD }).expect(401);
+      expect(res.body.error.code).toBe('INVALID_CREDENTIALS');
+      expect(cookieFrom(res, SESSION_COOKIE)).toBeNull();
+      expect((await t.prisma.user.findUniqueOrThrow({ where: { id: user.id } })).passwordHash).toBe(resetHash);
+      expect(await t.prisma.session.count({ where: { userId: user.id, revokedAt: null } })).toBe(0);
+      expect(await t.prisma.auditLog.count({ where: { action: 'auth.login', actorUserId: user.id } })).toBe(0);
+      await anon().post('/api/v1/auth/login').send({ email: user.email, password: PASSWORD }).expect(401);
+      await anon().post('/api/v1/auth/login').send({ email: user.email, password: 'Brand-new-pass-7' }).expect(200);
+    });
+
+    it('rehashes an outdated hash on a normal login', async () => {
+      const user = await createUser(t.prisma);
+      const weak = await argon2.hash(PASSWORD, { type: argon2.argon2id, memoryCost: 8192, timeCost: 2, parallelism: 1 });
+      await t.prisma.user.update({ where: { id: user.id }, data: { passwordHash: weak } });
+      await anon().post('/api/v1/auth/login').send({ email: user.email, password: PASSWORD }).expect(200);
+      const stored = (await t.prisma.user.findUniqueOrThrow({ where: { id: user.id } })).passwordHash!;
+      expect(stored).not.toBe(weak);
+      expect(t.get(PasswordService).needsRehash(stored)).toBe(false);
+      await anon().post('/api/v1/auth/login').send({ email: user.email, password: PASSWORD }).expect(200);
     });
 
     it('GET /auth/session is 401 without a session and clears a dead cookie', async () => {

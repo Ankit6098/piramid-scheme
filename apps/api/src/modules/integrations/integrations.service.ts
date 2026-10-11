@@ -13,6 +13,7 @@ import type { AuthContext } from '../../common/auth/auth-context';
 import { assertProgramAccess, programScopeFilter } from '../../common/auth/program-access';
 import { invalidState, notFound } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
+import { keysetWhere } from '../../common/pagination/keyset';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import type { Prisma } from '../../generated/prisma/client';
 import { generateApiKey, hashApiKey } from './domain/api-key';
@@ -95,7 +96,7 @@ export class IntegrationsService {
     if (q.status === 'REVOKED') and.push({ revokedAt: { not: null } });
     if (cursor) {
       const c = new Date(cursor.c);
-      and.push({ OR: [{ createdAt: { lt: c } }, { createdAt: c, id: { lt: cursor.id } }] });
+      and.push(keysetWhere<Prisma.ApiClientWhereInput>('createdAt', c, cursor.id, 'desc'));
     }
     const rows = await this.prisma.apiClient.findMany({
       where: { AND: and },

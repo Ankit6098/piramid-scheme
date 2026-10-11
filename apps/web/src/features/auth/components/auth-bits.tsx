@@ -12,9 +12,8 @@ import { getErrorMessage, isApiError } from '@/lib/api-client';
 /** Inline error for a failed submit (field errors are shown on the fields themselves). */
 export function FormErrorAlert({ error, title }: { error: unknown; title?: string }) {
   if (!error) return null;
-  const retryAfter = isApiError(error)
-    ? Number((error.details as { retryAfterSeconds?: unknown } | undefined)?.retryAfterSeconds ?? 0)
-    : 0;
+  // `details.retryAfterSeconds`, else the Retry-After header (any 429, incl. the IP throttler).
+  const retryAfter = isApiError(error) ? (error.retryAfterSeconds ?? 0) : 0;
   return (
     <Alert variant="destructive" role="alert">
       <AlertCircle aria-hidden />

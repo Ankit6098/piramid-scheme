@@ -191,6 +191,53 @@ describe('users: self-service profile & security (/users/me)', () => {
     });
   });
 
+  describe('email change of admin accounts (needs a TOTP-verified session)', () => {
+    it('a password-only admin session cannot move the mailbox that LOGIN_MFA bootstraps from', async () => {
+      // An admin who has not enrolled an authenticator yet; the attacker knows only the password.
+      const admin = await createUser(t.prisma, { roles: ['PROGRAM_ADMIN'], password: PASSWORD });
+      const attackerMailbox = uniqueEmail('attacker');
+      const login = await t.client().withHeaders({ 'X-Forwarded-For': ip() }).post('/api/v1/auth/login').send({ email: admin.email, password: PASSWORD }).expect(200);
+      expect(login.body.data).toMatchObject({ mfaRequired: true, method: 'TOTP_ENROLLMENT' });
+      const sid = String(login.headers['set-cookie']).match(/sid=([^;]+)/)![1]!;
+      const attacker = t.clientWithSession(sid).withHeaders({ 'X-Forwarded-For': ip() });
+
+      const start = await attacker.post('/api/v1/users/me/email-change').send({ newEmail: attackerMailbox, password: PASSWORD }).expect(403);
+      expect(start.body.error).toMatchObject({ code: 'MFA_REQUIRED', details: { reason: 'TOTP_ENROLLMENT_REQUIRED' } });
+      expect(await t.prisma.emailChallenge.count({ where: { purpose: 'EMAIL_CHANGE' } })).toBe(0);
+      await attacker.post('/api/v1/users/me/email-change/confirm').send({ code: '123456' }).expect(403);
+      // the LOGIN_MFA code still goes to the owner's address
+      const sent = await attacker.post('/api/v1/auth/mfa/email/send').expect(200);
+      expect(sent.body.data.sentTo).toMatch(/^u\*\*\*@e\*\*\*\.test$/);
+      expect(await t.prisma.emailChallenge.findFirstOrThrow({ where: { purpose: 'LOGIN_MFA' } })).toMatchObject({ email: admin.email });
+      expect((await t.prisma.user.findUniqueOrThrow({ where: { id: admin.id } })).email).toBe(admin.email);
+
+      // an email-OTP-verified session is not enough either; an authenticator-verified one is
+      const withFactor = await createUser(t.prisma, { roles: ['FINANCE_REVIEWER'], password: PASSWORD });
+      await createTotpFactor(t, withFactor);
+      const emailOtp = await signedIn(withFactor, { mfa: 'EMAIL_OTP' });
+      const refused = await emailOtp.post('/api/v1/users/me/email-change').send({ newEmail: uniqueEmail('x'), password: PASSWORD }).expect(403);
+      expect(refused.body.error.details).toEqual({ reason: 'TOTP_REQUIRED' });
+      const verified = await signedIn(withFactor, { mfa: 'TOTP' });
+      const target = uniqueEmail('admin-new');
+      await verified.post('/api/v1/users/me/email-change').send({ newEmail: target, password: PASSWORD }).expect(202);
+      const { code } = await latestCode({ userId: withFactor.id, purpose: 'EMAIL_CHANGE' });
+      expect((await verified.post('/api/v1/users/me/email-change/confirm').send({ code }).expect(200)).body.data.email).toBe(target);
+    });
+
+    it('a change started as a member cannot be confirmed once the account holds an admin role', async () => {
+      const user = await createUser(t.prisma, { password: PASSWORD });
+      const c = await signedIn(user);
+      await c.post('/api/v1/users/me/email-change').send({ newEmail: uniqueEmail('later'), password: PASSWORD }).expect(202);
+      const { code } = await latestCode({ userId: user.id, purpose: 'EMAIL_CHANGE' });
+      // role granted (sessions are normally revoked; even a surviving session must not finish the change)
+      const role = await t.prisma.role.findUniqueOrThrow({ where: { key: 'PROGRAM_ADMIN' } });
+      await t.prisma.userRole.create({ data: { userId: user.id, roleId: role.id } });
+      const res = await c.post('/api/v1/users/me/email-change/confirm').send({ code }).expect(403);
+      expect(res.body.error.code).toBe('MFA_REQUIRED');
+      expect((await t.prisma.user.findUniqueOrThrow({ where: { id: user.id } })).email).toBe(user.email);
+    });
+  });
+
   describe('sessions & activity', () => {
     it('lists own open sessions, revokes one or all others, and never touches another account', async () => {
       const user = await createUser(t.prisma);

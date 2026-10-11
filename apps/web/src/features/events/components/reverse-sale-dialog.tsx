@@ -3,7 +3,7 @@
 import { Undo2 } from 'lucide-react';
 import { useState } from 'react';
 import { toast } from 'sonner';
-import type { SaleEventDetailDto } from '@app/shared';
+import { financeReasonSchema, type SaleEventDetailDto } from '@app/shared';
 
 import { Amount } from '@/components/app/amount';
 import { ConfirmDialog } from '@/components/app/confirm-dialog';
@@ -44,6 +44,9 @@ export function ReverseSaleDialog({ event }: { event: SaleEventDetailDto }) {
           label: 'Reason',
           placeholder: 'e.g. Full refund issued to the customer on 12 Oct (ticket #4821).',
           description: 'At least 10 characters. Recorded in the audit log and shown on every reward.',
+          // Same limit as the API (`financeReasonSchema`: 10–480 characters).
+          schema: financeReasonSchema,
+          maxLength: 480,
         }}
         typedConfirmation="REVERSE"
         confirmLabel="Reverse sale"

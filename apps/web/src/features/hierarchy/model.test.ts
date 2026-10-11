@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyPatches, buildVisibleTree, flattenVisible, modelFromTree, pathToRoot } from './model';
+import {
+  applyPatches,
+  buildVisibleTree,
+  flattenVisible,
+  focusAfterLoadMore,
+  modelFromTree,
+  newChildIds,
+  pathToRoot,
+} from './model';
 import type { AnyMemberDto, AnyTreeNodeDto } from './types';
 
 function member(id: string, depth: number, childCount = 0): AnyMemberDto {
@@ -87,5 +95,49 @@ describe('tree model', () => {
     expect(capped.capped).toBe(true);
     expect(capped.count).toBe(3);
     expect(flattenVisible(capped.root).map((i) => i.id)).toEqual(['me', 'a', 'b']);
+  });
+});
+
+describe('load more focus', () => {
+  const expanded = new Set(['me', 'b']);
+  const orderOf = (model: ReturnType<typeof modelFromTree>, budget?: number) =>
+    flattenVisible(buildVisibleTree(model, 'me', (id) => expanded.has(id), budget).root);
+
+  it('reports only the children a page adds', () => {
+    const model = modelFromTree(initial);
+    expect(newChildIds(model, 'b', [member('b1', 2), member('b2', 2), member('b3', 2)])).toEqual(['b2', 'b3']);
+    expect(newChildIds(model, 'unknown', [member('x', 2)])).toEqual(['x']);
+  });
+
+  it('waits until the page is rendered, then keeps focus on "load more" while pages remain', () => {
+    const before = modelFromTree(initial);
+    const rows = [member('b2', 2), member('b3', 2)];
+    const ids = newChildIds(before, 'b', rows);
+    expect(focusAfterLoadMore(orderOf(before), 'b', ids)).toEqual({ status: 'wait' });
+    const after = applyPatches(before, [{ kind: 'children', parentId: 'b', rows, nextCursor: 'c2' }]);
+    expect(focusAfterLoadMore(orderOf(after), 'b', ids)).toEqual({ status: 'stay' });
+  });
+
+  it('moves focus to the first new child after the last page (the "load more" item is gone)', () => {
+    const before = modelFromTree(initial);
+    const rows = [member('b2', 2), member('b3', 2), member('b4', 2)];
+    const ids = newChildIds(before, 'b', rows);
+    const after = applyPatches(before, [{ kind: 'children', parentId: 'b', rows, nextCursor: null }]);
+    const order = orderOf(after);
+    expect(order.some((i) => i.id === 'more:b')).toBe(false);
+    expect(focusAfterLoadMore(order, 'b', ids)).toEqual({ status: 'focus', id: 'b2' });
+  });
+
+  it('falls back to the parent when the new children are not rendered (node budget)', () => {
+    const before = modelFromTree(initial);
+    const rows = [member('b2', 2), member('b3', 2), member('b4', 2)];
+    const ids = newChildIds(before, 'b', rows);
+    const after = applyPatches(before, [{ kind: 'children', parentId: 'b', rows, nextCursor: null }]);
+    expect(focusAfterLoadMore(orderOf(after, 4), 'b', ids)).toEqual({ status: 'focus', id: 'b' });
+  });
+
+  it('keeps focus when a failed load added nothing', () => {
+    const model = modelFromTree(initial);
+    expect(focusAfterLoadMore(orderOf(model), 'b', [])).toEqual({ status: 'stay' });
   });
 });

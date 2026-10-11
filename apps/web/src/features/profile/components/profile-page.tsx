@@ -75,7 +75,9 @@ export function ProfilePage() {
             <ErrorState error={profile.error} onRetry={() => void profile.refetch()} />
           ) : (
             <>
-              <TabsContent value="profile" className="max-w-2xl">
+              {/* Kept mounted (hidden while another tab is open) so unsaved edits survive a tab
+                  switch, and the unsaved-changes warning still guards leaving the page. */}
+              <TabsContent value="profile" forceMount className="max-w-2xl data-[state=inactive]:hidden">
                 <ProfileDetailsCard profile={profile.data} />
               </TabsContent>
               <TabsContent value="security" className="space-y-6">

@@ -11,6 +11,7 @@ import {
   programScopeFilter,
   validationFailed,
 } from '../../common';
+import { keysetWhere } from '../../common/pagination/keyset';
 import type { Prisma } from '../../generated/prisma/client';
 import { changedFieldsOf, diffAudit } from './domain/audit-diff';
 
@@ -69,7 +70,7 @@ export class AuditQueryService {
     if (from || to) and.push({ createdAt: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } });
     if (cursor) {
       const at = new Date(cursor.createdAt);
-      and.push({ OR: [{ createdAt: { lt: at } }, { createdAt: at, id: { lt: cursor.id } }] });
+      and.push(keysetWhere<Prisma.AuditLogWhereInput>('createdAt', at, cursor.id, 'desc'));
     }
 
     const rows = await this.prisma.auditLog.findMany({

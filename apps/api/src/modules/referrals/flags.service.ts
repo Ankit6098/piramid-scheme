@@ -12,6 +12,7 @@ import { AuditService } from '../../common/audit/audit.service';
 import type { AuthContext } from '../../common/auth/auth-context';
 import { forbidden, invalidState, notFound } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
+import { keysetWhere } from '../../common/pagination/keyset';
 import { PrismaService, type Db } from '../../common/prisma/prisma.service';
 import type { Prisma } from '../../generated/prisma/client';
 
@@ -51,14 +52,7 @@ export class FlagsService {
       ...(q.status ? { status: q.status } : {}),
       ...(q.kind ? { kind: q.kind } : {}),
       ...(q.userId ? { userId: q.userId } : {}),
-      ...(c
-        ? {
-            OR: [
-              { createdAt: { lt: new Date(c.createdAt) } },
-              { createdAt: new Date(c.createdAt), id: { lt: c.id } },
-            ],
-          }
-        : {}),
+      ...(c ? keysetWhere<Prisma.MemberFlagWhereInput>('createdAt', new Date(c.createdAt), c.id, 'desc') : {}),
     };
     const rows = await this.prisma.memberFlag.findMany({
       where,

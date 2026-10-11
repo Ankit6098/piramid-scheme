@@ -1,8 +1,9 @@
 'use client';
 
+import { ShieldAlert } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
-import type { AdminRewardRowDto } from '@app/shared';
+import { financeReasonSchema, type AdminRewardRowDto, type SaleComplianceDto } from '@app/shared';
 
 import { Amount } from '@/components/app/amount';
 import { ConfirmDialog } from '@/components/app/confirm-dialog';
@@ -16,7 +17,10 @@ export type RewardDecisionKind = 'approve' | 'reject' | 'reverse' | 'reverse-eve
 /** One user intent: the reward, what to do, and the Idempotency-Key created when it started. */
 export interface RewardDecisionIntent {
   kind: RewardDecisionKind;
-  reward: Pick<AdminRewardRowDto, 'id' | 'status' | 'level' | 'amountMinor' | 'rewardUnit' | 'currencyCode' | 'currencyMinorUnits' | 'recipient' | 'program' | 'event'>;
+  reward: Pick<AdminRewardRowDto, 'id' | 'status' | 'level' | 'amountMinor' | 'rewardUnit' | 'currencyCode' | 'currencyMinorUnits' | 'recipient' | 'program' | 'event'> & {
+    /** Present when the decision starts from the reward detail (full plan-payment review). */
+    compliance?: SaleComplianceDto;
+  };
   idempotencyKey: string;
 }
 
@@ -124,6 +128,9 @@ export function RewardDecisionDialog({ intent, onClose, onDone }: RewardDecision
                   ? 'e.g. The sale could not be matched to an invoice.'
                   : 'e.g. Full refund issued to the customer on 12 Oct (ticket #4821).',
               description: 'At least 10 characters. Recorded in the audit log and shown to the affected member.',
+              // Same limit as the API (`financeReasonSchema`: 10–480 characters).
+              schema: financeReasonSchema,
+              maxLength: 480,
             }
           : undefined
       }
@@ -131,35 +138,49 @@ export function RewardDecisionDialog({ intent, onClose, onDone }: RewardDecision
       onConfirm={({ reason }) => confirm(reason)}
     >
       {shown ? (
-        <dl className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-lg border bg-muted/30 p-3">
-          {shown.kind === 'reverse-event' ? (
-            <>
-              <Summary label="Sale">{shown.reward.event.externalId}</Summary>
-              <Summary label="Sale amount">
-                <Amount
-                  kind="currency"
-                  value={shown.reward.event.amountMinor}
-                  format={currencyFormat(shown.reward.event.currencyCode, shown.reward.currencyMinorUnits)}
-                />
-              </Summary>
-              <Summary label="Program">{shown.reward.program.name}</Summary>
-              <Summary label="Credited member">{shown.reward.event.subject.fullName}</Summary>
-            </>
-          ) : (
-            <>
-              <Summary label="Recipient">{shown.reward.recipient.fullName}</Summary>
-              <Summary label="Amount">
-                <Amount value={shown.reward.amountMinor} format={unitFormat(shown.reward)} className="font-medium" />
-              </Summary>
-              <Summary label="Program">
-                {shown.reward.program.name} · L{shown.reward.level}
-              </Summary>
-              <Summary label="Status">
-                <StatusBadge kind="RewardStatus" value={shown.reward.status} />
-              </Summary>
-            </>
-          )}
-        </dl>
+        <div className="space-y-3">
+          {shown.kind === 'approve' && shown.reward.event.planPaymentLookalike ? (
+            <div role="alert" className="flex gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
+              <ShieldAlert className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />
+              <div className="space-y-1">
+                <p className="font-medium">Compliance review: this sale looks like a plan payment</p>
+                <p className="text-foreground/80">
+                  {shown.reward.compliance?.message ??
+                    'It has the same amount as a plan payment by the credited member or their downline. Plan payments never earn rewards: open the reward details and confirm it is a real sale to an end customer before approving.'}
+                </p>
+              </div>
+            </div>
+          ) : null}
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-lg border bg-muted/30 p-3">
+            {shown.kind === 'reverse-event' ? (
+              <>
+                <Summary label="Sale">{shown.reward.event.externalId}</Summary>
+                <Summary label="Sale amount">
+                  <Amount
+                    kind="currency"
+                    value={shown.reward.event.amountMinor}
+                    format={currencyFormat(shown.reward.event.currencyCode, shown.reward.currencyMinorUnits)}
+                  />
+                </Summary>
+                <Summary label="Program">{shown.reward.program.name}</Summary>
+                <Summary label="Credited member">{shown.reward.event.subject.fullName}</Summary>
+              </>
+            ) : (
+              <>
+                <Summary label="Recipient">{shown.reward.recipient.fullName}</Summary>
+                <Summary label="Amount">
+                  <Amount value={shown.reward.amountMinor} format={unitFormat(shown.reward)} className="font-medium" />
+                </Summary>
+                <Summary label="Program">
+                  {shown.reward.program.name} · L{shown.reward.level}
+                </Summary>
+                <Summary label="Status">
+                  <StatusBadge kind="RewardStatus" value={shown.reward.status} />
+                </Summary>
+              </>
+            )}
+          </dl>
+        </div>
       ) : null}
     </ConfirmDialog>
   );

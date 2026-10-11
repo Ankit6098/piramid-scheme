@@ -8,6 +8,7 @@ import type {
 } from '@app/shared';
 import { z } from 'zod';
 import { decodeCursor, notFound, paginate, PrismaService, type AuthContext } from '../../common';
+import { keysetWhere } from '../../common/pagination/keyset';
 import type { Prisma } from '../../generated/prisma/client';
 import { evaluateEligibility, parseEligibility, type EligibilityMember } from '../enrollments/domain/enrollment-rules';
 import { isEnrollmentWindowOpen } from './domain/program-rules';
@@ -41,14 +42,7 @@ export class MemberProgramsService {
     const where: Prisma.ProgramWhereInput = {
       status: { in: [...BROWSABLE] },
       options: { some: { isActive: true } },
-      ...(cursor
-        ? {
-            OR: [
-              { startsAt: { lt: new Date(cursor.startsAt) } },
-              { startsAt: new Date(cursor.startsAt), id: { lt: cursor.id } },
-            ],
-          }
-        : {}),
+      ...(cursor ? keysetWhere<Prisma.ProgramWhereInput>('startsAt', new Date(cursor.startsAt), cursor.id, 'desc') : {}),
     };
     const rows = await this.prisma.program.findMany({
       where,

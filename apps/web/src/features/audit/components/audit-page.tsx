@@ -3,10 +3,10 @@
 import type { ColumnDef } from '@tanstack/react-table';
 import { Bot, ScrollText, X } from 'lucide-react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useId, useMemo } from 'react';
 import type { AuditLogListItemDto } from '@app/shared';
 
-import { DataTable, useCursorList } from '@/components/app/data-table';
+import { DataTable, useCursorList, useUrlTextFilters } from '@/components/app/data-table';
 import { DateTime } from '@/components/app/date-time';
 import { PageHeader } from '@/components/app/page-header';
 import { EmptyState } from '@/components/app/states';
@@ -131,12 +131,6 @@ export function AuditPage() {
     types: `${baseId}-types`,
   };
 
-  const [text, setText] = useState({
-    action: filters.action ?? '',
-    resourceType: filters.resourceType ?? '',
-    resourceId: filters.resourceId ?? '',
-  });
-
   const replaceParams = (patch: Record<string, string | undefined | null>) => {
     const next = new URLSearchParams(searchParams.toString());
     for (const [key, value] of Object.entries(patch)) {
@@ -147,22 +141,17 @@ export function AuditPage() {
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   };
 
-  // Debounce the free-text filters into the URL.
-  useEffect(() => {
-    const patch: Record<string, string | undefined> = {};
-    let dirty = false;
-    for (const key of ['action', 'resourceType', 'resourceId'] as const) {
-      const value = text[key].trim();
-      if (value !== (filters[key] ?? '')) {
-        patch[key] = value || undefined;
-        dirty = true;
-      }
-    }
-    if (!dirty) return;
-    const timer = setTimeout(() => replaceParams(patch), TEXT_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- replaceParams reads the latest params
-  }, [text]);
+  // Free-text filters: debounced into the URL (only the edited key), re-synced when the URL changes
+  // elsewhere (links with filters, back/forward, this route revived by <Activity>).
+  const { text, setText, clear: clearText } = useUrlTextFilters(
+    {
+      action: filters.action ?? '',
+      resourceType: filters.resourceType ?? '',
+      resourceId: filters.resourceId ?? '',
+    },
+    replaceParams,
+    TEXT_DEBOUNCE_MS,
+  );
 
   const apiQuery = toApiQuery(filters);
   const list = useCursorList<AuditLogListItemDto>({
@@ -173,7 +162,7 @@ export function AuditPage() {
 
   const hasFilters = Object.keys(filters).length > 0;
   const clearAll = () => {
-    setText({ action: '', resourceType: '', resourceId: '' });
+    clearText();
     replaceParams(Object.fromEntries(FILTER_KEYS.map((k) => [k, undefined])));
   };
 
@@ -186,7 +175,7 @@ export function AuditPage() {
         <Input
           id={ids.action}
           value={text.action}
-          onChange={(e) => setText((t) => ({ ...t, action: e.target.value }))}
+          onChange={(e) => setText('action', e.target.value)}
           placeholder="e.g. member. or reward.approve"
           maxLength={96}
         />
@@ -198,7 +187,7 @@ export function AuditPage() {
         <Input
           id={ids.resourceType}
           value={text.resourceType}
-          onChange={(e) => setText((t) => ({ ...t, resourceType: e.target.value }))}
+          onChange={(e) => setText('resourceType', e.target.value)}
           placeholder="e.g. user"
           list={ids.types}
           maxLength={64}
@@ -216,7 +205,7 @@ export function AuditPage() {
         <Input
           id={ids.resourceId}
           value={text.resourceId}
-          onChange={(e) => setText((t) => ({ ...t, resourceId: e.target.value }))}
+          onChange={(e) => setText('resourceId', e.target.value)}
           placeholder="Exact id"
           maxLength={64}
           spellCheck={false}

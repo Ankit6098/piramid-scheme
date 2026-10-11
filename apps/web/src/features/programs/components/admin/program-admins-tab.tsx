@@ -111,6 +111,10 @@ function ManageAdminsDialog({ programId, current, onDone }: { programId: string;
   const [reason, setReason] = useState('');
   const [error, setError] = useState<string | null>(null);
   const reasonId = useId();
+  // Assigned admins who are no longer candidates (suspended, deactivated or the role was removed):
+  // still listed so they can be removed — the API keeps unchanged assignments without re-checking.
+  const candidateIds = new Set((candidates.data ?? []).map((c) => c.userId));
+  const formerAdmins = candidates.data ? current.filter((a) => !candidateIds.has(a.userId)) : [];
   const reasonCheck = reason.trim() ? reasonSchema.safeParse(reason) : null;
   const reasonError = reasonCheck && !reasonCheck.success ? (reasonCheck.error.issues[0]?.message ?? null) : null;
 
@@ -148,23 +152,35 @@ function ManageAdminsDialog({ programId, current, onDone }: { programId: string;
           </div>
         ) : candidates.error ? (
           <p className="p-3 text-sm text-destructive">{getErrorMessage(candidates.error)}</p>
-        ) : candidates.data.length === 0 ? (
-          <p className="p-3 text-sm text-muted-foreground">
-            No active users hold the Program Admin role. Grant the role from the member’s profile first.
-          </p>
         ) : (
-          candidates.data.map((c) => {
-            const checkboxId = `admin-${c.userId}`;
-            return (
-              <label key={c.userId} htmlFor={checkboxId} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-muted/60">
-                <Checkbox id={checkboxId} checked={selected.has(c.userId)} onCheckedChange={(v) => toggle(c.userId, v === true)} />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium">{c.fullName}</span>
-                  <span className="block truncate text-xs text-muted-foreground">{c.email}</span>
-                </span>
-              </label>
-            );
-          })
+          <>
+            {candidates.data.length === 0 ? (
+              <p className="p-3 text-sm text-muted-foreground">
+                No active users hold the Program Admin role. Grant the role from the member’s profile first.
+              </p>
+            ) : (
+              candidates.data.map((c) => (
+                <AdminCheckbox key={c.userId} admin={c} checked={selected.has(c.userId)} onCheckedChange={(on) => toggle(c.userId, on)} />
+              ))
+            )}
+            {formerAdmins.length > 0 ? (
+              <div role="group" aria-labelledby={`${reasonId}-former`} className="border-t pt-1">
+                <p id={`${reasonId}-former`} className="px-2 pt-2 pb-1 text-xs text-muted-foreground">
+                  No longer active Program Admins (suspended or role removed). Uncheck to remove; they can’t be re-added until
+                  they are eligible again.
+                </p>
+                {formerAdmins.map((a) => (
+                  <AdminCheckbox
+                    key={a.userId}
+                    admin={a}
+                    checked={selected.has(a.userId)}
+                    onCheckedChange={(on) => toggle(a.userId, on)}
+                    note="Not eligible"
+                  />
+                ))}
+              </div>
+            ) : null}
+          </>
         )}
       </div>
       <Field data-invalid={reasonError ? true : undefined}>
@@ -188,5 +204,29 @@ function ManageAdminsDialog({ programId, current, onDone }: { programId: string;
         </Button>
       </DialogFooter>
     </DialogContent>
+  );
+}
+
+function AdminCheckbox({
+  admin,
+  checked,
+  onCheckedChange,
+  note,
+}: {
+  admin: { userId: string; fullName: string; email: string };
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+  note?: string;
+}) {
+  const checkboxId = `admin-${admin.userId}`;
+  return (
+    <label htmlFor={checkboxId} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-muted/60">
+      <Checkbox id={checkboxId} checked={checked} onCheckedChange={(v) => onCheckedChange(v === true)} />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium">{admin.fullName}</span>
+        <span className="block truncate text-xs text-muted-foreground">{admin.email}</span>
+      </span>
+      {note ? <span className="shrink-0 text-xs text-muted-foreground">{note}</span> : null}
+    </label>
   );
 }

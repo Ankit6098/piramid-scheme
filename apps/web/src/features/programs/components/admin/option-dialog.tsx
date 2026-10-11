@@ -116,7 +116,7 @@ export function OptionDialogContent({ program, option, onDone }: OptionDialogCon
       }
       onDone();
     } catch (error) {
-      if (!applyApiFieldErrors(error, form.setError)) toast.error(getErrorMessage(error));
+      if (!applyApiFieldErrors(error, form)) toast.error(getErrorMessage(error));
     }
   }
 

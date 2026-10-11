@@ -171,7 +171,7 @@ export function DryRunResultView({
                 <TableHead>Depth</TableHead>
                 <TableHead>Recipient</TableHead>
                 <TableHead className="text-right">Rule amount</TableHead>
-                <TableHead className="text-right">Paid</TableHead>
+                <TableHead className="text-right">Credited</TableHead>
                 <TableHead>Notes</TableHead>
               </TableRow>
             </TableHeader>

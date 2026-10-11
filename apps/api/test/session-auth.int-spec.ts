@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { LAST_SEEN_UPDATE_INTERVAL_MS } from '../src/common/auth/session-auth.service';
 import { SessionTokenService } from '../src/common/auth/session-token.service';
 import { sha256Hex } from '../src/common/crypto/tokens';
+import type { Tx } from '../src/common/prisma/prisma.service';
 import { createTestApp, type TestApp } from './utils/app';
 import { disconnectTestPrisma, resetDatabase } from './utils/db';
 import { createProgram, createTotpFactor, createUser, factoryAdmin, loginAs } from './utils/factories';
@@ -196,6 +197,116 @@ describe('SessionAuthGuard / PermissionsGuard', () => {
     ]);
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
     expect(await t.prisma.session.count({ where: { userId: admin.id, revokedAt: null } })).toBe(1);
+  });
+
+  describe('sessions vs concurrent credential changes', () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    async function waitFor(cond: () => boolean): Promise<void> {
+      const until = Date.now() + 10_000;
+      while (!cond()) {
+        if (Date.now() > until) throw new Error('waitFor: timed out');
+        await sleep(10);
+      }
+    }
+    /** An interactive transaction that runs `fn`, then stays open until `release()`. */
+    function heldTransaction<T>(fn: (tx: Tx) => Promise<T>) {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let value: T | undefined;
+      let ready = false;
+      const done = t.prisma.$transaction(
+        async (tx) => {
+          value = await fn(tx);
+          ready = true;
+          await gate;
+          return value;
+        },
+        { timeout: 20_000, maxWait: 10_000 },
+      );
+      return { done, release, ready: () => ready, value: () => value as T };
+    }
+    /** Starts `work` and reports whether it is still blocked after a short while. */
+    async function stillBlockedAfter<T>(work: Promise<T>, ms = 400): Promise<boolean> {
+      let finished = false;
+      void work.then(
+        () => (finished = true),
+        () => (finished = true),
+      );
+      await sleep(ms);
+      return !finished;
+    }
+
+    it('createSession refuses when the status or the verified password hash changed', async () => {
+      await factoryAdmin(t.prisma); // suspending needs an ACTIVE SUPER_ADMIN to remain (DB)
+      const user = await createUser(t.prisma, { password: 'Original-pass-1' });
+      const sessions = t.get(SessionTokenService);
+      const { passwordHash } = await t.prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
+      const create = (expect: { status: 'ACTIVE'; passwordHash: string | null }) =>
+        t.prisma.runInTransaction((tx) => sessions.createSession(tx, { userId: user.id, ttlHours: 1, expect }));
+
+      await create({ status: 'ACTIVE', passwordHash });
+      await t.prisma.user.update({ where: { id: user.id }, data: { passwordHash: `${passwordHash}x` } });
+      await expect(create({ status: 'ACTIVE', passwordHash })).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });
+      await t.prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash, status: 'SUSPENDED', suspendedAt: new Date(), suspensionReason: 'test' },
+      });
+      await expect(create({ status: 'ACTIVE', passwordHash })).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });
+      expect(await t.prisma.session.count({ where: { userId: user.id } })).toBe(1);
+    });
+
+    it('a session created while revokeAllForUser runs is revoked too (the revocation waits for it)', async () => {
+      await factoryAdmin(t.prisma);
+      const user = await createUser(t.prisma);
+      const sessions = t.get(SessionTokenService);
+      const creating = heldTransaction((tx) => sessions.createSession(tx, { userId: user.id, ttlHours: 1 }));
+      await waitFor(creating.ready);
+      // e.g. a role change or suspension revoking everything while the login is still committing
+      const revoking = t.prisma.runInTransaction((tx) => sessions.revokeAllForUser(tx, user.id, 'roles_changed'));
+      expect(await stillBlockedAfter(revoking)).toBe(true);
+      creating.release();
+      const created = await creating.done;
+      expect(await revoking).toBe(1);
+      expect(await t.prisma.session.findUniqueOrThrow({ where: { id: created.sessionId } })).toMatchObject({ revokeReason: 'roles_changed' });
+      await t.clientWithSession(created.token).get(ME).expect(401);
+    });
+
+    it('an MFA elevation racing a password change never leaves a live elevated session', async () => {
+      const admin = await createUser(t.prisma, { roles: ['SUPER_ADMIN'], password: 'Original-pass-1' });
+      const sessions = t.get(SessionTokenService);
+      const s1 = await t.prisma.runInTransaction((tx) => sessions.createSession(tx, { userId: admin.id, ttlHours: 12 }));
+      const newHash = (await t.prisma.user.findUniqueOrThrow({ where: { id: admin.id } })).passwordHash!.replace(/.$/, 'Q');
+      const passwordChange = () =>
+        t.prisma.runInTransaction(async (tx) => {
+          await tx.user.update({ where: { id: admin.id }, data: { passwordHash: newHash, passwordChangedAt: new Date() } });
+          return sessions.revokeAllForUser(tx, admin.id, 'password_changed');
+        });
+
+      // 1) the elevation is in flight when the password change starts → the change waits, then revokes it
+      const elevating = heldTransaction((tx) => sessions.elevateSession(tx, s1.sessionId, 'TOTP'));
+      await waitFor(elevating.ready);
+      const changing = passwordChange();
+      expect(await stillBlockedAfter(changing)).toBe(true);
+      elevating.release();
+      const elevated = await elevating.done;
+      await changing;
+      expect(await t.prisma.session.findUniqueOrThrow({ where: { id: elevated.sessionId } })).toMatchObject({ revokeReason: 'password_changed' });
+      await t.clientWithSession(elevated.token).get(ME).expect(401);
+
+      // 2) the password change is in flight when the elevation starts → the elevation waits, then fails
+      const s2 = await t.prisma.runInTransaction((tx) => sessions.createSession(tx, { userId: admin.id, ttlHours: 12 }));
+      const change2 = heldTransaction(async (tx) => {
+        await tx.user.update({ where: { id: admin.id }, data: { passwordChangedAt: new Date() } });
+        return sessions.revokeAllForUser(tx, admin.id, 'password_changed');
+      });
+      await waitFor(change2.ready);
+      const elevation2 = t.prisma.runInTransaction((tx) => sessions.elevateSession(tx, s2.sessionId, 'TOTP'));
+      expect(await stillBlockedAfter(elevation2)).toBe(true);
+      change2.release();
+      await change2.done;
+      await expect(elevation2).rejects.toMatchObject({ code: 'UNAUTHENTICATED' });
+      expect(await t.prisma.session.count({ where: { userId: admin.id, revokedAt: null } })).toBe(0);
+    });
   });
 
   it('permissions are loaded per request: a role revocation applies immediately; revokeAllForUser kills sessions', async () => {

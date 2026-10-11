@@ -15,3 +15,6 @@ test-results/
 .DS_Store
 uploads/
 backups/
+
+# Playwright e2e state (TOTP secrets, signed-in sessions) for the local e2e stack
+tests/e2e/.state/

@@ -439,6 +439,32 @@ describe('reward policies (business rules §7)', () => {
       expect(real.event.calculation).toMatchObject({ baseMinor: p.baseMinor, budgetMinor: p.budgetMinor, totalAllocatedMinor: p.totalAllocatedMinor });
       expect(p.allocations.map((a) => a.amountMinor)).toEqual(['5000', '3333']);
     });
+
+    it("a PROGRAM_ADMIN can preview only subjects enrolled in the policy's program (else 404)", async () => {
+      const program = await createProgram(t.prisma);
+      const other = await createProgram(t.prisma);
+      const pa = await loginAs(t, await createUser(t.prisma, { roles: ['PROGRAM_ADMIN'], programScopes: [program.id, other.id] }));
+      const sponsor = await createUser(t.prisma, { fullName: 'Secret Sponsor' });
+      const outsider = await createUser(t.prisma, { fullName: 'Not Enrolled', sponsor });
+      const elsewhere = await createUser(t.prisma, { fullName: 'Other Program', sponsor });
+      const insider = await createUser(t.prisma, { fullName: 'In Program', sponsor });
+      await createEnrollment(t.prisma, { userId: elsewhere.id, programId: other.id });
+      await createEnrollment(t.prisma, { userId: insider.id, programId: program.id });
+      const d = await draft(pa, program.id);
+      const preview = (subjectUserId: string, client: LoggedInClient = pa) =>
+        client.post(`/api/v1/admin/policies/${d.id}/dry-run`).send({ eventType: 'PRODUCT_SALE', saleAmountMinor: '100000', subjectUserId });
+
+      for (const subject of [outsider.id, elsewhere.id, '00000000-0000-4000-8000-000000000000']) {
+        const res = await preview(subject);
+        expect(res.status, JSON.stringify(res.body)).toBe(404);
+        expect(JSON.stringify(res.body)).not.toContain('Secret');
+      }
+      const ok = await preview(insider.id);
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+      expect((ok.body.data as DryRunResultDto).ancestors.map((a) => a.displayName)).toEqual(['Secret S.']);
+      // unscoped callers may preview any member
+      expect((await preview(outsider.id, su)).status).toBe(200);
+    });
   });
 
   describe('member transparency', () => {

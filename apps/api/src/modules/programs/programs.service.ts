@@ -30,6 +30,7 @@ import {
   type AuthContext,
   type Db,
 } from '../../common';
+import { keysetWhere } from '../../common/pagination/keyset';
 import type { Prisma } from '../../generated/prisma/client';
 import { parseEligibility } from '../enrollments/domain/enrollment-rules';
 import { evaluatePublishChecks, validateProgramPatch, type ProgramPatchInput } from './domain/program-rules';
@@ -101,9 +102,7 @@ export class ProgramsService {
       filters.push({ OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { code: { contains: query.q.toLowerCase() } }] });
     }
     if (cursor) {
-      filters.push({
-        OR: [{ createdAt: { lt: new Date(cursor.createdAt) } }, { createdAt: new Date(cursor.createdAt), id: { lt: cursor.id } }],
-      });
+      filters.push(keysetWhere<Prisma.ProgramWhereInput>('createdAt', new Date(cursor.createdAt), cursor.id, 'desc'));
     }
     const rows = await this.prisma.program.findMany({
       where: { AND: filters },

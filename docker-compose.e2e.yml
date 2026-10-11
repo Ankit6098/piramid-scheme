@@ -1,0 +1,42 @@
+# End-to-end override for the production stack (local Playwright runs).
+#
+#   C="docker compose --env-file .env.e2e -f docker-compose.prod.yml -f docker-compose.e2e.yml"
+#   $C up -d --build                 # COMPOSE_PROFILES=dev-mail in .env.e2e adds Mailpit
+#   $C run --rm seed                 # roles, settings, super admin (+ demo data)
+#   E2E_BASE_URL=http://localhost:8080 MAILPIT_URL=http://localhost:8026 E2E_ADMIN_PASSWORD=… \
+#     corepack pnpm test:e2e         # (the values are in .env.e2e)
+#   $C down -v                       # stop and delete the e2e data
+#
+# What changes compared to docker-compose.prod.yml:
+#   - the services read .env.e2e instead of the development .env;
+#   - Mailpit's UI/API is published on 127.0.0.1:8026, so it does not collide with the development
+#     Mailpit (docker-compose.yml) on :8025 (its SMTP port is never published);
+#   - the `edge` network gets a fixed subnet, and nginx exempts only that network's gateway — the
+#     address every request from the host arrives from — from its per-IP rate limits (the whole
+#     suite logs in and registers from one address). Containers on the edge network, and the API's
+#     own limits, are unaffected (tests/e2e/fixtures/nginx-rate-limit-allowlist.conf).
+# Nothing here publishes postgres/redis or the development ports (5432, 6379, 1025, 8025).
+services:
+  migrate:
+    env_file: !override [.env.e2e]
+  seed:
+    env_file: !override [.env.e2e]
+  api:
+    env_file: !override [.env.e2e]
+  worker:
+    env_file: !override [.env.e2e]
+
+  mailpit:
+    ports: !override
+      - '127.0.0.1:8026:8025'
+
+  nginx:
+    volumes:
+      - ./tests/e2e/fixtures/nginx-rate-limit-allowlist.conf:/etc/nginx/snippets/rate-limit-allowlist.conf:ro
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 10.231.80.0/24
+          gateway: 10.231.80.1

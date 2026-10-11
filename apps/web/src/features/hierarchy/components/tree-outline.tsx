@@ -1,11 +1,18 @@
 'use client';
 
 import { BadgeCheck, ChevronDown, ChevronRight, Loader2, MoreHorizontal } from 'lucide-react';
-import { useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent } from 'react';
 
 import { cn } from '@/lib/utils';
 
-import { depthColor, flattenVisible, nodeLabel, type VisibleItem, type VisibleTree } from '../model';
+import {
+  depthColor,
+  flattenVisible,
+  focusAfterLoadMore,
+  nodeLabel,
+  type VisibleItem,
+  type VisibleTree,
+} from '../model';
 import { describeItem } from './tree-canvas';
 
 export interface TreeOutlineProps {
@@ -15,7 +22,8 @@ export interface TreeOutlineProps {
   pending: ReadonlySet<string>;
   onToggle: (id: string) => void;
   onSelect: (id: string) => void;
-  onLoadMore: (parentId: string) => void;
+  /** Resolves with the ids of the loaded children (focus moves to the first after the last page). */
+  onLoadMore: (parentId: string) => Promise<readonly string[]> | void;
   label: string;
   rootLabel: string;
   className?: string;
@@ -47,10 +55,33 @@ export function TreeOutline({
   }, [order]);
   const rovingId = activeId && order.some((o) => o.id === activeId) ? activeId : (visible.root?.id ?? null);
 
+  // After the last "Load N more" page its item (and the focus) disappears: move focus to the first
+  // new child once the page is rendered. "Adjust state during render", then focus in an effect.
+  const [loadFocus, setLoadFocus] = useState<{ parentId: string; ids: readonly string[] } | null>(null);
+  const [focusRequest, setFocusRequest] = useState<{ id: string; seq: number } | null>(null);
+  if (loadFocus) {
+    const next = focusAfterLoadMore(order, loadFocus.parentId, loadFocus.ids);
+    if (next.status !== 'wait') {
+      setLoadFocus(null);
+      if (next.status === 'focus') {
+        setActiveId(next.id);
+        setFocusRequest((prev) => ({ id: next.id, seq: (prev?.seq ?? 0) + 1 }));
+      }
+    }
+  }
+  useEffect(() => {
+    if (focusRequest) refs.current.get(focusRequest.id)?.focus();
+  }, [focusRequest]);
+
   function focusItem(id: string | undefined) {
     if (!id) return;
     setActiveId(id);
     refs.current.get(id)?.focus();
+  }
+
+  function loadMore(parentId: string) {
+    const result = onLoadMore(parentId);
+    if (result) void result.then((ids) => setLoadFocus({ parentId, ids }));
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLLIElement>, item: VisibleItem) {
@@ -81,7 +112,7 @@ export function TreeOutline({
         break;
       case 'Enter':
       case ' ':
-        if (item.kind === 'more') onLoadMore(item.parentId);
+        if (item.kind === 'more') loadMore(item.parentId);
         else onSelect(item.id);
         break;
       default:
@@ -115,7 +146,7 @@ export function TreeOutline({
           <div
             className="flex cursor-pointer items-center gap-2 rounded-md py-2 pr-2 text-sm text-primary hover:bg-accent"
             style={indent}
-            onClick={() => onLoadMore(item.parentId)}
+            onClick={() => loadMore(item.parentId)}
           >
             {busy ? <Loader2 className="size-4 animate-spin" aria-hidden /> : <MoreHorizontal className="size-4" aria-hidden />}
             {busy ? 'Loading…' : `Load ${item.remaining} more`}

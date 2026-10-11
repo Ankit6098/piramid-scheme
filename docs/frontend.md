@@ -25,6 +25,9 @@ direction). What that means for this app:
   server-side data fetching, no Server Actions, no `cookies()` reads in pages.
 - Navigation keeps up to 3 recent routes mounted but hidden (React `<Activity>`): component state
   (form drafts, open dialogs) survives back/forward. Reset transient UI state on success yourself.
+  The auth screens (login, register, verify-email, forgot/reset password) call
+  `useResetWhenHidden()` (`features/auth/lib/use-reset-when-hidden.ts`, a `useLayoutEffect` cleanup) to
+  clear mutation results, errors and typed secrets when hidden, so a return visit starts clean.
 
 Rules:
 
@@ -130,7 +133,15 @@ arrays — see the file header). Invalidate by root: `queryClient.invalidateQuer
   `<RequireAuth>` redirects.
 - Render states with the kit: `isPending` → skeleton, `error` → `<ErrorState error onRetry>`, empty →
   `<EmptyState>`. On mutation success: `toast.success(...)` + invalidate affected keys; on error:
-  `applyApiFieldErrors(error, form.setError)` or `toast.error(getErrorMessage(error))`.
+  `if (!applyApiFieldErrors(error, form)) toast.error(getErrorMessage(error))` — it applies only
+  issues for fields the form renders (registered, or `knownFields`) and returns false otherwise, so
+  409s / invariant violations are never swallowed. `ApiError.fieldErrors` is built only from
+  `details.issues|errors|fieldErrors`; `ApiError.retryAfterSeconds` carries the 429 wait
+  (`details.retryAfterSeconds` or the `Retry-After` header).
+- Forms with `useUnsavedChangesWarning(form)`: the guard follows `isDirty`, so `form.reset(saved)`
+  (or remount) on success.
+- URL-synced search boxes: `useUrlTextFilters({ q: filters.q ?? '' }, setParams)` (debounced, writes
+  only the edited keys, follows URL changes made elsewhere).
 - Cursor lists: `useCursorList<T>({ queryKey, path, query, pageSize })` →
   `{ rows, isLoading, isFetching, error, refetch, pagination }`, plug straight into `<DataTable>`.
 
@@ -190,8 +201,8 @@ be added to `routes.member` in `src/config/routes.ts` to be protected.
 | `EmptyState` | `icon`, `title`, `description`, `action`, `variant` (`card`/`plain`), `size` |
 | `ErrorState` (`error-state.tsx`) | `error`, `onRetry`; 401 → sign-in prompt, 403 → `PermissionDenied`, 404 → `NotFoundState`, network → offline, else message + copyable request id |
 | `PermissionDenied`, `NotFoundState` | full-section states |
-| `ConfirmDialog` | `trigger` or controlled `open`; `title`, `description`, `children` (summary), `variant="destructive"`, `reason` (true or options; validated with `reasonSchema`, ≥ 10 chars), `typedConfirmation="REVERSE"`, `onConfirm({ reason })` returning a promise → pending spinner, closes on success, inline error on failure |
-| Form kit (`form/`) | `FormTextField`, `FormTextarea` (`showCount`), `FormSelect` (`options`), `FormSwitch`, `FormDateTimeField` (`timeZone`, value = UTC ISO), `FormAmountField` (value = minor-units string via `decimalToMinor`; `kind`, `currencyCode`, `unit`), `useUnsavedChangesWarning(form)`, `applyApiFieldErrors(error, form.setError)` |
+| `ConfirmDialog` | `trigger` or controlled `open`; `title`, `description`, `children` (summary), `variant="destructive"`, `reason` (true or options; validated with `reasonSchema` (10–1000) unless `schema` / `minLength` / `maxLength` match the endpoint, e.g. `financeReasonSchema`; `description` replaces the admin help text), `typedConfirmation="REVERSE"`, `onConfirm({ reason })` returning a promise → pending spinner, closes on success, inline error on failure |
+| Form kit (`form/`) | `FormTextField`, `FormTextarea` (`showCount`), `FormSelect` (`options`), `FormSwitch`, `FormDateTimeField` (`timeZone`, value = UTC ISO), `FormAmountField` (value = minor-units string via `decimalToMinor`; `kind`, `currencyCode`, `unit`), `useUnsavedChangesWarning(form)`, `applyApiFieldErrors(error, form)` |
 | `CopyButton` | `value`, `label`, optional visible children |
 | `DateTime`, `RelativeTime` | see §5 |
 | `UserAvatar` | `name`, `src`, `size` |

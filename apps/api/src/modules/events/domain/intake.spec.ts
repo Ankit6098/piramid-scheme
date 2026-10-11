@@ -97,6 +97,7 @@ describe('evaluateIntake', () => {
     subject: { status: 'ACTIVE', emailVerified: true },
     planPayment: null,
     policy,
+    unit: { rewardUnit: 'MONEY', currencyMinorUnits: 2, pointsPerCurrencyUnit: 1 },
   };
   const code = (o: Partial<IntakeEvaluationInput>) => evaluateIntake({ ...ok, ...o })?.code ?? null;
 
@@ -127,6 +128,18 @@ describe('evaluateIntake', () => {
     expect(code({ policy: null })).toBe('NO_POLICY');
     expect(code({ type: 'SERVICE_COMPLETED' })).toBe('POLICY_NOT_APPLICABLE');
     expect(evaluateIntake({ ...ok, amountMinor: 49_999n })?.reason).toMatch(/below the policy minimum/);
+  });
+
+  it('rejects a POINTS sale whose converted base would not fit a bigint (it could never be processed)', () => {
+    const points = { rewardUnit: 'POINTS' as const, currencyMinorUnits: 2, pointsPerCurrencyUnit: 1_000_000 };
+    const huge = 999_999_999_999_999_999n; // 18 digits: the contract maximum
+    expect(code({ unit: points, amountMinor: huge })).toBe('AMOUNT_TOO_LARGE');
+    expect(evaluateIntake({ ...ok, unit: points, amountMinor: huge })?.reason).toMatch(/too large/);
+    // 2^63 − 1 points is the largest storable base (base = amount × 10^6 / 10^2).
+    expect(code({ unit: points, amountMinor: 922_337_203_685_477n })).toBeNull();
+    expect(code({ unit: points, amountMinor: 922_337_203_685_478n })).toBe('AMOUNT_TOO_LARGE');
+    // MONEY bases equal the sale amount, which the contract caps below 2^63.
+    expect(code({ amountMinor: huge })).toBeNull();
   });
 });
 

@@ -129,7 +129,8 @@ export function ProgramLifecycleActions({ program }: { program: AdminProgramDeta
       toast.success(actionCopy(action, program, now).done ?? `Program ${updated.status.toLowerCase()}`);
     } catch (error) {
       if (isApiError(error) && error.code === 'STALE_VERSION') {
-        throw new Error('This program was changed by someone else. Close this dialog and try again with the latest version.');
+        // useProgramLifecycle reloads the program on 409, so a retry sends the new version.
+        throw new Error('This program was changed by someone else. The latest version is being loaded — review it, then confirm again.');
       }
       throw error;
     }

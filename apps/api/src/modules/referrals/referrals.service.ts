@@ -6,6 +6,7 @@ import { AppError } from '../../common/errors/app-error';
 import { OutboxService } from '../../common/outbox/outbox.service';
 import { OutboxTopic } from '../../common/outbox/outbox.topics';
 import type { Tx } from '../../common/prisma/prisma.service';
+import { lockReferralTreeShared } from '../../common/prisma/referral-tree-lock';
 import { generateReferralCode, normalizeReferralCode } from './domain/referral-code';
 
 /** Advisory lock guarding referral-tree writes (two-int form; see the integrity migration). */
@@ -50,9 +51,13 @@ export class ReferralsService {
 
   /**
    * Validates a referral code: an active global code whose owner is ACTIVE and email-verified.
-   * Normalizes input (trim, remove spaces/dashes, upper-case). Locks the code row FOR SHARE so it
-   * cannot be deactivated concurrently. Safe to call outside the creating transaction too (e.g. when
-   * storing a pending registration) — it is re-validated at creation time.
+   * Normalizes input (trim, remove spaces/dashes, upper-case). Locks the code row AND the owner's
+   * users row FOR SHARE, so neither can be deactivated/suspended until the creating transaction
+   * commits (the attribution trigger re-checks both). A suspension that is already in flight is waited
+   * for and then re-evaluated: the code no longer qualifies → REFERRAL_CODE_INVALID, and the
+   * registration joins without a sponsor instead of failing on the trigger. Safe to call outside the
+   * creating transaction too (e.g. when storing a pending registration) — it is re-validated at
+   * creation time.
    *
    * @throws AppError REFERRAL_CODE_INVALID (400) without revealing which condition failed.
    */
@@ -65,7 +70,7 @@ export class ReferralsService {
         JOIN "users" u ON u."id" = rc."user_id"
         WHERE rc."code" = ${normalized} AND rc."program_id" IS NULL AND rc."is_active"
           AND u."status" = 'ACTIVE' AND u."email_verified_at" IS NOT NULL
-        FOR SHARE OF rc`;
+        FOR SHARE OF rc, u`;
       const row = rows[0];
       if (row) return { sponsorUserId: row.user_id, referralCodeId: row.id };
     }
@@ -82,7 +87,8 @@ export class ReferralsService {
    */
   async attachNewMember(tx: Tx, input: AttachNewMemberInput): Promise<AttachNewMemberResult> {
     const { userId } = input;
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${REFERRAL_TREE_LOCK.classId}::int, ${REFERRAL_TREE_LOCK.objId}::int)`;
+    // Bounded wait (lock_timeout): behind a long sponsor correction this fails with 503 (retryable).
+    await lockReferralTreeShared(tx);
     await tx.$executeRaw`
       INSERT INTO "referral_paths" ("ancestor_id", "descendant_id", "depth")
       VALUES (${userId}::uuid, ${userId}::uuid, 0)`;

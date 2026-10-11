@@ -56,7 +56,7 @@ export function ActivateEnrollmentDialogContent({ enrollment, onDone }: { enroll
       });
       onDone();
     } catch (error) {
-      if (!applyApiFieldErrors(error, form.setError)) toast.error(getErrorMessage(error));
+      if (!applyApiFieldErrors(error, form)) toast.error(getErrorMessage(error));
     }
   }
 

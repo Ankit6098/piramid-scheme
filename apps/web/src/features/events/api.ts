@@ -48,7 +48,7 @@ export function useSaleEvent(id: string | null) {
  * Recording a sale creates rewards (auto-approved ones are posted to the ledger); reversing one
  * rejects or reverses them with compensating ledger entries. Refresh the sales feature and every
  * finance view those rewards appear in: approval queue + counts, ledger, reconciliation, the admin
- * overview counters and members' own rewards/earnings.
+ * overview counters, members' own rewards/earnings, the admin member detail and the audit log.
  */
 function useInvalidateSales() {
   const queryClient = useQueryClient();
@@ -60,6 +60,8 @@ function useInvalidateSales() {
       queryClient.invalidateQueries({ queryKey: financeKeys.reconciliation.all }),
       queryClient.invalidateQueries({ queryKey: financeKeys.adminOverview }),
       queryClient.invalidateQueries({ queryKey: queryKeys.rewards.all }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.adminMember }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.adminAudit }),
     ]);
 }
 
@@ -105,6 +107,32 @@ export function useReverseSale() {
         { idempotencyKey },
       ),
     // Not awaited, so the confirm dialog closes before the drawer re-renders with the new status.
+    onSettled: () => {
+      void invalidate();
+    },
+  });
+}
+
+export interface RejectPendingSaleVariables {
+  eventId: string;
+  reason: string;
+  /** Created once per dialog open. */
+  idempotencyKey: string;
+}
+
+/**
+ * POST /admin/events/:id/reject (`events:reverse`) — rejects a sale stuck in RECEIVED (it can never
+ * be processed) so the same external id can be re-recorded as a new revision.
+ */
+export function useRejectPendingSale() {
+  const queryClient = useQueryClient();
+  const invalidate = useInvalidateSales();
+  return useMutation({
+    mutationFn: ({ eventId, reason, idempotencyKey }: RejectPendingSaleVariables) =>
+      api.post<SaleEventDetailDto>(`/admin/events/${encodeURIComponent(eventId)}/reject`, { reason }, { idempotencyKey }),
+    onSuccess: (event) => {
+      queryClient.setQueryData(eventKeys.detail(event.id), event);
+    },
     onSettled: () => {
       void invalidate();
     },

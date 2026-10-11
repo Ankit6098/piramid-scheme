@@ -1,12 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import type { AdminOverviewDto, AmountBucketDto, RewardUnit } from '@app/shared';
-import { type AuthContext, hasPermission, PrismaService, programScopeFilter } from '../../common';
+import { allLimited, type AuthContext, hasPermission, PrismaService, programScopeFilter } from '../../common';
 import { Prisma } from '../../generated/prisma/client';
 import { AuditQueryService } from '../audit/audit-query.service';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
 import { buildDailySeries, seriesStart } from './domain/admin-rules';
 
 export const OVERVIEW_DAYS = 30;
+/** Pool connections one overview request may use at once. */
+export const OVERVIEW_CONCURRENCY = 3;
 /** Events still RECEIVED this long after being recorded count as reconciliation exceptions (§11). */
 export const STUCK_EVENT_MINUTES = 15;
 const DAY_MS = 86_400_000;
@@ -37,12 +39,13 @@ export class AdminOverviewService {
     const end = new Date(start.getTime() + OVERVIEW_DAYS * DAY_MS);
     const db = this.prisma;
 
+    // At most OVERVIEW_CONCURRENCY pool connections per request (13 aggregates; see allLimited).
     const [users, activePrograms, pendingEnrollments, sales, pending, posted, exceptions, openFlags, deadOutbox, recentActions, registrationsByDay, salesByDay, postedByDay] =
-      await Promise.all([
-        this.userCounts(scope),
-        db.program.count({ where: { status: 'ACTIVE', ...(programWhere ? { id: programWhere } : {}) } }),
-        db.programEnrollment.count({ where: { status: 'PENDING', ...(programWhere ? { programId: programWhere } : {}) } }),
-        db.qualifyingEvent.groupBy({
+      await allLimited(OVERVIEW_CONCURRENCY, [
+        () => this.userCounts(scope),
+        () => db.program.count({ where: { status: 'ACTIVE', ...(programWhere ? { id: programWhere } : {}) } }),
+        () => db.programEnrollment.count({ where: { status: 'PENDING', ...(programWhere ? { programId: programWhere } : {}) } }),
+        () => db.qualifyingEvent.groupBy({
           by: ['currencyCode'],
           where: {
             status: { in: ['RECEIVED', 'PROCESSED'] },
@@ -52,26 +55,28 @@ export class AdminOverviewService {
           _count: { _all: true },
           _sum: { amountMinor: true },
         }),
-        db.reward.groupBy({
-          by: ['rewardUnit', 'currencyCode'],
-          where: { status: 'PENDING_APPROVAL', ...(programWhere ? { programId: programWhere } : {}) },
-          _count: { _all: true },
-          _sum: { amountMinor: true },
-        }),
-        db.reward.groupBy({
-          by: ['rewardUnit', 'currencyCode'],
-          where: { status: 'POSTED', ...(programWhere ? { programId: programWhere } : {}) },
-          _count: { _all: true },
-          _sum: { amountMinor: true },
-        }),
-        this.reconciliationExceptions(scope, now),
-        scoped ? Promise.resolve(null) : db.memberFlag.count({ where: { status: 'OPEN' } }),
-        auth.roles.includes('SUPER_ADMIN') ? db.outboxMessage.count({ where: { status: 'DEAD' } }) : Promise.resolve(null),
-        this.recentActions(auth, scope),
-        this.registrationsByDay(scope, start, end),
-        this.salesByDay(scope, start, end),
-        this.rewardsPostedByDay(scope, start, end),
-      ]);
+        () =>
+          db.reward.groupBy({
+            by: ['rewardUnit', 'currencyCode'],
+            where: { status: 'PENDING_APPROVAL', ...(programWhere ? { programId: programWhere } : {}) },
+            _count: { _all: true },
+            _sum: { amountMinor: true },
+          }),
+        () =>
+          db.reward.groupBy({
+            by: ['rewardUnit', 'currencyCode'],
+            where: { status: 'POSTED', ...(programWhere ? { programId: programWhere } : {}) },
+            _count: { _all: true },
+            _sum: { amountMinor: true },
+          }),
+        () => this.reconciliationExceptions(scope, now),
+        () => (scoped ? Promise.resolve(null) : db.memberFlag.count({ where: { status: 'OPEN' } })),
+        () => (auth.roles.includes('SUPER_ADMIN') ? db.outboxMessage.count({ where: { status: 'DEAD' } }) : Promise.resolve(null)),
+        () => this.recentActions(auth, scope),
+        () => this.registrationsByDay(scope, start, end),
+        () => this.salesByDay(scope, start, end),
+        () => this.rewardsPostedByDay(scope, start, end),
+      ] as const);
 
     const amountBuckets = (rows: typeof pending): AmountBucketDto[] =>
       rows

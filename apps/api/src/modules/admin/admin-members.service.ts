@@ -39,6 +39,7 @@ import { Prisma } from '../../generated/prisma/client';
 import { AuthService } from '../auth/auth.service';
 import { SecurityNoticesService } from '../auth/security-notices.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { toDisplayName } from '../referrals/domain/display-name';
 import {
   checkAdminPasswordReset,
   checkStatusChange,
@@ -266,6 +267,10 @@ export class AdminMembersService {
     const target = { id: user.id, roles: roleKeys, status: user.status };
     const actor = { userId: auth.userId, roles: auth.roles };
     const canWrite = hasPermission(auth, Permission.MembersWrite);
+    const sponsorRow = user.sponsorRelationship?.sponsor ?? null;
+    // A PROGRAM_ADMIN sees the sponsor's identity only when the sponsor is in their scope too
+    // (enrolled in one of their programs); otherwise just the privacy-filtered display name.
+    const sponsorInScope = sponsorRow !== null && (scope === 'ALL' || (await this.isInScope(this.prisma, scope, sponsorRow.id)));
 
     return {
       id: user.id,
@@ -286,14 +291,20 @@ export class AdminMembersService {
           grantedBy: r.grantedBy ? { id: r.grantedBy.id, fullName: r.grantedBy.fullName } : null,
         }))
         .sort((a, b) => roleKeys.indexOf(a.role) - roleKeys.indexOf(b.role)),
-      programScopes: user.programAssignments.map((a) => a.program).sort((a, b) => a.name.localeCompare(b.name)),
+      // Only programs the caller may see (a PROGRAM_ADMIN never learns about other programs here).
+      programScopes: user.programAssignments
+        .map((a) => a.program)
+        .filter((p) => scope === 'ALL' || scope.includes(p.id))
+        .sort((a, b) => a.name.localeCompare(b.name)),
       hasTotpFactor: user.mfaFactors.length > 0,
       referralCode: user.referralCodes[0]?.code ?? null,
-      sponsor: user.sponsorRelationship
+      sponsor: sponsorRow
         ? {
-            id: user.sponsorRelationship.sponsor.id,
-            fullName: user.sponsorRelationship.sponsor.fullName,
-            email: user.sponsorRelationship.sponsor.email,
+            id: sponsorRow.id,
+            displayName: toDisplayName(sponsorRow.fullName),
+            fullName: sponsorInScope ? sponsorRow.fullName : null,
+            email: sponsorInScope ? sponsorRow.email : null,
+            inScope: sponsorInScope,
           }
         : null,
       team: { directReferrals, totalDescendants },
@@ -538,11 +549,15 @@ export class AdminMembersService {
 
   /** PROGRAM_ADMIN: the member must hold an enrollment in one of the caller's programs (else 404). */
   private async assertInScope(db: Db, scope: Scope, userId: string): Promise<void> {
-    if (scope === 'ALL') return;
-    const found =
+    if (!(await this.isInScope(db, scope, userId))) throw notFound('Member');
+  }
+
+  private async isInScope(db: Db, scope: Scope, userId: string): Promise<boolean> {
+    if (scope === 'ALL') return true;
+    return (
       scope.length > 0 &&
-      (await db.programEnrollment.findFirst({ where: { userId, programId: { in: scope } }, select: { id: true } })) !== null;
-    if (!found) throw notFound('Member');
+      (await db.programEnrollment.findFirst({ where: { userId, programId: { in: scope } }, select: { id: true } })) !== null
+    );
   }
 
   private memberScopeSql(scope: Scope): Prisma.Sql {

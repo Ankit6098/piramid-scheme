@@ -205,6 +205,7 @@ drafts accept `expectedUpdatedAt`.
 | API `auth` throttler | 10 req/min per IP (`THROTTLE_AUTH_*`) | register, login, password forgot/reset, password change; `POST /referrals/validate` uses it with 20 req/min |
 | API `otp` throttler | 5 req/min per IP (`THROTTLE_OTP_*`) | resend, verify-email, all `/auth/mfa/*`, email change, TOTP reset |
 | Login backoff (Redis) | after 5 failures per (email, IP) or 20 per IP: 30 s · 2^k, max 15 min | login, password change, TOTP confirm/verify/reset, email-change start |
+| TOTP lockout (Redis) | 10 consecutive wrong authenticator codes per ACCOUNT (any IP): 15 min · 2^k, max 24 h; session revoked, owner + SUPER_ADMINs notified | TOTP confirm/verify/reset |
 | One-time code limits (DB) | 60 s resend cooldown, 5 codes/h, ≥ 10 failures/24 h block | per (address, purpose); silent on public flows, explicit on admin email MFA |
 | Machine ingestion | 120 req/min per IP | `POST /integrations/events` |
 

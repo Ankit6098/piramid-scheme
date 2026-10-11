@@ -1,6 +1,7 @@
 'use client';
 
 import { useId, useState, type ReactNode } from 'react';
+import { z } from 'zod';
 import { reasonSchema } from '@app/shared';
 
 import {
@@ -20,12 +21,50 @@ import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
 import { getErrorMessage } from '@/lib/api-client';
 
+/** Anything with Zod's `safeParse` that validates the trimmed reason text. */
+export interface ReasonValidator {
+  safeParse: (value: unknown) => {
+    success: boolean;
+    error?: { issues: ReadonlyArray<{ message: string }> };
+  };
+}
+
 export interface ConfirmReasonOptions {
   /** Defaults to true — most audited actions need a reason (≥ 10 characters, see `reasonSchema`). */
   required?: boolean;
   label?: string;
   placeholder?: string;
+  /** Help text under the field. Defaults to an admin/audit-log hint built from `minLength`. */
   description?: ReactNode;
+  /**
+   * Validation of the (trimmed) text, matching the API's schema for this action — e.g.
+   * `financeReasonSchema` (≤ 480) or `cancelMyEnrollmentSchema.shape.reason` (optional, ≤ 500).
+   * Defaults to `reasonSchema` (10–1000), or to `minLength`/`maxLength` when those are given.
+   */
+  schema?: ReasonValidator;
+  /** Minimum length (default 10). Builds the default schema and help text. */
+  minLength?: number;
+  /** Maximum length (default 1000): the textarea limit, and part of the default schema. */
+  maxLength?: number;
+}
+
+const DEFAULT_REASON_MIN = 10;
+const DEFAULT_REASON_MAX = 1000;
+
+function reasonValidator(options: ConfirmReasonOptions): ReasonValidator {
+  if (options.schema) return options.schema;
+  const min = options.minLength ?? DEFAULT_REASON_MIN;
+  const max = options.maxLength ?? DEFAULT_REASON_MAX;
+  if (min === DEFAULT_REASON_MIN && max === DEFAULT_REASON_MAX) return reasonSchema;
+  let schema = z.string().trim();
+  if (min > 0) schema = schema.min(min, `Please give a reason (at least ${min} characters)`);
+  return schema.max(max, `Keep it under ${max} characters`);
+}
+
+function defaultReasonHelp(min: number): string {
+  return min > 0
+    ? `At least ${min} characters. Visible to other administrators.`
+    : 'Visible to other administrators.';
 }
 
 export interface ConfirmDialogProps {
@@ -84,10 +123,11 @@ export function ConfirmDialog({
 
   const reasonOptions: ConfirmReasonOptions | null = reason === true ? {} : reason ? reason : null;
   const reasonRequired = reasonOptions ? (reasonOptions.required ?? true) : false;
-  const reasonResult = reasonSchema.safeParse(reasonText);
+  const reasonMax = reasonOptions?.maxLength ?? DEFAULT_REASON_MAX;
+  const reasonResult = reasonOptions ? reasonValidator(reasonOptions).safeParse(reasonText) : null;
   const reasonError =
-    reasonOptions && (reasonRequired || reasonText.trim().length > 0) && !reasonResult.success
-      ? (reasonResult.error.issues[0]?.message ?? 'Please give a reason')
+    reasonOptions && reasonResult && (reasonRequired || reasonText.trim().length > 0) && !reasonResult.success
+      ? (reasonResult.error?.issues[0]?.message ?? 'Please give a reason')
       : null;
   const typedOk = !typedConfirmation || typed.trim() === typedConfirmation;
   const canConfirm = !pending && !reasonError && typedOk;
@@ -163,7 +203,7 @@ export function ConfirmDialog({
                 placeholder={
                   reasonOptions.placeholder ?? 'Explain why — this is recorded in the audit log.'
                 }
-                maxLength={1000}
+                maxLength={reasonMax}
                 rows={3}
                 required={reasonRequired}
                 aria-invalid={touched && reasonError ? true : undefined}
@@ -172,7 +212,7 @@ export function ConfirmDialog({
               />
               <FieldDescription id={`${reasonId}-desc`}>
                 {reasonOptions.description ??
-                  'At least 10 characters. Visible to other administrators.'}
+                  defaultReasonHelp(reasonOptions.minLength ?? DEFAULT_REASON_MIN)}
               </FieldDescription>
               {touched && reasonError ? <FieldError>{reasonError}</FieldError> : null}
             </Field>

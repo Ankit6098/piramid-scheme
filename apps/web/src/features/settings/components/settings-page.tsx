@@ -197,7 +197,7 @@ function SettingsForm({ settings, onReload }: { settings: PlatformSettingsDto; o
         });
         return;
       }
-      if (applyApiFieldErrors(error, form.setError)) setConfirm(null);
+      if (applyApiFieldErrors(error, form)) setConfirm(null);
       throw error;
     }
   }

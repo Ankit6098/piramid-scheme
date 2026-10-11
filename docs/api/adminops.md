@@ -59,7 +59,10 @@ is 0 for program-scoped callers. Emails are visible to admins; secrets never are
 
 `AdminMemberDetailDto` — profile (`email`, `phone`, `status`, `emailVerifiedAt`, `suspendedAt`,
 `suspensionReason`, `lastLoginAt`), `roles: [{ role, grantedAt, grantedBy }]`, `programScopes` (PROGRAM_ADMIN
-assignments), `hasTotpFactor`, `referralCode`, `sponsor { id, fullName, email } | null`,
+assignments — for a program-scoped caller only the programs within the caller's own scope), `hasTotpFactor`,
+`referralCode`, `sponsor { id, displayName, fullName, email, inScope } | null` (for a program-scoped caller
+whose programs the sponsor is not enrolled in: `fullName`/`email` null and `inScope: false` — only the display
+name, first name + last initial; the UI does not link it),
 `team { directReferrals, totalDescendants }`, `enrollments` (scoped; option name and price from the immutable
 snapshot), `rewardSummary: RewardSummaryBucketDto[]` (scoped; earned from the ledger, see below),
 `openFlags` (`null` for program-scoped callers) and `can { suspend, reactivate, changeRoles, sendPasswordReset }`

@@ -19,7 +19,8 @@ export function EditProgramPage() {
   return (
     <div className="space-y-4">
       <SectionHeader title="Edit program" description="Changes are audited. Concurrent edits are detected and you will be asked to reload." />
-      <ProgramForm program={program} />
+      {/* A new version (saved here or changed elsewhere) starts a fresh form on the latest data. */}
+      <ProgramForm key={program.version} program={program} />
     </div>
   );
 }

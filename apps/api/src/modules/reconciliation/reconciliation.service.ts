@@ -9,12 +9,18 @@ import {
 import type { AuthContext } from '../../common/auth/auth-context';
 import { programScopeFilter } from '../../common/auth/program-access';
 import { forbidden } from '../../common/errors/app-error';
+import { allLimited } from '../../common/prisma/concurrency';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import type { RewardUnit } from '../../generated/prisma/client';
+import { PLAN_PAYMENT_FLAG_KIND } from '../rewards/domain/plan-payment';
 import { CHECK_BY_KEY, summarizeChecks, type CheckOutcome } from './domain/checks';
 
 /** How long a computed report is reused (the checks scan whole tables). */
 export const RECONCILIATION_CACHE_TTL_MS = 60_000;
+/** Oldest cached report whose count the admin overview may still show (refreshed in the background). */
+export const RECONCILIATION_STALE_MAX_MS = 15 * 60_000;
+/** Pool connections one report computation may use at once. */
+export const RECONCILIATION_CONCURRENCY = 2;
 /** Exception rows returned per check (counts are always exact). */
 export const EXCEPTION_LIMIT_PER_CHECK = 100;
 
@@ -43,9 +49,20 @@ export class ReconciliationService {
 
   /**
    * CROSS-MODULE CONTRACT (admin overview): number of open exceptions of every check, including
-   * compliance-review items. Uses the same ~60 s cache as the report.
+   * compliance-review items. Stale-while-revalidate on the report cache: a cached count up to
+   * RECONCILIATION_STALE_MAX_MS old is returned at once (a refresh starts in the background once it
+   * is older than the ~60 s TTL), so the full-table checks run in the overview request only when
+   * there is no usable report at all.
    */
   async countExceptions(): Promise<number> {
+    const cached = this.cached;
+    const age = cached ? Date.now() - cached.at : Infinity;
+    if (cached && age < RECONCILIATION_STALE_MAX_MS) {
+      if (age >= RECONCILIATION_CACHE_TTL_MS && !this.inflight) {
+        this.report(true).catch((err: unknown) => this.logger.warn({ err }, 'background reconciliation refresh failed'));
+      }
+      return cached.report.totalExceptions;
+    }
     return (await this.report(false)).totalExceptions;
   }
 
@@ -71,22 +88,24 @@ export class ReconciliationService {
 
   private async compute(): Promise<ReconciliationReportDto> {
     const generatedAt = new Date();
-    const outcomes = await Promise.all([
-      this.rewardLedgerStatus(),
-      this.ledgerAmounts(),
-      this.unbalancedTransactions(),
-      this.payableBalances(),
-      this.reversedEventsWithLiveRewards(),
-      this.calculationTotals(),
-      this.stuckEvents(),
-      this.planPaymentLookalikes(),
+    // The checks scan whole tables: at most RECONCILIATION_CONCURRENCY pool connections at a time,
+    // so a refresh never starves request traffic of connections.
+    const outcomes: CheckOutcome[] = await allLimited(RECONCILIATION_CONCURRENCY, [
+      () => this.rewardLedgerStatus(),
+      () => this.ledgerAmounts(),
+      () => this.unbalancedTransactions(),
+      () => this.payableBalances(),
+      () => this.reversedEventsWithLiveRewards(),
+      () => this.calculationTotals(),
+      () => this.stuckEvents(),
+      () => this.planPaymentLookalikes(),
     ]);
     const { checks, totalExceptions, healthy } = summarizeChecks(outcomes);
-    const [rewardsByStatus, eventsByStatus, buckets] = await Promise.all([
-      this.rewardCounts(),
-      this.eventCounts(),
-      this.buckets(),
-    ]);
+    const [rewardsByStatus, eventsByStatus, buckets] = await allLimited(RECONCILIATION_CONCURRENCY, [
+      () => this.rewardCounts(),
+      () => this.eventCounts(),
+      () => this.buckets(),
+    ] as const);
     return {
       generatedAt: generatedAt.toISOString(),
       healthy,
@@ -351,20 +370,28 @@ export class ReconciliationService {
         currency_code: string;
         status: string;
         enrollment_id: string;
+        payer_user_id: string;
+        payment_program_id: string;
+        depth: number;
         payment_recorded_at: Date;
+        matches: number;
         total: number;
       }>
     >`
       WITH m AS (
         SELECT DISTINCT ON (e."id") e."id", e."program_id", e."subject_user_id", e."amount_minor", e."currency_code",
-               e."status"::text AS "status", e."occurred_at", pe."id" AS "enrollment_id", pe."payment_recorded_at"
+               e."status"::text AS "status", e."occurred_at", pm."enrollment_id", pm."payer_user_id",
+               pm."program_id" AS "payment_program_id", pm."depth", pm."payment_recorded_at",
+               count(*) OVER (PARTITION BY e."id")::int AS "matches"
           FROM "qualifying_events" e
-          JOIN "program_enrollments" pe
-            ON pe."program_id" = e."program_id" AND pe."user_id" = e."subject_user_id"
-           AND pe."payment_amount_minor" = e."amount_minor"
-           AND e."occurred_at" BETWEEN pe."payment_recorded_at" - interval '2 days' AND pe."payment_recorded_at" + interval '2 days'
-         WHERE e."status" <> 'REJECTED' AND pe."payment_amount_minor" > 0
-         ORDER BY e."id", pe."payment_recorded_at" DESC
+         CROSS JOIN LATERAL app_plan_payment_matches(e."subject_user_id", e."amount_minor", e."currency_code"::text,
+                                                     e."occurred_at", e."created_at") pm
+         WHERE e."status" NOT IN ('REJECTED', 'REVERSED')
+           -- A reviewer resolved / dismissed the sale's PLAN_PAYMENT_LOOKALIKE flag: reviewed.
+           AND NOT EXISTS (
+                 SELECT 1 FROM "member_flags" f
+                  WHERE f."dedupe_key" = ${`${PLAN_PAYMENT_FLAG_KIND}:`}::text || e."id"::text AND f."status" <> 'OPEN')
+         ORDER BY e."id", pm."depth" ASC, pm."payment_recorded_at" DESC
       )
       SELECT m.*, count(*) OVER ()::int AS "total" FROM m
        ORDER BY m."occurred_at" DESC, m."id"
@@ -377,10 +404,19 @@ export class ReconciliationService {
           resourceType: 'qualifying_event',
           resourceId: r.id,
           programId: r.program_id,
-          summary: `Sale amount equals the subject's own plan payment recorded ${r.payment_recorded_at.toISOString()}.`,
+          summary:
+            r.depth === 0
+              ? `Sale amount equals the credited member's own plan payment recorded ${r.payment_recorded_at.toISOString()}.`
+              : `Sale amount equals a plan payment by a member ${r.depth} level(s) below the credited member, recorded ${r.payment_recorded_at.toISOString()}.`,
           details: {
             subjectUserId: r.subject_user_id,
+            relation: r.depth === 0 ? 'OWN' : 'DOWNLINE',
+            payerUserId: r.payer_user_id,
+            depth: r.depth,
             enrollmentId: r.enrollment_id,
+            paymentProgramId: r.payment_program_id,
+            paymentRecordedAt: r.payment_recorded_at.toISOString(),
+            matchingPayments: r.matches,
             amountMinor: s(r.amount_minor),
             currencyCode: r.currency_code,
             eventStatus: r.status,

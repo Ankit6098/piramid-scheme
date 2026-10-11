@@ -39,11 +39,11 @@ This document explains the controls and where they live. Related decisions:
 |---|---|
 | Credential stuffing / brute force | argon2id hashes; generic login errors with equal timing; Redis failure counters per (email-HMAC, IP) and per IP with exponential backoff (5 failures → 30 s, doubling to 15 min; 20 per IP) — no global account lock, so nobody can lock out an owner; per-IP throttler on auth routes; nginx limit on auth mutations (10 r/min/IP, burst 20). |
 | Account enumeration | Registration and password reset return the same response for known and unknown emails (an existing address gets a "someone tried to register" notice instead); `EMAIL_NOT_VERIFIED` only after a correct password. |
-| Session theft / fixation | Opaque random token, HttpOnly + SameSite=Lax + Secure cookie; only its SHA-256 is stored; new token per login; idle + absolute expiry; revocation on logout, password change/reset and suspension. |
+| Session theft / fixation | Opaque random token, HttpOnly + SameSite=Lax + Secure cookie; only its SHA-256 is stored; new token per login; idle + absolute expiry; revocation on logout, password change/reset and suspension — race-safe against sessions being created or elevated at the same moment (users-row locks, §3). |
 | CSRF | Double-submit token (`csrf_token` cookie ↔ `x-csrf-token` header, constant-time compare) + Origin/Referer allow-list + SameSite=Lax. |
 | XSS | React escaping; no `dangerouslySetInnerHTML` with user data; CSP baseline; session cookie unreadable by JS; `nosniff`. |
 | Clickjacking | `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`. |
-| Privilege escalation | Server-side permission checks on every route (`@RequirePermissions`); program scoping for PROGRAM_ADMIN (`assertProgramAccess`); admin routes require a TOTP verification in the current session within 12 h (`adminAccess`); email OTP never grants admin access; no self-granting; only SUPER_ADMIN assigns roles; last SUPER_ADMIN protected. |
+| Privilege escalation | Server-side permission checks on every route (`@RequirePermissions`); program scoping for PROGRAM_ADMIN (`assertProgramAccess`); admin routes require a TOTP verification in the current session within 12 h (`adminAccess`); email OTP never grants admin access; an admin-role account cannot move its mailbox (where the first-login email code goes) without `adminAccess`; TOTP guesses capped per account (10, any IP); no self-granting; only SUPER_ADMIN assigns roles; last SUPER_ADMIN protected. |
 | Insider fraud (rewards) | Policies immutable once published; 50 % budget cap in DB; approvals by FINANCE_REVIEWER with segregation of duties (cannot approve own rewards); every privileged action audited (append-only); ledger append-only and balanced. |
 | Referral manipulation | Attribution only at registration from a valid code of an ACTIVE, verified member; immutable outside the audited correction flow (trigger); cycle checks; shared-IP registration flags. |
 | Data scraping / privacy leaks | Members see only privacy-filtered team data (first name + last initial, depth, join date, status bucket); never other members' email, phone, prices, rewards or sale amounts; DTOs map explicitly, never raw entities. |
@@ -88,6 +88,16 @@ This document explains the controls and where they live. Related decisions:
   `session.mfaMethod = TOTP` verified within the last 12 h; otherwise 403 `MFA_REQUIRED` with
   `details.reason` `TOTP_ENROLLMENT_REQUIRED` (no confirmed factor) or `TOTP_REQUIRED`. Hiding admin
   UI is never the control. The API guard is.
+  - **Mailbox binding:** the LOGIN_MFA bootstrap trusts the account's mailbox, so an admin-role account
+    can start or confirm an email change only from a TOTP-verified session (`adminAccess`, else 403
+    `MFA_REQUIRED`), and `/auth/mfa/email/*` refuse a session created before the account's email was last
+    changed/verified (409).
+  - **Per-account TOTP lockout** (`TotpLockoutService`, Redis, independent of IP): 10 consecutive wrong
+    codes across `/auth/mfa/totp/verify`, `/auth/mfa/totp/confirm` and `/users/me/mfa/totp/reset` pause
+    TOTP verification for the account for 15 min, doubling with each further failure up to 24 h; the
+    session that made the failures is revoked (`totp_locked`) and the owner and every SUPER_ADMIN are
+    notified once (audit `auth.mfa.totp_locked`). A correct code resets the count. The per-(user, IP) and
+    per-IP login backoff applies as well. Like that backoff, a Redis outage fails open (logged).
 - **Password reset / email change:** OTP challenges. Email change requires the current password
   and verification of the new address, and the old address is notified.
 
@@ -103,6 +113,12 @@ This document explains the controls and where they live. Related decisions:
   `expires_at = least(old expiry, now + 12 h)`; the old row is revoked (`mfa_rotated`).
 - Revocation: logout (that session); password change or reset, suspension, deactivation and any
   role grant/revoke (all sessions of the user). Expired sessions are rejected and later purged.
+- Race-safety: `createSession` and `elevateSession` hold the users row `FOR SHARE` while inserting the new
+  session (and re-check what the caller verified: the password hash + ACTIVE status for a login, the old
+  session still open for an elevation); `revokeAllForUser` takes the row `FOR NO KEY UPDATE` before revoking.
+  A session is therefore either committed before the revocation runs (and revoked by it) or created after
+  the credential change (and refused). Login updates `lastLoginAt`/rehash conditionally on the verified hash,
+  so it never undoes a concurrent password reset.
 - Roles and permissions are loaded from the database on every request (no cache).
 - IP and user agent are stored per session for the member's "active sessions" view and for
   investigations.
@@ -129,6 +145,7 @@ This document explains the controls and where they live. Related decisions:
 | API | `auth` routes (login, register, password reset) per IP | `THROTTLE_AUTH_LIMIT` / TTL (10 / 60 s) |
 | API | `otp` routes (send/verify) per IP | `THROTTLE_OTP_LIMIT` / TTL (5 / 60 s) |
 | API (`LoginThrottleService`, Redis) | Per (email-HMAC, IP) and per IP | Login failures: 5 per pair / 20 per IP free, then 30 s doubling to 15 min (`LOGIN_THROTTLE_*`) |
+| API (`TotpLockoutService`, Redis) | Per account (any IP) | Authenticator codes: 10 consecutive failures → 15 min, doubling to 24 h; session revoked; owner + SUPER_ADMINs notified |
 | API (domain, DB counters) | Per email and purpose | OTP attempts (5 per code; 10 failed per 24 h → 24 h block), resend cooldown (60 s), hourly send cap (5) |
 
 The nginx allow-list (`infra/nginx/snippets/rate-limit-allowlist.conf`) is empty in production.

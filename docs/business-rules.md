@@ -10,9 +10,20 @@ validate first and turn violations into friendly errors.
 1. **Rewards are funded only by sales of an approved Offering to an end customer.** Trigger types:
    `PRODUCT_SALE`, `SERVICE_COMPLETED`, `SUBSCRIPTION_RENEWAL` (an *end customer's* renewal of the
    Offering). Registration, referral and enrollment are never triggers. **A member's own payment for a
-   program Option (initial or renewal) is never a qualifying event** [DB: an event whose external id
-   equals an enrollment payment reference, or that matches the subject's own plan payment amount within
-   ±2 days of its recording, is rejected]. Every sale names an end-customer reference.
+   program Option (initial or renewal) — or a recruit's — never funds rewards.** A sale *resembles* a plan
+   payment when the amounts are equal, the payment was made in a program with the sale's currency (any
+   program, not only the sale's), and it was recorded within ±2 days of the sale's `occurredAt` **or** of
+   the time the sale is recorded (so back-dating cannot escape the window):
+   - an event whose external id equals any enrollment payment reference (references are unique across
+     programs), or that resembles the **subject's own** plan payment, is rejected [DB: insert guard];
+   - one that resembles a plan payment by a member of the **subject's downline** (any depth) is not
+     refused — an honest sale can match by coincidence — but it is flagged: its rewards are **never
+     auto-approved** (always `PENDING_APPROVAL`, even for API sales under a no-approval policy) [DB:
+     `trg_rewards_lookalike_guard`], an OPEN `PLAN_PAYMENT_LOOKALIKE` flag (dedupe key
+     `PLAN_PAYMENT_LOOKALIKE:<eventId>`) is raised on the subject, reviewers see the warning on the sale,
+     the reward detail and the approval dialogs, and the sale is queued in reconciliation (§11).
+
+   Every sale names an end-customer reference.
 2. **Budget cap.** Rewards for one sale ≤ `budgetBps` of the sale value and `budgetBps ≤ 5000` (50%)
    [DB: on policies *and* on every stored calculation; Σ rewards = calculation total].
 3. **No guaranteed returns.** The UI never shows projected or guaranteed income. Option prices are the
@@ -42,6 +53,8 @@ validate first and turn violations into friendly errors.
   `SUSPENDED` (admin, reason), `DEACTIVATED`. (`PENDING_VERIFICATION` is legacy-only: accounts are now
   created already verified, see Registration.)
 - Password: ≥ 10 chars with a letter and a digit; argon2id.
+- Full name: 2–120 chars, no control characters, no web addresses (`://`, `www.`) — names appear in emails and
+  other members' team views.
 - **Registration (anti-squatting):** `POST /auth/register` never creates a user. It stores the pending
   name, password hash and validated referral code on an `EMAIL_VERIFICATION` challenge and emails a code.
   The users row, depth-0 closure row, sponsor relationship and ancestor rows are created in the single
@@ -53,7 +66,7 @@ validate first and turn violations into friendly errors.
   therefore never activates an account with their password — the owner registers again (a newer
   registration for the same address replaces the older pending one) and verifies with their own. For an
   address that already has an account the response is identical and the owner gets a "someone tried to
-  register" notice.
+  register" notice. The verification email never greets by name (the pending name is unverified input).
 - **OTP codes:** 6 digits (CSPRNG); stored only as HMAC-SHA-256(pepper, `purpose:email:code`); TTL 10
   min; ≤ 5 attempts per code; single use; **one open challenge per (email, purpose)** [DB] — issuing a
   new code invalidates the old one in the same transaction; resend cooldown 60 s; ≤ 5 sends per hour;
@@ -76,6 +89,13 @@ validate first and turn violations into friendly errors.
   AES-256-GCM encrypted with `MFA_ENCRYPTION_KEY`, replay protection by last used time-step). First admin
   login with no factor: email OTP bound to that session, then forced TOTP enrollment before any
   `/admin/*` access. `/admin/*` requires `session.mfaMethod = TOTP` verified within the last 12 h.
+  Because LOGIN_MFA bootstraps from the mailbox, an admin-role account can **change its email only from a
+  TOTP-verified session** (`adminAccess`, checked on start and confirm, else 403 `MFA_REQUIRED`), and a
+  LOGIN_MFA code is refused for a session created before the account's email was last changed/verified.
+  **TOTP guesses are capped per account** (independent of IP, across verify, enrollment confirm and
+  authenticator reset): 10 consecutive wrong codes pause TOTP verification for the account for 15 min
+  (doubling with each further failure, max 24 h; a correct code resets the count), revoke the session that
+  made them and notify the owner and every SUPER_ADMIN once (audit `auth.mfa.totp_locked`).
   Self-service password reset is disabled for admin-role users. Instead a SUPER_ADMIN (never for
   themselves, reason required) sends an **admin-triggered reset** (`POST /admin/members/:id/password-reset`,
   also usable for plain members): a `PASSWORD_RESET` code to the account's address that records the
@@ -90,7 +110,12 @@ validate first and turn violations into friendly errors.
   stored. Member TTL 7 days, idle 12 h. On MFA success the token is rotated (old row revoked
   `mfa_rotated`) and expiry capped at now + 12 h. Logout revokes; password change/reset, an admin-triggered
   reset, suspension and **any role grant/revoke** revoke all of that user's sessions. LOGIN_MFA codes elevate only the session
-  that requested them [DB]. Permissions are loaded per request.
+  that requested them [DB]. Permissions are loaded per request. Race-safety: creating or elevating a session
+  holds the users row `FOR SHARE` and re-checks what was verified (login: the password hash and ACTIVE status;
+  elevation: the old session still open, account ACTIVE); revoking all sessions takes the row
+  `FOR NO KEY UPDATE` first — so a session can never be created alongside a credential change and survive it.
+  A login whose verified hash changed meanwhile fails with `INVALID_CREDENTIALS` and never rehashes over the
+  newer password; a password change is likewise conditional on the hash it verified.
 - Rate limits (per IP and per account/email): register, login, OTP send/verify, password reset.
 
 ## 3. Roles, permissions, segregation of duties
@@ -105,6 +130,10 @@ validate first and turn violations into friendly errors.
 - Every operation is authorized on the server. Only SUPER_ADMIN assigns roles; nobody grants roles to
   themselves [DB]; at least one ACTIVE SUPER_ADMIN always remains — removal includes suspension and
   deactivation [DB, serialized].
+- **Program-scoped reads:** a PROGRAM_ADMIN sees a member only if the member is enrolled in one of their
+  programs, and inside a member view only what is in scope: a sponsor outside their programs appears by
+  display name only (no full name, email or link), and the member's own PROGRAM_ADMIN assignments are listed
+  only for programs within the caller's scope.
 - **Segregation of duties [DB]:** nobody approves, rejects or reverses their own reward; the admin who
   recorded a sale can never approve its rewards; an admin cannot record a sale whose subject is
   themselves or anyone in their downline; a reward recipient must be an upline of the sale's subject;
@@ -159,7 +188,10 @@ validate first and turn violations into friendly errors.
   Link `${APP_PUBLIC_URL}/register?ref=CODE`. A code is attribution, never authentication.
 - **Attribution happens once, in the transaction that creates the member** (email verification), from
   a code that is active and owned by an ACTIVE, verified sponsor [DB]. Invalid code at registration →
-  validation error (the client may continue without a code).
+  validation error (the client may continue without a code). At verification the code row and the
+  sponsor's users row are locked `FOR SHARE`: a sponsor suspension in flight is waited for and the member
+  then joins without a sponsor (`codeNoLongerValid`); a suspension that starts later waits for the
+  registration to commit — never a 409.
 - **Write protocol [DB-enforced]:** registration takes `pg_advisory_xact_lock_shared(7301, 1)` then
   inserts users row → self closure row (depth 0) → relationship (with `registrationIp`, user agent) →
   ancestor rows (sponsor's rows + 1), with no savepoints. Closure rows must equal the sponsor chain at
@@ -212,10 +244,18 @@ superseding it [DB].
 **Intake validation** (the app stores failures as `REJECTED` with a reason when the row itself is valid):
 type is a sale type; offering = program offering and ACTIVE [DB]; currency = program currency [DB];
 amount > 0; customer reference present; `occurredAt` within the program period, ≤ now + 5 min [DB], the
-program was ACTIVE (not PAUSED/SCHEDULED) at `occurredAt` (from `program_status_changes`), and if the
+program was ACTIVE (not PAUSED/SCHEDULED) at `occurredAt` (from `program_status_changes`; changes logged
+in one transaction share a timestamp and resolve to the end of their chain, e.g. DRAFT → ACTIVE), and if the
 program is COMPLETED, now ≤ `endsAt` + grace; subject member exists and is ACTIVE; recorder SoD [DB];
-plan-payment checks [DB]; an applicable policy version exists (non-draft, range contains `occurredAt`,
-lists the type, amount ≥ minimum) [DB when bound].
+plan-payment checks (§0.1: any program's payment reference, the subject's own payment amount — refused;
+a downline member's — flagged) [DB]; an applicable policy version exists (non-draft, range contains
+`occurredAt`, lists the type, amount ≥ minimum) [DB when bound]; for POINTS programs the converted base
+(`floor(amount × rate / 10^minorUnits)`) fits a `bigint` (≤ 2^63 − 1), otherwise the sale could never be
+stored — the engine re-checks this and rejects instead of failing.
+
+**Stuck sales.** A sale that stays RECEIVED (the sweeper retries every minute) can be rejected by a
+reviewer with `events:reverse` (`POST /admin/events/:id/reject`, reason, audited `event.reject`); its
+external id can then be re-recorded as `revision + 1`. Serializes with the engine on the event row lock.
 
 **Calculation** (pure, `ENGINE_VERSION` recorded):
 1. Base: MONEY → `amountMinor`; POINTS → `floor(amountMinor × pointsPerCurrencyUnit / 10^minorUnits)`.
@@ -234,12 +274,15 @@ lists the type, amount ≥ minimum) [DB when bound].
 commit; ancestors are read under it); bind
 the policy to the event [DB re-checks applicability]; insert the calculation (with base, budget,
 unit/currency/minor units/points rate snapshot) [DB re-derives the base and checks the cap] and rewards
-[DB checks upline, depth, SoD]; mark the event PROCESSED. If the policy doesn't require approval and the
-source is not ADMIN_MANUAL, rewards are created `APPROVED` (system) and posted in the same transaction.
-Notifications go via the outbox. Historical rewards are never recalculated.
+[DB checks upline, depth, SoD]; mark the event PROCESSED. If the policy doesn't require approval, the
+source is not ADMIN_MANUAL **and the sale does not resemble a plan payment** (§0.1, judged with the
+event's `created_at` as recording time; the subject is flagged once per sale if it does), rewards are
+created `APPROVED` (system) and posted in the same transaction [DB]. Notifications go via the outbox.
+Historical rewards are never recalculated.
 
 **Dry-run** (`policies:write`): the same calculator with an admin-supplied sale amount and synthetic
-ancestor chain, or a real subject's tree (read-only). No writes.
+ancestor chain, or a real subject's tree (read-only). No writes. A PROGRAM_ADMIN may preview only a
+subject enrolled in the policy's program (otherwise 404), since the result reveals the subject's upline.
 
 ## 9. Approval, posting, reversal
 
@@ -274,15 +317,19 @@ ancestor chain, or a real subject's tree (read-only). No writes.
 Exceptions reported (and counted on the admin overview): reward status vs ledger mismatch; posting or
 reversal amount ≠ reward amount; unbalanced transaction; member payable balance ≠ Σ posted − Σ reversed
 rewards; REVERSED event with live rewards; PROCESSED event whose calculation total ≠ Σ rewards; events
-stuck in RECEIVED > 15 min; sales whose subject has a paid enrollment payment of the same amount within
-±2 days in the same program (compliance review queue). Most are impossible by construction (DB) — the
-report proves it continuously.
+stuck in RECEIVED > 15 min; sales (not rejected or reversed) that resemble a plan payment (§0.1) of the
+subject **or of a member of the subject's downline**, in any program with the sale's currency, within
+±2 days of the sale date or of its recording (compliance review queue; an item leaves the queue when the
+sale is reversed, or when its `PLAN_PAYMENT_LOOKALIKE` flag is resolved or dismissed). Most are
+impossible by construction (DB) — the report proves it continuously.
 
 ## 12. Fraud signals (advisory)
 
 - Registration enqueues `fraud.registration-attributed`; the worker counts committed attributions for
   (sponsor, registration IP, last 24 h). ≥ 3 → upsert an OPEN `MemberFlag` `SHARED_IP_REGISTRATIONS` with
-  dedupe key `SHARED_IP:<sponsorId>:<ip>` [DB unique while OPEN]. Admins (`flags:manage`) can raise
+  dedupe key `SHARED_IP:<sponsorId>:<ip>` [DB unique while OPEN]. A sale resembling a downline member's
+  plan payment raises `PLAN_PAYMENT_LOOKALIKE` on its subject (§0.1; one per sale, never re-raised once
+  reviewed). Admins (`flags:manage`) can raise
   manual flags and resolve/dismiss them (not their own [DB]). Flags never change balances automatically.
 
 ## 13. Audit

@@ -32,6 +32,10 @@ export const SqlState = {
   InvalidTextRepresentation: '22P02',
   StringDataRightTruncation: '22001',
   NumericValueOutOfRange: '22003',
+  /** lock_timeout expired (row or advisory lock wait). */
+  LockNotAvailable: '55P03',
+  /** statement_timeout expired (or the statement was cancelled). */
+  QueryCanceled: '57014',
 } as const;
 
 /** SQLSTATEs raised by our integrity triggers / constraints → HTTP 409 INVARIANT_VIOLATION. */
@@ -96,6 +100,8 @@ export function inspectDbError(err: unknown): DbErrorInfo | null {
 
 /** Maps a database error to an AppError, or null when it is not a recognised/expected DB failure. */
 export function mapDbError(err: unknown): AppError | null {
+  // pg-pool rejects with a plain Error (no code) when no connection frees up in time.
+  if (isPoolTimeout(err)) return busy(err);
   const info = inspectDbError(err);
   if (!info) return null;
   const { sqlState, prismaCode, constraint } = info;
@@ -133,10 +139,36 @@ export function mapDbError(err: unknown): AppError | null {
       undefined, { cause: err });
   }
   if (prismaCode && /^P10(0[0-2]|17)$/.test(prismaCode)) {
-    return new AppError(ErrorCode.ServiceUnavailable, 'Database temporarily unavailable', 503, undefined, { cause: err });
+    return new AppError(ErrorCode.ServiceUnavailable, 'Database temporarily unavailable', 503, { retryable: true }, { cause: err });
   }
-  if (prismaCode === 'P2024' || prismaCode === 'P2037') {
-    return new AppError(ErrorCode.ServiceUnavailable, 'The service is busy. Please retry', 503, undefined, { cause: err });
+  // Bounded waits (lock_timeout, statement_timeout, pool/transaction timeouts — see create-client.ts):
+  // the request gave up instead of queueing; nothing was written, so the client may retry.
+  if (
+    sqlState === SqlState.LockNotAvailable ||
+    sqlState === SqlState.QueryCanceled ||
+    prismaCode === 'P2024' ||
+    prismaCode === 'P2028' ||
+    prismaCode === 'P2037'
+  ) {
+    return busy(err);
   }
   return null;
+}
+
+function busy(err: unknown): AppError {
+  return new AppError(ErrorCode.ServiceUnavailable, 'The service is busy. Please retry', 503, { retryable: true }, { cause: err });
+}
+
+/** node-postgres pool: "timeout exceeded when trying to connect" (connectionTimeoutMillis). */
+function isPoolTimeout(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let e: unknown = err, depth = 0; e && typeof e === 'object' && depth < 6 && !seen.has(e); depth++) {
+    seen.add(e);
+    const o = e as { message?: unknown; cause?: unknown };
+    if (typeof o.message === 'string' && /timeout exceeded when trying to connect|Connection terminated due to connection timeout/i.test(o.message)) {
+      return true;
+    }
+    e = o.cause;
+  }
+  return false;
 }

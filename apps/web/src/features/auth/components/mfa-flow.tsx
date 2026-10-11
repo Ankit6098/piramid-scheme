@@ -34,7 +34,7 @@ import {
   useVerifyMfaEmailCode,
   useVerifyTotp,
 } from '../api';
-import { destinationAfterAuth, hardNavigate } from '../lib/navigation';
+import { destinationAfterAuth, hardNavigate, MFA_NOTICE_PARAM, MfaNotice } from '../lib/navigation';
 import { FormErrorAlert, InfoAlert, ResendButton, SubmitButton } from './auth-bits';
 import { FormOtpField } from './form-fields';
 import { TotpQrCode } from './totp-qr';
@@ -184,7 +184,7 @@ function TotpSetupStep({ next }: { next: string | null }) {
                     >
                       {secret.secret.match(/.{1,4}/g)?.join(' ')}
                     </code>
-                    <CopyButton value={secret.secret} label="Copy setup key" />
+                    <CopyButton value={secret.secret} label="setup key" />
                   </div>
                   <p className="text-xs text-muted-foreground">
                     Shown only now. Keep it private — anyone with this key can generate your codes.
@@ -271,6 +271,7 @@ export function MfaFlow() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const next = searchParams.get('next');
+  const totpRemoved = searchParams.get(MFA_NOTICE_PARAM) === MfaNotice.TotpRemoved;
   const queryClient = useQueryClient();
   const { user, status, error, refetch } = useSession();
   const logout = useLogout();
@@ -294,6 +295,9 @@ export function MfaFlow() {
   return (
     <div className="space-y-6">
       {step === 'email' ? <EmailCodeStep /> : null}
+      {step === 'setup' && totpRemoved ? (
+        <InfoAlert title="Authenticator removed">Set up your new authenticator app now.</InfoAlert>
+      ) : null}
       {step === 'setup' ? <TotpSetupStep next={next} /> : null}
       {step === 'totp' ? <TotpVerifyStep next={next} /> : null}
       <div className="flex flex-col items-center gap-2 border-t pt-4 text-sm">

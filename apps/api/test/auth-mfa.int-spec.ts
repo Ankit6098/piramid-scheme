@@ -6,6 +6,7 @@ import { CryptoService } from '../src/common/crypto/crypto.service';
 import { sha256Hex } from '../src/common/crypto/tokens';
 import { totp } from '../src/common/crypto/totp';
 import { RedisService } from '../src/common/redis/redis.service';
+import { TotpLockoutService } from '../src/modules/auth/totp-lockout.service';
 import { createTestApp, type TestApp, type TestClient } from './utils/app';
 import { disconnectTestPrisma, resetDatabase } from './utils/db';
 import { createTotpFactor, createUser, factoryAdmin, loginAs } from './utils/factories';
@@ -192,6 +193,97 @@ describe('auth: admin MFA (email OTP → TOTP enrollment, TOTP verification)', (
     }
     const blocked = await as(a.token, a.addr).post('/api/v1/auth/mfa/totp/verify').send({ code: '123456' }).expect(429);
     expect(blocked.body.error.code).toBe('RATE_LIMITED');
+  });
+
+  it('LOGIN_MFA is refused when the account email changed after the session signed in', async () => {
+    const admin = await createUser(t.prisma, { roles: ['PROGRAM_ADMIN'], password: PASSWORD });
+    const a = await login(admin.email);
+    const moved = `moved-${Date.now()}@example.test`;
+    // the address changes by any path after this sign-in (e.g. a change finished in another session)
+    await t.prisma.user.update({ where: { id: admin.id }, data: { email: moved, emailVerifiedAt: new Date() } });
+    const res = await as(a.token, a.addr).post('/api/v1/auth/mfa/email/send').expect(409);
+    expect(res.body.error.code).toBe('INVALID_STATE_TRANSITION');
+    expect(await t.prisma.emailChallenge.count({ where: { purpose: 'LOGIN_MFA' } })).toBe(0);
+    // a fresh sign-in (which needs the password for the current address) may bootstrap
+    const b = await login(moved);
+    await as(b.token, b.addr).post('/api/v1/auth/mfa/email/send').expect(200);
+  });
+
+  describe('per-account cap on authenticator codes (independent of the client IP)', () => {
+    const lockout = () => t.get(TotpLockoutService);
+    /** A 6-digit code outside the ±1-step window of `secret`. */
+    function wrongCode(secret: string, i: number): string {
+      const valid = new Set([-30_000, 0, 30_000].map((d) => totp(secret, Date.now() + d)));
+      for (let n = 100_000 + i * 7919; ; n++) {
+        const c = String(n % 1_000_000).padStart(6, '0');
+        if (!valid.has(c)) return c;
+      }
+    }
+    const emailsTo = async (to: string) =>
+      (await t.prisma.outboxMessage.findMany({ where: { topic: 'email.send' } })).filter((m) => (m.payload as { to?: string }).to === to);
+
+    it('10 wrong codes from 10 IPs lock TOTP for the account, revoke the session and notify the owner and Super Admins once', async () => {
+      const superAdmin = await factoryAdmin(t.prisma);
+      const admin = await createUser(t.prisma, { roles: ['PROGRAM_ADMIN'], password: PASSWORD });
+      const { secret } = await createTotpFactor(t, admin);
+      const a = await login(admin.email);
+      for (let i = 0; i < 9; i++) {
+        const r = await as(a.token).post('/api/v1/auth/mfa/totp/verify').send({ code: wrongCode(secret, i) });
+        expect(r.status, JSON.stringify(r.body)).toBe(400);
+      }
+      const locked = await as(a.token).post('/api/v1/auth/mfa/totp/verify').send({ code: wrongCode(secret, 9) }).expect(429);
+      expect(locked.body.error).toMatchObject({ code: 'RATE_LIMITED', details: { retryAfterSeconds: 900 } });
+      expect(Number(locked.headers['retry-after'])).toBe(900);
+      // the guessing session is signed out
+      expect(await sessionOf(a.token)).toMatchObject({ revokeReason: 'totp_locked' });
+      await as(a.token).get('/api/v1/auth/session').expect(401);
+
+      // even the right code, from a new sign-in on another IP, is refused while locked …
+      const b = await login(admin.email);
+      expect((await as(b.token).post('/api/v1/auth/mfa/totp/verify').send({ code: totp(secret) }).expect(429)).body.error.code).toBe(
+        'RATE_LIMITED',
+      );
+      // … and so is the authenticator reset of an already verified session
+      const verified = await loginAs(t, admin, { mfa: 'TOTP' });
+      await verified.withHeaders({ 'X-Forwarded-For': ip() }).post('/api/v1/users/me/mfa/totp/reset').send({ code: totp(secret) }).expect(429);
+      expect(await t.prisma.userMfaFactor.count({ where: { userId: admin.id, revokedAt: null } })).toBe(1);
+
+      const subject = (m: { payload: unknown }) => (m.payload as { data: { subject: string } }).data.subject;
+      expect((await emailsTo(admin.email)).map(subject)).toEqual(['Security alert: too many incorrect authenticator codes']);
+      expect((await emailsTo(superAdmin.email)).map(subject)).toEqual([
+        'Security notice: Authenticator verification locked on an admin account',
+      ]);
+      expect(JSON.stringify((await emailsTo(superAdmin.email))[0]!.payload)).not.toContain(admin.email);
+      expect(await t.prisma.auditLog.count({ where: { action: 'auth.mfa.totp_locked', resourceId: admin.id } })).toBe(1);
+
+      // when the lock ends, the next wrong code locks again at once (doubled) without a second notice
+      await t.get(RedisService).redis.del(`totp-lockout:v1:user:${admin.id}:block`);
+      const c = await login(admin.email);
+      const again = await as(c.token).post('/api/v1/auth/mfa/totp/verify').send({ code: wrongCode(secret, 10) }).expect(429);
+      expect(again.body.error.details.retryAfterSeconds).toBe(1800);
+      expect(await emailsTo(admin.email)).toHaveLength(1);
+      expect(await t.prisma.auditLog.count({ where: { action: 'auth.mfa.totp_locked', resourceId: admin.id } })).toBe(1);
+
+      // a correct code after the lock resets the counter
+      await t.get(RedisService).redis.del(`totp-lockout:v1:user:${admin.id}:block`);
+      const d = await login(admin.email);
+      await as(d.token).post('/api/v1/auth/mfa/totp/verify').send({ code: totp(secret) }).expect(200);
+      expect(await t.get(RedisService).redis.exists(`totp-lockout:v1:user:${admin.id}:n`)).toBe(0);
+    });
+
+    it('wrong enrollment confirmations count against the same per-account cap', async () => {
+      const admin = await createUser(t.prisma, { roles: ['FINANCE_REVIEWER'] });
+      const session = await loginAs(t, admin, { mfa: 'EMAIL_OTP' });
+      const { secret } = (await session.post('/api/v1/auth/mfa/totp/setup').expect(200)).body.data as { secret: string };
+      for (let i = 0; i < 9; i++) {
+        await session.withHeaders({ 'X-Forwarded-For': ip() }).post('/api/v1/auth/mfa/totp/confirm').send({ code: wrongCode(secret, i) }).expect(400);
+      }
+      await session.withHeaders({ 'X-Forwarded-For': ip() }).post('/api/v1/auth/mfa/totp/confirm').send({ code: wrongCode(secret, 9) }).expect(429);
+      await session.get('/api/v1/auth/session').expect(401);
+      expect(await t.prisma.userMfaFactor.count({ where: { userId: admin.id, confirmedAt: { not: null } } })).toBe(0);
+      expect(lockout().policy.threshold).toBe(10);
+      await lockout().reset(admin.id);
+    });
   });
 
   it('members cannot use the admin MFA endpoints', async () => {

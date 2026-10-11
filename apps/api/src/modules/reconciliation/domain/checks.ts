@@ -73,8 +73,9 @@ export const CHECKS: readonly CheckDefinition[] = [
     key: 'PLAN_PAYMENT_LOOKALIKE',
     label: 'Sales that resemble plan payments',
     description:
-      "Sales whose amount equals the subject member's own plan payment in the same program within ±2 days. A member's own plan payment must never earn rewards.",
-    remedy: 'Review the sale with the program admin. If it is the member’s own plan payment, reverse the sale.',
+      "Sales whose amount equals a plan payment of the credited member, or of a member of their downline, in any program with the sale's currency, recorded within ±2 days of the sale date or of when the sale was recorded. A member's own plan payment — or a recruit's — must never earn rewards.",
+    remedy:
+      'Review the sale with the program admin. If it is a plan payment, reverse the sale. If it is a genuine sale, resolving or dismissing its plan-payment flag on the Flags page clears it from this queue.',
     severity: 'review',
   },
 ];

@@ -14,13 +14,15 @@ import { RequestContext } from '../../common/context/request-context';
 import { CryptoService } from '../../common/crypto/crypto.service';
 import { buildOtpauthUri, generateTotpSecret, verifyTotp } from '../../common/crypto/totp';
 import { forbidden, invalidState, mfaRequired } from '../../common/errors/app-error';
-import { PrismaService, type Tx } from '../../common/prisma/prisma.service';
+import { PrismaService, type Db, type Tx } from '../../common/prisma/prisma.service';
 import { LoginThrottleService } from '../../common/throttle/login-throttle.service';
 import { AppConfig } from '../../config/app-config';
 import { otpInvalid, otpSendRefused, totpInvalid } from './auth-errors';
 import { AuthService, type SignedIn } from './auth.service';
+import { dayBucket } from './domain/otp-policy';
 import { OtpService } from './otp.service';
 import { SecurityNoticesService } from './security-notices.service';
+import { TotpLockoutService, totpLocked } from './totp-lockout.service';
 
 /** An unconfirmed authenticator must be confirmed within this window (else set it up again). */
 export const TOTP_SETUP_WINDOW_MS = 30 * 60_000;
@@ -32,7 +34,13 @@ export const TOTP_SETUP_WINDOW_MS = 30 * 60_000;
  *   factor confirmed + session elevated with TOTP (admin access);
  * - with a factor: TOTP code (replay-safe via `last_used_step`) → session elevated with TOTP.
  * Every elevation rotates the session token (SessionTokenService.elevateSession). Email OTP never
- * grants admin access by itself.
+ * grants admin access by itself, and it is refused when the account's email changed after this
+ * session was created (the mailbox that proves control must be the one the password sign-in had).
+ *
+ * Wrong TOTP codes count against the login backoff per (user, IP) and per IP AND against a per-account
+ * counter (TotpLockoutService): 10 consecutive failures pause TOTP verification for the account
+ * (15 min, doubling to 24 h), revoke the session that made them and notify the owner and every
+ * SUPER_ADMIN once.
  */
 @Injectable()
 export class MfaService {
@@ -46,6 +54,7 @@ export class MfaService {
     private readonly otp: OtpService,
     private readonly authService: AuthService,
     private readonly notices: SecurityNoticesService,
+    private readonly lockout: TotpLockoutService,
   ) {}
 
   private assertAdmin(auth: AuthContext): void {
@@ -65,6 +74,7 @@ export class MfaService {
     const now = new Date();
     return this.prisma.runInTransaction(async (tx) => {
       await this.otp.lock(tx, auth.email, 'LOGIN_MFA');
+      await this.assertEmailUnchangedSinceSignIn(tx, auth);
       const decision = await this.otp.sendDecision(tx, { email: auth.email, purpose: 'LOGIN_MFA', userId: auth.userId }, now);
       if (!decision.allowed) throw otpSendRefused(decision);
       const issued = await this.otp.issue(
@@ -85,6 +95,7 @@ export class MfaService {
     if (auth.mfaMethod) throw invalidState('This session is already verified. Continue with the authenticator setup');
     const now = new Date();
     const history = { email: auth.email, purpose: 'LOGIN_MFA' as const, userId: auth.userId };
+    await this.assertEmailUnchangedSinceSignIn(this.prisma, auth);
     if (await this.otp.isVerificationBlocked(this.prisma, history, now)) throw otpInvalid();
     // Only a code requested by THIS session can elevate it.
     const attempt = await this.otp.attempt({ purpose: 'LOGIN_MFA', email: auth.email, sessionId: auth.sessionId }, code, now);
@@ -93,8 +104,11 @@ export class MfaService {
       throw otpInvalid();
     }
     const session = await this.prisma.runInTransaction(async (tx) => {
-      if (!(await this.otp.consume(tx, attempt.challenge.id, now))) throw otpInvalid();
+      // Elevate first: it takes the users row FOR SHARE before the challenge row is locked — the same
+      // order (user, then challenges) as an email change, which invalidates this challenge.
       const elevated = await this.sessions.elevateSession(tx, auth.sessionId, 'EMAIL_OTP');
+      await this.assertEmailUnchangedSinceSignIn(tx, auth);
+      if (!(await this.otp.consume(tx, attempt.challenge.id, now))) throw otpInvalid();
       await this.audit.record(tx, {
         action: 'auth.mfa.email_verified',
         resourceType: 'session',
@@ -164,6 +178,7 @@ export class MfaService {
     const throttleKey = this.throttleKey(auth.userId);
     const ip = RequestContext.ip;
     this.loginThrottle.assertAllowed(await this.loginThrottle.check(throttleKey, ip));
+    await this.lockout.assertNotLocked(auth.userId);
 
     const factor = await this.prisma.userMfaFactor.findFirst({
       where: { userId: auth.userId, kind: 'TOTP', revokedAt: null, confirmedAt: null },
@@ -177,10 +192,7 @@ export class MfaService {
       lastUsedStep: factor.lastUsedStep,
       now: now.getTime(),
     });
-    if (!result.ok) {
-      await this.loginThrottle.recordFailure(throttleKey, ip);
-      throw totpInvalid();
-    }
+    if (!result.ok) return this.failTotp(auth, throttleKey, ip);
     const session = await this.prisma.runInTransaction(async (tx) => {
       const updated = await tx.userMfaFactor.updateMany({
         where: {
@@ -202,6 +214,7 @@ export class MfaService {
       return elevated;
     });
     await this.loginThrottle.reset(throttleKey, ip);
+    await this.lockout.reset(auth.userId);
     return this.signedIn(session);
   }
 
@@ -223,6 +236,7 @@ export class MfaService {
       return elevated;
     });
     await this.loginThrottle.reset(this.throttleKey(auth.userId), RequestContext.ip);
+    await this.lockout.reset(auth.userId);
     return this.signedIn(session);
   }
 
@@ -264,6 +278,7 @@ export class MfaService {
       });
     });
     await this.loginThrottle.reset(this.throttleKey(auth.userId), RequestContext.ip);
+    await this.lockout.reset(auth.userId);
   }
 
   // ─── helpers ───────────────────────────────────────────────────────────────
@@ -273,6 +288,7 @@ export class MfaService {
     const throttleKey = this.throttleKey(auth.userId);
     const ip = RequestContext.ip;
     this.loginThrottle.assertAllowed(await this.loginThrottle.check(throttleKey, ip));
+    await this.lockout.assertNotLocked(auth.userId);
     const factor = await this.prisma.userMfaFactor.findFirst({
       where: { userId: auth.userId, kind: 'TOTP', revokedAt: null, confirmedAt: { not: null } },
       select: { id: true, secretEnc: true, lastUsedStep: true },
@@ -284,11 +300,57 @@ export class MfaService {
       lastUsedStep: factor.lastUsedStep,
       now: now.getTime(),
     });
-    if (!result.ok) {
-      await this.loginThrottle.recordFailure(throttleKey, ip);
-      throw totpInvalid();
-    }
+    if (!result.ok) return this.failTotp(auth, throttleKey, ip);
     return { factorId: factor.id, step: result.step };
+  }
+
+  /**
+   * A wrong authenticator code: counts against the (user, IP)/IP backoff and the per-account
+   * lockout. Below the lockout threshold → 400 OTP_INVALID. Once locked (and on every further
+   * failure after a lock ends) → the calling session is revoked and 429 RATE_LIMITED; the first lock
+   * of an episode is audited and notifies the owner and every SUPER_ADMIN (de-duplicated per day).
+   */
+  private async failTotp(auth: AuthContext, throttleKey: string, ip: string | null | undefined): Promise<never> {
+    await this.loginThrottle.recordFailure(throttleKey, ip);
+    const result = await this.lockout.recordFailure(auth.userId);
+    if (result.lockedForSeconds === null) throw totpInvalid();
+    const now = new Date();
+    await this.prisma.runInTransaction(async (tx) => {
+      await this.sessions.revokeSession(tx, auth.sessionId, 'totp_locked');
+      if (!result.firstLock) return;
+      await this.audit.record(tx, {
+        action: 'auth.mfa.totp_locked',
+        resourceType: 'user',
+        resourceId: auth.userId,
+        after: { failures: result.failures, lockedForSeconds: result.lockedForSeconds },
+      });
+      await this.notices.totpLocked(tx, { id: auth.userId, email: auth.email, fullName: auth.fullName }, now);
+      await this.notices.notifySuperAdmins(tx, {
+        subjectUserId: auth.userId,
+        title: 'Authenticator verification locked on an admin account',
+        paragraphs: [
+          `Someone signed in to the admin account ${maskEmail(auth.email)} with its password and entered ${result.failures} incorrect authenticator codes in a row.`,
+          'Authenticator verification for that account is paused and the session was signed out. The password may be compromised: consider an admin-triggered password reset.',
+        ],
+        dedupeKey: `totp-locked:${auth.userId}:${dayBucket(now)}`,
+      });
+    });
+    throw totpLocked(result.lockedForSeconds);
+  }
+
+  /**
+   * LOGIN_MFA proves control of the mailbox the account had when this session signed in. Refused
+   * when the address was changed (or re-verified) after the session was created.
+   */
+  private async assertEmailUnchangedSinceSignIn(db: Db, auth: AuthContext): Promise<void> {
+    const row = await db.session.findUnique({
+      where: { id: auth.sessionId },
+      select: { createdAt: true, user: { select: { email: true, emailVerifiedAt: true } } },
+    });
+    const verifiedAt = row?.user.emailVerifiedAt;
+    if (!row || !verifiedAt || row.user.email !== auth.email || verifiedAt.getTime() > row.createdAt.getTime()) {
+      throw invalidState('The email address of this account changed after you signed in. Sign out and sign in again to get a code');
+    }
   }
 
   /** Replay protection: the step must be newer than the last accepted one (conditional UPDATE). */

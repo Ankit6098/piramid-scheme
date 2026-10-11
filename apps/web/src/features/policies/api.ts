@@ -28,6 +28,7 @@ import type {
 
 import { useCursorList } from '@/components/app/data-table';
 import { api } from '@/lib/api-client';
+import { queryKeys } from '@/lib/query-keys';
 
 import { policyKeys } from './query-keys';
 
@@ -108,6 +109,8 @@ export function useCreatePolicyDraft(programId: string) {
     onSuccess: (policy) => {
       queryClient.setQueryData(policyKeys.detail(policy.id), policy);
       void queryClient.invalidateQueries({ queryKey: policyKeys.all });
+      // The program's policy summary (draft count) and publish checks change too.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.program(programId) });
     },
   });
 }
@@ -121,11 +124,13 @@ export function useUpdatePolicyDraft(id: string) {
   return useMutation({
     mutationFn: (input: UpdatePolicyDraftInput) =>
       api.patch<PolicyVersionDto>(`/admin/policies/${seg(id)}`, input),
-    onSuccess: () => {
+    onSuccess: (policy) => {
       void queryClient.invalidateQueries({
         queryKey: policyKeys.all,
         predicate: (query) => query.queryKey[1] !== 'detail' || query.queryKey[2] !== id,
       });
+      // The program's policy summary shows draft names.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.program(policy.programId) });
     },
   });
 }
@@ -136,11 +141,18 @@ export function useDeletePolicyDraft(id: string) {
     mutationFn: () => api.delete<DeletedPolicyDto>(`/admin/policies/${seg(id)}`),
     // Awaited: when the caller moves the selection, the timeline no longer lists the deleted draft.
     // Queries of the deleted version itself are not refetched (they would only 404).
-    onSuccess: () =>
-      queryClient.invalidateQueries({
+    onSuccess: () => {
+      // The program's policy summary (draft count) changes too. Read the program from the cached
+      // version before the invalidation below can drop it; without it, refresh every program detail.
+      const programId = queryClient.getQueryData<PolicyVersionDto>(policyKeys.detail(id))?.programId;
+      void queryClient.invalidateQueries({
+        queryKey: programId ? queryKeys.admin.program(programId) : ['admin', 'program'],
+      });
+      return queryClient.invalidateQueries({
         queryKey: policyKeys.all,
         predicate: (query) => query.queryKey[2] !== id,
-      }),
+      });
+    },
   });
 }
 
@@ -170,6 +182,10 @@ export function usePublishPolicy(id: string) {
     onSuccess: (result) => {
       queryClient.setQueryData(policyKeys.detail(result.policy.id), result.policy);
       void queryClient.invalidateQueries({ queryKey: policyKeys.all });
+      // The program's publish checks ("a reward policy is published") and policy summary change too.
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.admin.program(result.policy.programId),
+      });
     },
   });
 }
@@ -186,6 +202,10 @@ export function useRetirePolicy(id: string) {
     onSuccess: (result) => {
       queryClient.setQueryData(policyKeys.detail(result.policy.id), result.policy);
       void queryClient.invalidateQueries({ queryKey: policyKeys.all });
+      // The program's publish checks ("a reward policy is published") and policy summary change too.
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.admin.program(result.policy.programId),
+      });
     },
   });
 }

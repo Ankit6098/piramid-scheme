@@ -94,6 +94,11 @@ and `APP_PUBLIC_URL=http://localhost:8080`, then run
 work on `http://localhost`. Stop the development Mailpit first, or set `MAILPIT_UI_PORT`,
 because both use port 8025.
 
+**End-to-end stack next to the development stack:** `docker-compose.e2e.yml` (an override of this
+file) reads `.env.e2e` instead of `.env`, publishes Mailpit on `127.0.0.1:8026`, pins the `edge`
+network to `10.231.80.0/24` and exempts only its gateway (the address host traffic arrives from)
+from nginx's rate limits — see the README ("Testing") for the commands.
+
 ### Images
 
 - `infra/docker/api.Dockerfile` (default target `runtime`):

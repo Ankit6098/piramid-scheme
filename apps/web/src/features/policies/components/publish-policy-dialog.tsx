@@ -96,6 +96,16 @@ export function PublishPolicyDialog({ open, onOpenChange, ...props }: PublishPol
   );
 }
 
+/**
+ * The publish may or may not have happened: no response (network), a server error, or the API
+ * still processing the same Idempotency-Key. A definitive 4xx answer is not undecided.
+ */
+function isUndecided(error: unknown): boolean {
+  if (!isApiError(error)) return true;
+  if (error.isNetworkError || error.status >= 500) return true;
+  return error.isConflict && (error.details as { retryable?: unknown } | undefined)?.retryable === true;
+}
+
 function defaultScheduleIso(openedAt: number): string {
   // Next full hour at least 30 minutes away.
   const hour = 3_600_000;
@@ -116,7 +126,10 @@ function PublishForm({
   const rewardFmt = rewardFormat(program, context.pointsLabel);
   const validate = useValidatePolicy(policy.id);
   const publish = usePublishPolicy(policy.id);
-  const [idempotencyKey, setIdempotencyKey] = useState(createIdempotencyKey);
+  // A publish that failed without a definitive answer (network error, 5xx, "still processing") is
+  // retried as the identical request — same effectiveFrom, same Idempotency-Key — so the API replays
+  // the first outcome instead of publishing twice. Any other attempt is a new request with a new key.
+  const [retry, setRetry] = useState<{ target: string; effectiveFrom: string; idempotencyKey: string } | null>(null);
   const [blockingIssues, setBlockingIssues] = useState<PolicyIssueDto[] | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -175,14 +188,27 @@ function PublishForm({
     setSubmitError(null);
     setBlockingIssues(null);
     setSubmitting(true);
-    const effectiveFrom = values.when === 'NOW' ? new Date().toISOString() : values.effectiveFrom;
+    const attemptTarget = values.when === 'NOW' ? 'NOW' : values.effectiveFrom;
+    const reuse = retry && retry.target === attemptTarget ? retry : null;
+    // "Now" is fixed at the first attempt: a retry must not change the payload under the same key.
+    const effectiveFrom =
+      reuse?.effectiveFrom ?? (values.when === 'NOW' ? new Date().toISOString() : values.effectiveFrom);
+    const idempotencyKey = reuse?.idempotencyKey ?? createIdempotencyKey();
+    let publishing = false;
     try {
-      const check = await validate.mutateAsync({ effectiveFrom });
-      if (check.issues.some((issue) => issue.severity === 'error')) {
-        setBlockingIssues(check.issues);
-        return;
+      // A retry skips the pre-check: the first attempt may already have published (the server
+      // re-validates inside the publish transaction anyway).
+      if (!reuse) {
+        const check = await validate.mutateAsync({ effectiveFrom });
+        if (check.issues.some((issue) => issue.severity === 'error')) {
+          setRetry(null);
+          setBlockingIssues(check.issues);
+          return;
+        }
       }
+      publishing = true;
       const result = await publish.mutateAsync({ effectiveFrom, idempotencyKey });
+      setRetry(null);
       const startsAt = result.policy.effectiveFrom ?? effectiveFrom;
       toast.success(
         values.when === 'SCHEDULE'
@@ -202,9 +228,7 @@ function PublishForm({
       onClose();
       onPublished(result);
     } catch (error) {
-      if (isApiError(error) && error.status >= 400 && error.status < 500) {
-        setIdempotencyKey(createIdempotencyKey());
-      }
+      setRetry(publishing && isUndecided(error) ? { target: attemptTarget, effectiveFrom, idempotencyKey } : null);
       if (isApiError(error) && error.code === ErrorCode.PolicyInvalid) {
         const fromServer = issuesFromErrorDetails(error.details);
         setBlockingIssues(

@@ -12,12 +12,12 @@ import type {
   UserStatus,
 } from '@app/shared';
 import { computeRequestHash } from '../../../common/idempotency/request-hash';
-import { checkEventAgainstPolicy, type CalcPolicy } from '../../rewards/domain/reward-calculator';
+import { checkBaseStorable, checkEventAgainstPolicy, type CalcPolicy, type CalcUnit } from '../../rewards/domain/reward-calculator';
+
+export { PLAN_PAYMENT_WINDOW_MS } from '../../rewards/domain/plan-payment';
 
 /** Sales may be dated at most this far in the future (clock skew; mirrors the DB check). */
 export const FUTURE_SALE_TOLERANCE_MS = 5 * 60_000;
-/** Plan payments recorded within ± this window with the same amount are treated as plan payments. */
-export const PLAN_PAYMENT_WINDOW_MS = 2 * 86_400_000;
 
 // ─── canonical request ───────────────────────────────────────────────────────
 
@@ -108,7 +108,8 @@ export type IntakeRejectionCode =
   | 'LATE_WINDOW_CLOSED'
   | 'MEMBER_NOT_ACTIVE'
   | 'NO_POLICY'
-  | 'POLICY_NOT_APPLICABLE';
+  | 'POLICY_NOT_APPLICABLE'
+  | 'AMOUNT_TOO_LARGE';
 
 export interface IntakeEvaluationInput {
   now: Date;
@@ -120,10 +121,17 @@ export interface IntakeEvaluationInput {
   /** Program status in force at `occurredAt` (from program_status_changes); null = none yet. */
   statusAtSale: ProgramStatus | null;
   subject: { status: UserStatus; emailVerified: boolean };
-  /** REFERENCE: external id = an enrollment payment reference; AMOUNT: same amount ±2 days of the subject's plan payment. */
+  /**
+   * REFERENCE: the external id is an enrollment payment reference (of any program — references are
+   * globally unique); AMOUNT: the subject's own plan payment of the same amount, in any program with
+   * the sale's currency, recorded within ±2 days of the sale date or of now (business rules §0.1).
+   * A downline member's matching payment is not a rejection (the sale is flagged for review instead).
+   */
   planPayment: 'REFERENCE' | 'AMOUNT' | null;
   /** Non-draft version whose range contains `occurredAt`. */
   policy: CalcPolicy | null;
+  /** Reward unit of the program and the policy's points rate (null without a policy). */
+  unit: CalcUnit | null;
 }
 
 export interface IntakeRejection {
@@ -153,7 +161,7 @@ export function evaluateIntake(i: IntakeEvaluationInput): IntakeRejection | null
   if (i.planPayment === 'AMOUNT') {
     return {
       code: 'PLAN_PAYMENT',
-      reason: "This looks like the member's own plan payment (same amount within 2 days). Plan payments never earn rewards",
+      reason: "This looks like the member's own plan payment (same amount, recorded within 2 days of the sale or of now). Plan payments never earn rewards",
     };
   }
   if (i.statusAtSale !== 'ACTIVE') {
@@ -173,6 +181,9 @@ export function evaluateIntake(i: IntakeEvaluationInput): IntakeRejection | null
   }
   const problem = checkEventAgainstPolicy({ type: i.type, amountMinor: i.amountMinor }, i.policy);
   if (problem) return { code: 'POLICY_NOT_APPLICABLE', reason: problem };
+  // POINTS: the converted base must fit a bigint, or the sale could never be processed.
+  const storage = i.unit ? checkBaseStorable(i.amountMinor, i.unit) : null;
+  if (storage) return { code: 'AMOUNT_TOO_LARGE', reason: storage };
   return null;
 }
 

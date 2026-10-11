@@ -3,7 +3,7 @@
 import { Hourglass, Info } from 'lucide-react';
 import { useId, useState } from 'react';
 import { toast } from 'sonner';
-import type { MemberProgramDetailDto, MemberProgramOptionDto } from '@app/shared';
+import { ErrorCode, type MemberProgramDetailDto, type MemberProgramOptionDto } from '@app/shared';
 
 import { Amount } from '@/components/app/amount';
 import { Button } from '@/components/ui/button';
@@ -21,6 +21,13 @@ import { getErrorMessage, isApiError } from '@/lib/api-client';
 import { enumLabel } from '@/lib/enum-labels';
 
 import { useEnroll } from '../../api';
+
+/** 409 CONFLICT sent when the accepted `termsVersion` is no longer current (`details.termsVersion`). */
+function termsChanged(error: unknown): boolean {
+  if (!isApiError(error) || error.code !== ErrorCode.Conflict) return false;
+  const details = error.details as { termsVersion?: unknown } | undefined;
+  return typeof details?.termsVersion === 'string';
+}
 
 /** Terms review + acceptance, then enrollment in one plan. Mount per open. */
 export function EnrollDialogContent({
@@ -51,11 +58,15 @@ export function EnrollDialogContent({
       }
       onDone();
     } catch (e) {
-      setError(
-        isApiError(e) && e.code === 'CONFLICT' && e.message.includes('terms')
-          ? 'The program terms were just updated. Close this dialog and review the latest terms.'
-          : getErrorMessage(e),
-      );
+      if (termsChanged(e)) {
+        // useEnroll refreshes the program on 409; the member must read and accept the new terms.
+        toast.error('The program terms were just updated', {
+          description: 'Review the latest terms, then enroll again.',
+        });
+        onDone();
+        return;
+      }
+      setError(getErrorMessage(e));
     }
   }
 

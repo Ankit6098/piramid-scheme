@@ -66,6 +66,9 @@ import { pluralize, programCurrencyFormat, programOptionLabel, programRewardForm
 
 // ─── Form schema ─────────────────────────────────────────────────────────────
 
+/** Sales may be dated at most this far ahead (mirrors the API and the DB check). */
+const FUTURE_SALE_TOLERANCE_MS = 5 * 60_000;
+
 /** `recordSaleSchema` with friendlier messages for empty fields (same output shape). */
 export const recordSaleFormSchema = recordSaleSchema.extend({
   programId: z.uuid({ error: 'Select a program' }),
@@ -75,7 +78,14 @@ export const recordSaleFormSchema = recordSaleSchema.extend({
     .min(1, 'Choose the member credited with the sale')
     .pipe(z.uuid({ error: 'Choose a member from the list' })),
   amountMinor: z.string().min(1, 'Enter the sale amount').pipe(positiveMinorAmountSchema),
-  occurredAt: z.string().min(1, 'Enter when the sale happened').pipe(isoDateTimeSchema),
+  occurredAt: z
+    .string()
+    .min(1, 'Enter when the sale happened')
+    .pipe(isoDateTimeSchema)
+    // Same tolerance as the API (5 minutes of clock skew); validated on submit, not during render.
+    .refine((value) => new Date(value).getTime() <= Date.now() + FUTURE_SALE_TOLERANCE_MS, {
+      message: 'The sale date cannot be in the future',
+    }),
 });
 
 export type RecordSaleFormInput = z.input<typeof recordSaleFormSchema>;

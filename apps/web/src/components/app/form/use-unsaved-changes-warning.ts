@@ -9,18 +9,23 @@ const DEFAULT_MESSAGE = 'You have unsaved changes. Leave this page and discard t
 
 /**
  * Warns before the user leaves a dirty form: browser reload/close (`beforeunload`) and in-app link
- * clicks (asks for confirmation). Stops warning after a successful submit.
+ * clicks (asks for confirmation). Paused while a submit handler runs.
+ *
+ * The guard follows `isDirty` only — not `isSubmitSuccessful`, which react-hook-form also sets when
+ * the submit handler catches a failed save. So on success the form must stop being dirty:
+ * `form.reset(savedValues)` (or remount it / pass `enabled: false`) before navigating away.
  *
  * @example
  *   const form = useForm(...);
  *   useUnsavedChangesWarning(form);
+ *   // on success: form.reset(toFormValues(saved));
  */
 export function useUnsavedChangesWarning<T extends FieldValues, TT = T>(
   form: { control: Control<T, AnyFormContext, TT> },
   options: { enabled?: boolean; message?: string } = {},
 ): boolean {
-  const { isDirty, isSubmitSuccessful, isSubmitting } = useFormState({ control: form.control });
-  const active = (options.enabled ?? true) && isDirty && !isSubmitSuccessful && !isSubmitting;
+  const { isDirty, isSubmitting } = useFormState({ control: form.control });
+  const active = (options.enabled ?? true) && isDirty && !isSubmitting;
   const message = options.message ?? DEFAULT_MESSAGE;
 
   useEffect(() => {

@@ -32,6 +32,9 @@ export interface IdempotentOptions {
  * the same request (method, route, params, query, body) gets the stored status + body back with
  * `Idempotent-Replayed: true`; the same key with a different request → 409 IDEMPOTENCY_CONFLICT;
  * while the first call is still running → 409 CONFLICT. Errors are not stored (the key is released).
+ * Once the handler has succeeded the key is never released: if storing the response fails, the
+ * handler's response is still returned and the key stays IN_PROGRESS (a retry gets 409 CONFLICT
+ * instead of running the handler a second time).
  */
 export const Idempotent = (options: IdempotentOptions = {}) => SetMetadata(IDEMPOTENT_KEY, options);
 
@@ -77,13 +80,15 @@ export class IdempotencyInterceptor implements NestInterceptor {
       return of(begun.body);
     }
     return next.handle().pipe(
-      mergeMap(async (body: unknown) => {
-        await this.idempotency.complete({ ...scope, status: res.statusCode, body });
-        return body;
-      }),
+      // Only handler errors release the key (nothing was committed, so a retry may run it again).
       catchError((err: unknown) =>
         from(this.idempotency.release(scope).catch(() => undefined)).pipe(mergeMap(() => throwError(() => err))),
       ),
+      // The handler succeeded (and committed): store the response best-effort, never fail the request.
+      mergeMap(async (body: unknown) => {
+        await this.idempotency.completeBestEffort({ ...scope, status: res.statusCode, body });
+        return body;
+      }),
     );
   }
 }

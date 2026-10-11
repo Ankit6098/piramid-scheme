@@ -20,6 +20,7 @@ import { LedgerService } from '../src/modules/ledger/ledger.service';
 import { NotificationsService } from '../src/modules/notifications/notifications.service';
 import { HierarchyService } from '../src/modules/referrals/hierarchy.service';
 import { ReferralsService } from '../src/modules/referrals/referrals.service';
+import { PlanPaymentLookalikeService } from '../src/modules/rewards/plan-payment-lookalike.service';
 import { RewardEngineService } from '../src/modules/rewards/reward-engine.service';
 
 export const DEMO_PROGRAM_CODE = 'demo-wellness';
@@ -69,6 +70,7 @@ export async function seedDemo(superAdminEmail: string): Promise<void> {
     ledger,
     notifications,
     audit,
+    new PlanPaymentLookalikeService(audit),
   );
   try {
     await prisma.$connect();

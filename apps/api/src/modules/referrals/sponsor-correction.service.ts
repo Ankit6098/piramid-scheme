@@ -12,9 +12,22 @@ import { AuditService } from '../../common/audit/audit.service';
 import type { AuthContext } from '../../common/auth/auth-context';
 import { AppError, forbidden, invalidState, notFound } from '../../common/errors/app-error';
 import { PrismaService, type Db } from '../../common/prisma/prisma.service';
+import { setLocalTimeouts } from '../../common/prisma/local-settings';
 import { lockReferralTreeExclusive, setReferralCorrectionId } from '../../common/prisma/referral-tree-lock';
 import { evaluateSponsorCorrection, type CorrectionFacts } from './domain/correction-rules';
 import { TeamRepository } from './team.repository';
+
+/** Interactive-transaction budget of one correction. */
+export const CORRECTION_TX_TIMEOUT_MS = 120_000;
+/** Per statement (incl. COMMIT, where the deferred closure checks run); below the tx budget. */
+export const CORRECTION_STATEMENT_TIMEOUT_MS = 110_000;
+/** Wait for the exclusive tree lock (in-flight registrations / sale processing finish quickly). */
+export const CORRECTION_LOCK_TIMEOUT_MS = 10_000;
+/**
+ * Most closure rows one correction may rewrite (moved members × (old ancestors + new sponsor
+ * chain)). Measured (PostgreSQL 17, fresh statistics): 18 k rows ≈ 3 s, 120 k rows ≈ 11 s end to end.
+ */
+export const CORRECTION_LIMITS = { maxClosureRows: 50_000 };
 
 interface LoadedCorrection {
   member: CorrectionMemberRef;
@@ -64,6 +77,12 @@ export class SponsorCorrectionService {
   async apply(auth: AuthContext, memberId: string, input: SponsorCorrectionInput): Promise<SponsorCorrectionResponse> {
     return this.prisma.runInTransaction(
       async (tx) => {
+        // 0. This transaction may legitimately run longer than the pool's session limits (15 s
+        //    statements, 5 s lock waits): raise them for this transaction only, below its own timeout.
+        await setLocalTimeouts(tx, {
+          statementTimeoutMs: CORRECTION_STATEMENT_TIMEOUT_MS,
+          lockTimeoutMs: CORRECTION_LOCK_TIMEOUT_MS,
+        });
         // 1. Exclusive tree lock FIRST: serializes against registrations and other corrections.
         await lockReferralTreeExclusive(tx);
 
@@ -72,6 +91,7 @@ export class SponsorCorrectionService {
         if (loaded.issues.length > 0) throw toCorrectionError(loaded.issues);
         const previousSponsorId = loaded.currentSponsor?.id ?? null;
         const affectedMembers = await this.repo.subtreeSize(tx, memberId);
+        await this.assertCorrectionSize(tx, memberId, input.newSponsorId, affectedMembers);
 
         // 3. The correction row, then its id as the transaction-local authorization for the rewrite.
         const correction = await tx.referralCorrection.create({
@@ -135,9 +155,28 @@ export class SponsorCorrectionService {
           createdAt: correction.createdAt.toISOString(),
         };
       },
-      // Deferred closure-consistency triggers run per moved row at COMMIT; large subtrees take time.
-      { timeout: 120_000, maxWait: 10_000 },
+      // The deferred closure-consistency check runs once per moved member at COMMIT.
+      { timeout: CORRECTION_TX_TIMEOUT_MS, maxWait: 10_000 },
     );
+  }
+
+  /**
+   * Size cap (docs/database.md "Referral tree"): the rewrite deletes and inserts
+   * members × (old ancestors + new sponsor chain) closure rows while the exclusive tree lock blocks
+   * every registration and sale calculation (they give up after 3 s with a retryable 503). Above
+   * CORRECTION_LIMITS.maxClosureRows the move is refused; it needs a planned maintenance window.
+   */
+  private async assertCorrectionSize(db: Db, memberId: string, newSponsorId: string, affectedMembers: number): Promise<void> {
+    const oldAncestors = await db.referralPath.count({ where: { descendantId: memberId, depth: { gt: 0 } } });
+    const newChain = await db.referralPath.count({ where: { descendantId: newSponsorId } });
+    const closureRows = affectedMembers * (oldAncestors + newChain);
+    const limit = CORRECTION_LIMITS.maxClosureRows;
+    if (closureRows > limit) {
+      throw invalidState(
+        `This move would rewrite ${closureRows.toLocaleString('en')} referral links (limit ${limit.toLocaleString('en')}). Large team moves need a planned maintenance window.`,
+        { reason: 'CORRECTION_TOO_LARGE', affectedMembers, closureRows, limit },
+      );
+    }
   }
 
   private async load(db: Db, performerId: string, memberId: string, newSponsorId: string): Promise<LoadedCorrection> {

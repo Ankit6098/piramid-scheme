@@ -38,4 +38,8 @@ export const financeKeys = {
   adminOverview: ['admin', 'overview'] as const,
   /** Sales events feature root (event detail shows reward states). */
   events: ['events'] as const,
+  /** Admin member detail (rewards, earnings, flags) — `queryKeys.admin.member(id)` and nested keys. */
+  adminMember: ['admin', 'member'] as const,
+  /** Audit log (finance decisions are audited) — `auditKeys.all`. */
+  adminAudit: ['admin', 'audit'] as const,
 };

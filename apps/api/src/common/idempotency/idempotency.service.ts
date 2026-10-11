@@ -41,8 +41,9 @@ export interface IdempotencyCompleteInput extends IdempotencyScope {
  *
  *   const r = await idem.begin({ actorUserId, key, route, requestHash });
  *   if (r.state === 'replay') return r.body;            // same key + same request → stored response
- *   try { const body = await doWork(); await idem.complete({ actorUserId, key, status: 200, body }); }
+ *   let body; try { body = await doWork(); }
  *   catch (e) { await idem.release({ actorUserId, key }); throw e; }   // failed work can be retried
+ *   await idem.completeBestEffort({ actorUserId, key, status: 200, body }); // never release after success
  *
  * - same key, different route or request hash → 409 IDEMPOTENCY_CONFLICT;
  * - same key while the first request is still running → 409 CONFLICT (`details.retryable`);
@@ -107,6 +108,29 @@ export class IdempotencyService {
     if (res.count !== 1) this.logger.warn({ key: input.key.slice(0, 8) }, 'Idempotency key vanished before completion');
   }
 
+  /**
+   * `complete()` after the work has committed: retried once, never throws. If the response cannot be
+   * stored the key stays IN_PROGRESS — a retry then gets 409 CONFLICT (and, after
+   * IDEMPOTENCY_STALE_IN_PROGRESS_MS, may take the key over) instead of re-running committed work
+   * right away. Returns whether the response was stored.
+   */
+  async completeBestEffort(input: IdempotencyCompleteInput, db: Db = this.prisma): Promise<boolean> {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await this.complete(input, db);
+        return true;
+      } catch (err) {
+        if (attempt === 2) {
+          this.logger.error(
+            { key: input.key.slice(0, 8), err: err instanceof Error ? err.message : String(err) },
+            'Could not store the idempotent response; the key stays IN_PROGRESS',
+          );
+        }
+      }
+    }
+    return false;
+  }
+
   /** Forgets an IN_PROGRESS key after a failed request, so the client may retry with the same key. */
   async release(input: IdempotencyScope, db: Db = this.prisma): Promise<void> {
     await db.idempotencyKey.deleteMany({ where: { actorUserId: input.actorUserId, key: input.key, status: 'IN_PROGRESS' } });
@@ -123,14 +147,16 @@ export class IdempotencyService {
   ): Promise<{ replayed: boolean; status: number; body: T | unknown }> {
     const begun = await this.begin(input);
     if (begun.state === 'replay') return { replayed: true, status: begun.status, body: begun.body };
+    let body: T;
     try {
-      const body = await fn();
-      await this.complete({ actorUserId: input.actorUserId, key: input.key, status, body });
-      return { replayed: false, status, body };
+      body = await fn();
     } catch (err) {
+      // Only a failed `fn` releases the key: its work did not happen, so it may be retried.
       await this.release(input).catch(() => undefined);
       throw err;
     }
+    await this.completeBestEffort({ actorUserId: input.actorUserId, key: input.key, status, body });
+    return { replayed: false, status, body };
   }
 
   /** Deletes expired keys; returns the count (scheduled hourly by the worker). */

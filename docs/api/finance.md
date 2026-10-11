@@ -32,10 +32,16 @@ boundaries as ISO date-times.
 
 `AdminRewardRowDto`: id, status, level, `amountMinor` + unit/currency/minor units, `program` (id, name,
 code, timezone), `recipient` (id, fullName), `event` (id, externalId, revision, type, source, status,
-`amountMinor`, currencyCode, occurredAt, `subject`, `recordedBy`), createdAt, decision fields
-(`approvedAt/By`, `postedAt`, `rejectedAt/By`, `rejectionReason`, `reversedAt/By`, `reversalReason`) and
-`viewer: { isRecipient, recordedSale }` — segregation-of-duties hints for the caller (the server enforces
-them regardless).
+`amountMinor`, currencyCode, occurredAt, `subject`, `recordedBy`, `planPaymentLookalike`), createdAt, decision
+fields (`approvedAt/By`, `postedAt`, `rejectedAt/By`, `rejectionReason`, `reversedAt/By`, `reversalReason`) and
+`viewer: { isRecipient, recordedSale, saleRewardRecipient }` — segregation-of-duties hints for the caller
+(`saleRewardRecipient`: the caller holds a live reward of this sale, so they may not reverse the sale; the
+server enforces all of them regardless).
+
+**Compliance review.** `event.planPaymentLookalike` is true when the sale has the amount of a plan payment by
+the credited member or a member of their downline (business rules §0.1) — now, or when it was processed (a
+`PLAN_PAYMENT_LOOKALIKE` flag exists for it). Such rewards are never auto-approved. The web shows a
+"Plan payment?" badge in the queue and a warning in the approve and bulk-approve dialogs.
 
 **Web deep links** (`/admin/rewards`): `?tab=` (or its alias `?status=`, used by the admin overview) selects the
 status tab (`PENDING_APPROVAL` default, `POSTED`, `REJECTED`, `REVERSED`, `ALL`); `?recipientUserId=<uuid>`
@@ -51,7 +57,10 @@ decision `AWARDED | NO_RULE | NO_ANCESTOR | INELIGIBLE_FORFEITED | BUDGET_EXHAUS
 depth, rule type / bps / fixed amount / cap, rule amount, final amount, `capped`, `budgetLimited`, remaining
 budget, reason, `isThisReward`; `ancestors[]` with eligibility at the sale date; `warnings[]`; `raw` JSON;
 `parsed = false` for unrecognised traces), `siblings` (other rewards of the sale), `ledgerTransactions`
-(with entries) and `auditTrail` (reward + sale audit entries, oldest first, ≤ 100).
+(with entries), `auditTrail` (reward + sale audit entries, oldest first, ≤ 100) and `compliance` (the sale's
+plan-payment review: `planPaymentLookalike`, reviewer `message`, matching payments with payer, relation
+`OWN`/`DOWNLINE`, depth, program and recording time, and the flag; same shape as
+`SaleEventDetailDto.compliance`, see [engine.md](engine.md)).
 
 ## Admin: decisions
 
@@ -66,6 +75,7 @@ request replays the stored response (`Idempotent-Replayed: true`); the same key 
 | POST | `/admin/rewards/:id/reverse` | rewards:reverse (scoped) | `{ reason }` (10–480 chars) | `{ id, status: 'REVERSED', ledgerTransaction: { id, type: 'REWARD_REVERSAL' } }` |
 | POST | `/admin/rewards/bulk-approve` | rewards:approve | `{ ids: uuid[] }` (1–100, unique) | `BulkApproveResultDto` `{ results: [{ id, ok: true, status, ledgerTransactionId } \| { id, ok: false, error: { code, message } }], approved, failed }` |
 | POST | `/admin/events/:id/reverse` | events:reverse (scoped) | `{ reason }` (10–480 chars) | `EventReversalResultDto` `{ eventId, status: 'REVERSED', reversedAt, rejectedRewardIds, reversedRewardIds }` |
+| POST | `/admin/events/:id/reject` | events:reverse (scoped) | `{ reason }` (10–480 chars) | `SaleEventDetailDto` — rejects a sale stuck in `RECEIVED` so it can be re-recorded ([engine.md](engine.md#sales-intake--events)) |
 
 **Approve** = approve + post in **one transaction**: lock the sale `FOR SHARE`, lock the reward `FOR
 UPDATE`, re-check status and segregation of duties, `PENDING_APPROVAL → APPROVED` (approvedBy = caller),
@@ -84,6 +94,14 @@ posting and sets `REVERSED` (reversedBy, reason); audit `reward.reverse`; notifi
 the batch and are reported per item with the same codes as the single endpoint (`NOT_FOUND`,
 `INVALID_STATE_TRANSITION`, `CONFLICT` for SoD, `FORBIDDEN` for program scope).
 
+**Idempotency after commit.** Once a decision has committed its response is returned even if storing it
+under the `Idempotency-Key` fails (one retry, best effort); the key then stays IN_PROGRESS, so a retry with
+the same key gets 409 `CONFLICT` (`retryable`) instead of running the decision again. Only a failed decision
+releases its key.
+
+**Notifications** of decisions read the platform settings (points label) through the decision's own
+transaction, so concurrent decisions never wait for a second pool connection.
+
 **Event reversal** (refund / chargeback; `PROCESSED` sales only), one transaction: `UPDATE` the sale to
 `REVERSED` first (row lock — approvals hold the sale `FOR SHARE`, so an approval either commits first and its
 reward is then reversed, or waits and fails with 409), then every reward of the sale: `PENDING_APPROVAL` /
@@ -91,7 +109,9 @@ reward is then reversed, or waits and fails with 409), then every reward of the 
 a compensating ledger transaction. Audits `event.reverse` plus one `reward.reject` / `reward.reverse` per
 reward; each affected member is notified. The DB refuses a commit that leaves live rewards. In the web app,
 a reversal from the sales events page (like one from the rewards queue) refreshes the sales, the approval queue
-and its counts, the ledger, reconciliation and the admin overview counters.
+and its counts, the ledger, reconciliation, the admin overview counters, the admin member detail and the audit
+log (every finance mutation does). "Reverse whole sale" is hidden for a viewer who holds a live reward of the
+sale (`viewer.saleRewardRecipient`; the API answers 409 `OWN_REWARD`).
 
 Errors (all decisions):
 
@@ -136,7 +156,7 @@ The report runs eight SQL checks (business rules §11) and is cached for ~60 s p
 | `REVERSED_EVENT_LIVE_REWARDS` | critical | reversed sale with PENDING/APPROVED/POSTED rewards |
 | `CALCULATION_TOTAL_MISMATCH` | critical | processed/reversed sale without a calculation, or calculation total ≠ Σ rewards |
 | `EVENT_STUCK_RECEIVED` | warning | sale in RECEIVED for more than 15 minutes |
-| `PLAN_PAYMENT_LOOKALIKE` | review | sale amount = the subject's own plan payment in the same program within ±2 days (compliance queue) |
+| `PLAN_PAYMENT_LOOKALIKE` | review | a sale (not rejected/reversed) whose amount equals a plan payment of the subject **or of a member of their downline**, in any program with the sale's currency, recorded within ±2 days of the sale date or of its recording (compliance queue; `details`: `relation` OWN/DOWNLINE, `payerUserId`, `depth`, `enrollmentId`, `paymentProgramId`, `paymentRecordedAt`, `matchingPayments`). Leaves the queue when the sale is reversed or its `PLAN_PAYMENT_LOOKALIKE` flag is resolved/dismissed |
 
 Response: `generatedAt`, `healthy` (no critical/warning exception — review items do not count),
 `totalExceptions`, `checks[]` (key, label, description, remedy, severity, count, passed), `exceptions[]`

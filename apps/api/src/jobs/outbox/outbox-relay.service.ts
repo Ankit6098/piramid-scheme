@@ -26,7 +26,11 @@ export interface RelayRunResult {
   sent: number;
   failed: number;
   dead: number;
+  /** Claims taken over by another relay (stale-lock reclaim) before this one finished: result discarded. */
+  lost: number;
 }
+
+type Outcome = 'sent' | 'failed' | 'dead' | 'lost';
 
 /** String leaves of a payload (≥ 6 chars) — redacted from error messages before they are stored. */
 function payloadStrings(payload: unknown, out: string[] = []): string[] {
@@ -59,6 +63,12 @@ export function outboxErrorMessage(err: unknown, payload: unknown): string {
  * FAILED with exponential backoff + jitter (`available_at`), or DEAD after `max_attempts`
  * (or on PermanentOutboxError / missing handler at the last attempt). The UPDATE that marks a row SENT
  * or DEAD also removes `codeCiphertext` (+ the handler's `scrubKeys`) from its payload.
+ *
+ * Claim ownership: the `attempts` value returned by the claim is the claim token. Right before a row
+ * is dispatched its `locked_at` is refreshed (rows queued behind slow ones in the same batch never
+ * look stale), and every later UPDATE of the row requires `status = PROCESSING AND attempts = token`.
+ * If another relay reclaimed the row after OUTBOX_STALE_LOCK_SECONDS, this relay's late result is
+ * discarded (`lost`) instead of overwriting the other relay's SENT with FAILED (and re-sending).
  */
 @Injectable()
 export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdown {
@@ -114,7 +124,7 @@ export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdow
   /** Claims and processes one batch. Public for tests and manual draining. */
   async runOnce(batchSize = OUTBOX_BATCH_SIZE): Promise<RelayRunResult> {
     const rows = await this.claim(batchSize);
-    const result: RelayRunResult = { claimed: rows.length, sent: 0, failed: 0, dead: 0 };
+    const result: RelayRunResult = { claimed: rows.length, sent: 0, failed: 0, dead: 0, lost: 0 };
     for (const row of rows) {
       const outcome = await RequestContext.run({ requestId: `outbox:${row.id}` }, () => this.process(row));
       result[outcome] += 1;
@@ -124,13 +134,14 @@ export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdow
 
   /** Processes until no due message is left (tests). */
   async drain(maxBatches = 20): Promise<RelayRunResult> {
-    const total: RelayRunResult = { claimed: 0, sent: 0, failed: 0, dead: 0 };
+    const total: RelayRunResult = { claimed: 0, sent: 0, failed: 0, dead: 0, lost: 0 };
     for (let i = 0; i < maxBatches; i++) {
       const r = await this.runOnce();
       total.claimed += r.claimed;
       total.sent += r.sent;
       total.failed += r.failed;
       total.dead += r.dead;
+      total.lost += r.lost;
       if (r.claimed === 0) break;
     }
     return total;
@@ -151,43 +162,64 @@ export class OutboxRelay implements OnApplicationBootstrap, OnApplicationShutdow
       RETURNING o."id", o."topic", o."payload", o."attempts", o."max_attempts" AS "maxAttempts", o."created_at" AS "createdAt"`;
   }
 
-  private async process(row: ClaimedRow): Promise<'sent' | 'failed' | 'dead'> {
+  private async process(row: ClaimedRow): Promise<Outcome> {
+    // Still ours? (A slow batch may have been reclaimed as stale by another relay.) Refresh the lock
+    // so the stale timeout counts from this row's dispatch, not from the batch claim.
+    if (!(await this.refreshClaim(row))) return this.lost(row, 'before dispatch');
     const registration = this.registry.get(row.topic);
     const message: OutboxMessageView = { ...row };
     try {
       if (!registration) throw new Error(`No outbox handler registered for topic "${row.topic}"`);
       await registration.handle(message as OutboxMessageView<never>);
-      await this.finish(row.id, 'SENT', null, registration.scrubKeys);
+      if (!(await this.finish(row, 'SENT', null, registration.scrubKeys))) return this.lost(row, 'after delivery');
       return 'sent';
     } catch (err) {
       const permanent = err instanceof PermanentOutboxError;
       const dead = permanent || row.attempts >= row.maxAttempts;
       const lastError = outboxErrorMessage(err, row.payload);
       if (dead) {
-        await this.finish(row.id, 'DEAD', lastError, registration?.scrubKeys);
+        if (!(await this.finish(row, 'DEAD', lastError, registration?.scrubKeys))) return this.lost(row, 'after a final failure');
         this.logger.error({ outboxId: row.id, topic: row.topic, attempts: row.attempts, error: lastError }, 'Outbox message is DEAD');
         return 'dead';
       }
       const delay = computeBackoffMs(row.attempts);
-      await this.prisma.outboxMessage.updateMany({
-        where: { id: row.id, status: 'PROCESSING' },
+      const { count } = await this.prisma.outboxMessage.updateMany({
+        where: { id: row.id, status: 'PROCESSING', attempts: row.attempts },
         data: { status: 'FAILED', lockedAt: null, lastError, availableAt: new Date(Date.now() + delay) },
       });
+      if (count === 0) return this.lost(row, 'after a failed delivery');
       this.logger.warn({ outboxId: row.id, topic: row.topic, attempts: row.attempts, retryInMs: delay, error: lastError }, 'Outbox delivery failed; will retry');
       return 'failed';
     }
   }
 
-  /** Marks a claimed row SENT/DEAD and scrubs secret payload keys in the same UPDATE. */
-  private async finish(id: string, status: 'SENT' | 'DEAD', lastError: string | null, extraKeys: readonly string[] = []): Promise<void> {
+  /** Renews `locked_at` of a row this relay still owns (claim token = attempts). */
+  private async refreshClaim(row: ClaimedRow): Promise<boolean> {
+    const n = await this.prisma.$executeRaw`
+      UPDATE "outbox_messages" SET "locked_at" = now()
+       WHERE "id" = ${row.id}::uuid AND "status" = 'PROCESSING' AND "attempts" = ${row.attempts}`;
+    return n === 1;
+  }
+
+  private lost(row: ClaimedRow, when: string): 'lost' {
+    this.logger.warn({ outboxId: row.id, topic: row.topic, attempts: row.attempts }, `Outbox claim taken over by another relay ${when}; result discarded`);
+    return 'lost';
+  }
+
+  /**
+   * Marks a row this relay still owns SENT/DEAD and scrubs secret payload keys in the same UPDATE.
+   * False when the claim was lost (another relay reclaimed the row).
+   */
+  private async finish(row: ClaimedRow, status: 'SENT' | 'DEAD', lastError: string | null, extraKeys: readonly string[] = []): Promise<boolean> {
     const keys = [...new Set([...OUTBOX_TERMINAL_SCRUB_KEYS, ...extraKeys])];
-    await this.prisma.$executeRaw`
+    const n = await this.prisma.$executeRaw`
       UPDATE "outbox_messages"
          SET "status" = ${status}::"OutboxStatus",
              "processed_at" = now(),
              "locked_at" = NULL,
              "last_error" = ${lastError},
              "payload" = "payload" - ARRAY[${Prisma.join(keys)}]::text[]
-       WHERE "id" = ${id}::uuid AND "status" = 'PROCESSING'`;
+       WHERE "id" = ${row.id}::uuid AND "status" = 'PROCESSING' AND "attempts" = ${row.attempts}`;
+    return n === 1;
   }
 }

@@ -57,7 +57,12 @@ export interface ChildCursor {
 
 // ─── SQL fragments (alias `u` = users) ──────────────────────────────────────
 
-/** Same coverage rule as EnrollmentsService.findEligibleEnrollments, evaluated at now(). */
+/**
+ * Same coverage rule as EnrollmentsService.findEligibleEnrollments, evaluated at now(). Lists
+ * evaluate it (and CHILD_COUNT) only for the rows of the page: they select the page in a
+ * MATERIALIZED CTE with its LIMIT first, so the planner probes program_enrollments(user_id, …) per
+ * row instead of hashing the whole enrollments table for every page.
+ */
 const ELIGIBLE_NOW = Prisma.sql`EXISTS (
   SELECT 1 FROM "program_enrollments" e
   WHERE e."user_id" = u."id"
@@ -115,17 +120,21 @@ export class TeamRepository {
   async childrenOfMany(db: Db, parentIds: readonly string[], perParent: number): Promise<ChildNodeRow[]> {
     if (parentIds.length === 0) return [];
     return db.$queryRaw<ChildNodeRow[]>`
-      SELECT par."id" AS "parentId", c."attributed_at" AS "attributedAt", ${NODE_COLUMNS}
-      FROM unnest(${[...parentIds]}::uuid[]) AS par("id")
-      CROSS JOIN LATERAL (
-        SELECT r."child_user_id", r."attributed_at"
-        FROM "referral_relationships" r
-        WHERE r."sponsor_user_id" = par."id"
-        ORDER BY r."attributed_at" ASC, r."child_user_id" ASC
-        LIMIT ${perParent + 1}
-      ) c
-      JOIN "users" u ON u."id" = c."child_user_id"
-      ORDER BY par."id", c."attributed_at" ASC, c."child_user_id" ASC`;
+      WITH page AS MATERIALIZED (
+        SELECT par."id" AS "parent_id", c."child_user_id", c."attributed_at"
+        FROM unnest(${[...parentIds]}::uuid[]) AS par("id")
+        CROSS JOIN LATERAL (
+          SELECT r."child_user_id", r."attributed_at"
+          FROM "referral_relationships" r
+          WHERE r."sponsor_user_id" = par."id"
+          ORDER BY r."attributed_at" ASC, r."child_user_id" ASC
+          LIMIT ${perParent + 1}
+        ) c
+      )
+      SELECT page."parent_id" AS "parentId", page."attributed_at" AS "attributedAt", ${NODE_COLUMNS}
+      FROM page
+      JOIN "users" u ON u."id" = page."child_user_id"
+      ORDER BY page."parent_id", page."attributed_at" ASC, page."child_user_id" ASC`;
   }
 
   /** One page of a parent's children after `after` (keyset), oldest first; fetches `limit + 1`. */
@@ -134,12 +143,17 @@ export class TeamRepository {
       ? Prisma.sql`AND (r."attributed_at", r."child_user_id") > (${after.attributedAt}::timestamptz, ${after.id}::uuid)`
       : Prisma.empty;
     return db.$queryRaw<ChildNodeRow[]>`
-      SELECT r."sponsor_user_id" AS "parentId", r."attributed_at" AS "attributedAt", ${NODE_COLUMNS}
-      FROM "referral_relationships" r
-      JOIN "users" u ON u."id" = r."child_user_id"
-      WHERE r."sponsor_user_id" = ${parentId}::uuid ${keyset}
-      ORDER BY r."attributed_at" ASC, r."child_user_id" ASC
-      LIMIT ${limit + 1}`;
+      WITH page AS MATERIALIZED (
+        SELECT r."sponsor_user_id", r."child_user_id", r."attributed_at"
+        FROM "referral_relationships" r
+        WHERE r."sponsor_user_id" = ${parentId}::uuid ${keyset}
+        ORDER BY r."attributed_at" ASC, r."child_user_id" ASC
+        LIMIT ${limit + 1}
+      )
+      SELECT page."sponsor_user_id" AS "parentId", page."attributed_at" AS "attributedAt", ${NODE_COLUMNS}
+      FROM page
+      JOIN "users" u ON u."id" = page."child_user_id"
+      ORDER BY page."attributed_at" ASC, page."child_user_id" ASC`;
   }
 
   /** Direct referrals of a sponsor, newest attribution first (keyset), optionally by status bucket. */
@@ -158,12 +172,18 @@ export class TeamRepository {
       ? Prisma.sql`AND (r."attributed_at", r."child_user_id") < (${opts.before.attributedAt}::timestamptz, ${opts.before.id}::uuid)`
       : Prisma.empty;
     return db.$queryRaw<ChildNodeRow[]>`
-      SELECT r."sponsor_user_id" AS "parentId", r."attributed_at" AS "attributedAt", ${NODE_COLUMNS}
-      FROM "referral_relationships" r
-      JOIN "users" u ON u."id" = r."child_user_id"
-      WHERE r."sponsor_user_id" = ${sponsorId}::uuid ${statusFilter} ${keyset}
-      ORDER BY r."attributed_at" DESC, r."child_user_id" DESC
-      LIMIT ${opts.limit + 1}`;
+      WITH page AS MATERIALIZED (
+        SELECT r."sponsor_user_id", r."child_user_id", r."attributed_at"
+        FROM "referral_relationships" r
+        JOIN "users" u ON u."id" = r."child_user_id"
+        WHERE r."sponsor_user_id" = ${sponsorId}::uuid ${statusFilter} ${keyset}
+        ORDER BY r."attributed_at" DESC, r."child_user_id" DESC
+        LIMIT ${opts.limit + 1}
+      )
+      SELECT page."sponsor_user_id" AS "parentId", page."attributed_at" AS "attributedAt", ${NODE_COLUMNS}
+      FROM page
+      JOIN "users" u ON u."id" = page."child_user_id"
+      ORDER BY page."attributed_at" DESC, page."child_user_id" DESC`;
   }
 
   /** Per-depth counts of the subtree below `ancestorId` (depth ≥ 1, ≤ maxDepth unless null). */

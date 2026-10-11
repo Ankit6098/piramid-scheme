@@ -88,13 +88,19 @@ const OTP_COPY: Record<ChallengePurpose, { subject: string; intro: string; outro
   },
 };
 
+/**
+ * EMAIL_VERIFICATION codes are sent before any account exists: the only name available is what the
+ * registrant typed for this address, so they never greet by name (no attacker-chosen text in mail
+ * that an unrelated mailbox owner receives).
+ */
 export function renderOtpEmail(data: OtpEmailData, ctx: TemplateContext): RenderedEmail {
   const copy = OTP_COPY[data.purpose];
+  const name = data.purpose === 'EMAIL_VERIFICATION' ? undefined : data.name;
   const validity = `The code expires in ${data.expiresInMinutes} minutes and can be used once. Never share it with anyone.`;
   return {
     subject: `${copy.subject} — ${ctx.appName}`,
-    text: text([greeting(data.name), copy.intro, data.code, validity, copy.outro], ctx),
-    html: layout(ctx, [greeting(data.name), copy.intro, { code: data.code }, validity, copy.outro]),
+    text: text([greeting(name), copy.intro, data.code, validity, copy.outro], ctx),
+    html: layout(ctx, [greeting(name), copy.intro, { code: data.code }, validity, copy.outro]),
   };
 }
 

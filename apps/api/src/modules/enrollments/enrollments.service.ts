@@ -29,6 +29,7 @@ import {
   type Db,
   type Tx,
 } from '../../common';
+import { keysetWhere } from '../../common/pagination/keyset';
 import { AppConfig } from '../../config/app-config';
 import type { EnrollmentStatus as DbEnrollmentStatus, Prisma } from '../../generated/prisma/client';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -61,9 +62,7 @@ function statusList(status: EnrollmentStatus | EnrollmentStatus[] | undefined): 
 
 function cursorWhere(cursor: { createdAt: string; id: string } | undefined): Prisma.ProgramEnrollmentWhereInput {
   if (!cursor) return {};
-  return {
-    OR: [{ createdAt: { lt: new Date(cursor.createdAt) } }, { createdAt: new Date(cursor.createdAt), id: { lt: cursor.id } }],
-  };
+  return keysetWhere<Prisma.ProgramEnrollmentWhereInput>('createdAt', new Date(cursor.createdAt), cursor.id, 'desc');
 }
 
 /**

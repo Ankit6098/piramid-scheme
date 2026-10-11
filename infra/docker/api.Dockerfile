@@ -82,6 +82,18 @@ RUN rm -rf dist src test prisma prisma.config.ts nest-cli.json tsconfig*.json vi
     fi \
  && test -f node_modules/prisma/build/index.js \
  && node -e "require('argon2'); require('@app/shared'); require.resolve('@prisma/adapter-pg')"
+
+# Schema engine for `prisma migrate deploy`. The runtime user cannot write to node_modules, so the
+# binary for the runtime platform (bookworm-slim + openssl 3 = debian-openssl-3.0.x) must already be
+# in the image. `pnpm deploy` may restore @prisma/engines from the store's side-effects cache with
+# an engine fetched for another platform (seen: debian-openssl-1.1.x, which made migrate try to
+# download at run time and fail with "Can't write to …/@prisma/engines"). Re-run the engines
+# postinstall here (openssl 3 is installed, so detection is correct), drop other platforms' engines
+# and verify the expected one exists.
+RUN engines_dir="$(node -p "require('path').dirname(require.resolve('@prisma/engines/package.json',{paths:[require('fs').realpathSync('node_modules/prisma')]}))")" \
+ && (cd "$engines_dir" && node scripts/postinstall.js) \
+ && find "$engines_dir" -maxdepth 1 -type f -name 'schema-engine-*' ! -name 'schema-engine-debian-openssl-3.0.x' -delete \
+ && test -x "$engines_dir/schema-engine-debian-openssl-3.0.x"
 WORKDIR /repo
 
 # ─── tools: full workspace incl. dev dependencies (seed, prisma status, scripts) ─

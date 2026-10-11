@@ -42,14 +42,18 @@ export const currentPasswordSchema = z
   .min(1, 'Enter your password')
   .max(256, 'Password is too long');
 
-/** Display name: 2–120 characters, no control characters. */
+/**
+ * Display name: 2–120 characters, no control characters, no web addresses (names end up in emails
+ * and in other members' team views, so they must not carry links).
+ */
 export const fullNameSchema = z
   .string()
   .trim()
   .min(2, 'Enter your full name')
   .max(120, 'Use at most 120 characters')
   // eslint-disable-next-line no-control-regex
-  .regex(/^[^\u0000-\u001f\u007f]+$/, 'Remove special control characters');
+  .regex(/^[^\u0000-\u001f\u007f]+$/, 'Remove special control characters')
+  .refine((v) => !/:\/\/|www\./i.test(v), 'A name cannot contain a web address');
 
 /** 6-digit one-time code (email OTP or authenticator app). Spaces are ignored. */
 export const otpCodeSchema = z

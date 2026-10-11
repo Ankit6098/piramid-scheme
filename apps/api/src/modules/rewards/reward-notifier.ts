@@ -37,7 +37,9 @@ export class RewardNotifier {
       where: { id: input.programId },
       select: { name: true, currencyMinorUnits: true },
     });
-    const { pointsLabel } = await this.settings.get();
+    // Read through the caller's transaction: a cold-cache read on the pool from inside a decision
+    // transaction needs a second connection and deadlocks the pool under concurrent decisions.
+    const { pointsLabel } = await this.settings.get(tx);
     const amount = formatAmount(
       input.amountMinor,
       toRecordAmountFormat(

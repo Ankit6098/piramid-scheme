@@ -32,7 +32,13 @@ export interface AppConfigShape {
     /** Value passed to express `trust proxy` (false = ignore X-Forwarded-*). */
     readonly trustProxy: boolean | number | string;
   };
-  readonly database: { readonly url: string; readonly poolMax: number };
+  readonly database: {
+    readonly url: string;
+    readonly poolMax: number;
+    readonly connectTimeoutMs: number;
+    readonly statementTimeoutMs: number;
+    readonly lockTimeoutMs: number;
+  };
   readonly redis: { readonly url: string };
   readonly security: {
     readonly otpPepper: string;
@@ -144,7 +150,13 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfigS
       corsOrigins: [...corsOrigins],
       trustProxy: e.TRUST_PROXY,
     },
-    database: { url: e.DATABASE_URL, poolMax: e.DATABASE_POOL_MAX },
+    database: {
+      url: e.DATABASE_URL,
+      poolMax: e.DATABASE_POOL_MAX,
+      connectTimeoutMs: e.DATABASE_CONNECT_TIMEOUT_MS,
+      statementTimeoutMs: e.DATABASE_STATEMENT_TIMEOUT_MS,
+      lockTimeoutMs: e.DATABASE_LOCK_TIMEOUT_MS,
+    },
     redis: { url: e.REDIS_URL },
     security: {
       otpPepper: e.OTP_PEPPER,

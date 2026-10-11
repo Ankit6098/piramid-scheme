@@ -76,6 +76,23 @@ describe('normalizeError (exception → public error mapping)', () => {
     expect(normalizeError(exclusion)).toMatchObject({ status: 409, code: 'INVARIANT_VIOLATION', details: { constraint: 'ex_policy_versions_no_overlap' } });
   });
 
+  it('maps bounded waits (lock_timeout 55P03, statement_timeout 57014, P2028, pool timeout) → 503 retryable', () => {
+    const lock = adapterError('P2010', { kind: 'postgres', code: '55P03', originalCode: '55P03', originalMessage: 'canceling statement due to lock timeout' });
+    expect(normalizeError(lock)).toMatchObject({ status: 503, code: 'SERVICE_UNAVAILABLE', details: { retryable: true }, unexpected: false });
+    const stmt = Object.assign(new Error('x'), {
+      name: 'DriverAdapterError',
+      cause: { kind: 'postgres', originalCode: '57014', originalMessage: 'canceling statement due to statement timeout' },
+    });
+    expect(normalizeError(stmt)).toMatchObject({ status: 503, code: 'SERVICE_UNAVAILABLE', details: { retryable: true } });
+    expect(normalizeError(prismaError('P2028'))).toMatchObject({ status: 503, code: 'SERVICE_UNAVAILABLE', details: { retryable: true } });
+    const pgLock = Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03', severity: 'ERROR' });
+    expect(normalizeError(pgLock)).toMatchObject({ status: 503, details: { retryable: true } });
+    const poolTimeout = new Prisma.PrismaClientUnknownRequestError('Invalid invocation: timeout exceeded when trying to connect', { clientVersion: '7.10.0' });
+    expect(normalizeError(poolTimeout)).toMatchObject({ status: 503, code: 'SERVICE_UNAVAILABLE', details: { retryable: true } });
+    // pg-pool itself rejects with a plain Error when no pooled connection frees up in time.
+    expect(normalizeError(new Error('timeout exceeded when trying to connect'))).toMatchObject({ status: 503, details: { retryable: true } });
+  });
+
   it('keeps foreign-key violations (P2003 / 23503) as 409 CONFLICT', () => {
     const fk = adapterError('P2003', { kind: 'ForeignKeyConstraintViolation', originalCode: '23503', constraint: { index: 'fk_x' } });
     expect(normalizeError(fk)).toMatchObject({ status: 409, code: 'CONFLICT' });
@@ -164,5 +181,32 @@ describe('AllExceptionsFilter', () => {
     new AllExceptionsFilter().catch(new ThrottlerException(), h as never);
     expect(res.statusCode).toBe(429);
     expect(res.headers['retry-after']).toBe('60');
+  });
+
+  it('exposes the throttler guard wait as details.retryAfterSeconds (default throttler)', () => {
+    const { res, h } = host();
+    res.headers['retry-after'] = '17';
+    new AllExceptionsFilter().catch(new ThrottlerException(), h as never);
+    expect(res.statusCode).toBe(429);
+    expect(res.headers['retry-after']).toBe('17');
+    expect((res.body as { error: { details?: unknown } }).error.details).toEqual({ retryAfterSeconds: 17 });
+  });
+
+  it('uses a named throttler header (Retry-After-auth) for details and Retry-After', () => {
+    const { res, h } = host();
+    res.headers['retry-after-auth'] = '42';
+    new AllExceptionsFilter().catch(new ThrottlerException(), h as never);
+    expect(res.headers['retry-after']).toBe('42');
+    expect((res.body as { error: { code: string; details?: unknown } }).error).toMatchObject({
+      code: 'RATE_LIMITED',
+      details: { retryAfterSeconds: 42 },
+    });
+  });
+
+  it('keeps AppError retryAfterSeconds details and sends them as Retry-After', () => {
+    const { res, h } = host();
+    new AllExceptionsFilter().catch(new AppError('RATE_LIMITED', 'Slow down', 429, { retryAfterSeconds: 90 }), h as never);
+    expect(res.headers['retry-after']).toBe('90');
+    expect((res.body as { error: { details?: unknown } }).error.details).toEqual({ retryAfterSeconds: 90 });
   });
 });

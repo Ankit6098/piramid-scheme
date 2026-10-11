@@ -13,8 +13,10 @@ import type { AuthContext } from '../../common/auth/auth-context';
 import { assertProgramAccess, canAccessProgram, programScopeFilter } from '../../common/auth/program-access';
 import { notFound } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
+import { keysetWhere } from '../../common/pagination/keyset';
 import { PrismaService, type Db } from '../../common/prisma/prisma.service';
 import type { Prisma } from '../../generated/prisma/client';
+import { PlanPaymentLookalikeService } from '../rewards/plan-payment-lookalike.service';
 import {
   saleEventDetailInclude,
   saleEventInclude,
@@ -36,7 +38,10 @@ const FINISHED_STATUSES = new Set(['COMPLETED', 'ARCHIVED']);
 /** Admin read side of sales events (business rules §8, §10: admin-only details). */
 @Injectable()
 export class EventsQueryService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly lookalike: PlanPaymentLookalikeService,
+  ) {}
 
   /** Programs visible to the caller, for filters and the "Record sale" form. */
   async programOptions(auth: AuthContext): Promise<SaleProgramOptionDto[]> {
@@ -84,7 +89,7 @@ export class EventsQueryService {
     if (q.q) and.push({ OR: [{ externalId: q.q }, { customerReference: q.q }] });
     if (cursor) {
       const c = new Date(cursor.c);
-      and.push({ OR: [{ createdAt: { lt: c } }, { createdAt: c, id: { lt: cursor.id } }] });
+      and.push(keysetWhere<Prisma.QualifyingEventWhereInput>('createdAt', c, cursor.id, 'desc'));
     }
     const rows = await this.prisma.qualifyingEvent.findMany({
       where: { AND: and },
@@ -101,14 +106,14 @@ export class EventsQueryService {
     );
   }
 
-  /** Admin detail (calculation trace + rewards). Pass `auth` to enforce program scope. */
+  /** Admin detail (calculation trace + rewards + compliance review). Pass `auth` to enforce program scope. */
   async getDetail(auth: AuthContext | null, id: string): Promise<SaleEventDetailDto> {
     const row = await this.prisma.qualifyingEvent.findUnique({ where: { id }, include: saleEventDetailInclude });
     if (!row) throw notFound('Sale event');
     if (auth) assertProgramAccess(auth, row.programId, 'read');
 
     const ancestorIds = row.calculation ? parseTrace(row.calculation.trace).ancestors.map((a) => a.userId) : [];
-    const [users, revisions] = await Promise.all([
+    const [users, revisions, compliance] = await Promise.all([
       ancestorIds.length
         ? this.prisma.user.findMany({ where: { id: { in: ancestorIds } }, select: { id: true, fullName: true } })
         : Promise.resolve([]),
@@ -117,8 +122,10 @@ export class EventsQueryService {
         select: { id: true, revision: true, status: true, createdAt: true, programId: true },
         orderBy: { revision: 'asc' },
       }),
+      this.lookalike.compliance(this.prisma, row),
     ]);
     return toSaleEventDetailDto(row, {
+      compliance,
       names: new Map(users.map((u) => [u.id, u.fullName])),
       revisions: revisions
         .filter((r) => r.programId === row.programId || !auth || canAccessProgram(auth, r.programId, 'read'))

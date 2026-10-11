@@ -6,6 +6,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { AdminEventReversalController } from './admin-event-reversal.controller';
 import { AdminRewardsController } from './admin-rewards.controller';
 import { EventReversalService } from './event-reversal.service';
+import { PlanPaymentLookalikeService } from './plan-payment-lookalike.service';
 import { RewardDecisionsService } from './reward-decisions.service';
 import { RewardEngineService } from './reward-engine.service';
 import { RewardNotifier } from './reward-notifier';
@@ -24,7 +25,8 @@ import { RewardsQueryService } from './rewards-query.service';
     EventReversalService,
     RewardsExportService,
     RewardNotifier,
+    PlanPaymentLookalikeService,
   ],
-  exports: [RewardEngineService, RewardsQueryService, RewardDecisionsService, EventReversalService],
+  exports: [RewardEngineService, RewardsQueryService, RewardDecisionsService, EventReversalService, PlanPaymentLookalikeService],
 })
 export class RewardsModule {}

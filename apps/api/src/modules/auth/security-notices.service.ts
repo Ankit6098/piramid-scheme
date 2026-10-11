@@ -77,6 +77,37 @@ export class SecurityNoticesService {
     });
   }
 
+  /**
+   * Too many wrong authenticator codes for this (admin) account: TOTP verification is paused. Email +
+   * in-app, once per day — whoever entered them knew the password.
+   */
+  async totpLocked(tx: Db, user: { id: string; email: string; fullName: string }, now: Date): Promise<void> {
+    await this.outbox.enqueue(tx, {
+      topic: 'email.send',
+      payload: {
+        to: user.email,
+        template: 'generic',
+        data: {
+          subject: 'Security alert: too many incorrect authenticator codes',
+          paragraphs: [
+            `Hello ${user.fullName},`,
+            'Someone signed in to your account with your password and then entered too many incorrect authenticator codes.',
+            'For your protection, authenticator verification for your account is paused for a while and that session was signed out. Super Admins have been notified.',
+            "If this wasn't you, your password is known to someone else: ask a Super Admin to send you a password reset.",
+          ],
+        },
+      },
+      dedupeKey: `totp-locked:${user.id}:${dayBucket(now)}`,
+    });
+    await this.notifications.notify(tx, {
+      userId: user.id,
+      type: 'security.totp_locked',
+      title: 'Authenticator verification paused',
+      body: 'Too many incorrect authenticator codes were entered for your account. Verification is paused for a while.',
+      dedupeKey: `totp-locked:${user.id}:${dayBucket(now)}`,
+    });
+  }
+
   /** Someone tried to move another account onto this (taken) address. */
   async emailChangeTargetTaken(tx: Db, input: { to: string; name?: string | null }, now: Date): Promise<void> {
     await this.outbox.enqueue(tx, {

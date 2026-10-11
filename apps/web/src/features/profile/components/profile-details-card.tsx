@@ -76,7 +76,7 @@ export function ProfileDetailsCard({ profile }: { profile: ProfileDto }) {
     update.mutate(body, {
       onSuccess: () => toast.success('Profile saved'),
       onError: (error) => {
-        if (!applyApiFieldErrors(error, form.setError))
+        if (!applyApiFieldErrors(error, form))
           toast.error("Couldn't save your profile", { description: getErrorMessage(error) });
       },
     });

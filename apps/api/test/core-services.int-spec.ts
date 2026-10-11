@@ -120,6 +120,33 @@ describe('core services (outbox relay, OTP delivery, notifications, audit, setti
       expect(full.Text).toContain('Hi Ada Lovelace');
     });
 
+    it('a verification code email never greets with the unverified registration name', async () => {
+      const email = `pending-${Date.now()}@example.test`;
+      const code = String(100000 + Math.floor(Math.random() * 899999));
+      const crypto = t.get(CryptoService);
+      await t.prisma.runInTransaction(async (tx) => {
+        const ch = await tx.emailChallenge.create({
+          data: {
+            email,
+            purpose: 'EMAIL_VERIFICATION',
+            codeHash: crypto.otpCodeHash('EMAIL_VERIFICATION', email, code),
+            expiresAt: new Date(Date.now() + 10 * 60_000),
+            pendingFullName: 'Visit https://evil.example now',
+            pendingPasswordHash: 'x',
+          },
+        });
+        await t.get(OtpMailer).enqueue(tx, { challengeId: ch.id, code, email, purpose: 'EMAIL_VERIFICATION' });
+      });
+      expect((await t.get(OutboxRelay).runOnce()).sent).toBe(1);
+      const found = await mailpitSearch(email);
+      expect(found).toHaveLength(1);
+      const full = (await (await fetch(`${MAILPIT}/api/v1/message/${found[0]!.ID}`)).json()) as { Text: string; HTML: string };
+      expect(full.Text).toContain(code);
+      expect(full.Text).not.toContain('evil.example');
+      expect(full.HTML).not.toContain('evil.example');
+      expect(full.Text.startsWith('Hi,')).toBe(true);
+    });
+
     it('skips (SENT, scrubbed, no email) when the challenge is consumed, invalidated, expired or re-issued', async () => {
       const handler = t.get(OtpEmailOutboxHandler);
       const cases: Array<[string, (challengeId: string) => Promise<unknown>]> = [

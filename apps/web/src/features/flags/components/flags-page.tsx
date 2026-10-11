@@ -29,6 +29,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet';
 import { routes } from '@/config/routes';
+import { useSession } from '@/hooks/use-session';
 import { enumLabel } from '@/lib/enum-labels';
 
 import { useFlags, useResolveFlag, type FlagFilters } from '../api';
@@ -233,8 +234,13 @@ export function FlagsPage() {
 
 function FlagActions({ flag }: { flag: FlagDto }) {
   const resolve = useResolveFlag();
+  const { user } = useSession();
   if (flag.status !== 'OPEN') {
     return <span className="text-xs text-muted-foreground">{flag.resolvedBy ? `by ${flag.resolvedBy.fullName}` : ''}</span>;
+  }
+  // The API refuses resolving a flag about yourself (separation of duties): another admin reviews it.
+  if (user && flag.user.id === user.id) {
+    return <span className="text-xs text-muted-foreground">About you — another admin reviews it</span>;
   }
   const run = (status: 'RESOLVED' | 'DISMISSED') => async ({ reason }: { reason?: string }) => {
     await resolve.mutateAsync({ id: flag.id, status, resolution: reason ?? '' });

@@ -67,6 +67,10 @@ describe('health & HTTP pipeline', () => {
     const limited = await c.get('/api/v1/__probe/otp-limited').expect(429);
     expect(limited.body.error.code).toBe('RATE_LIMITED');
     expect(limited.headers['retry-after-otp'] ?? limited.headers['retry-after']).toBeDefined();
+    // The guard's wait is exposed in the body and as the standard Retry-After header (web shows it).
+    const wait = limited.body.error.details?.retryAfterSeconds;
+    expect(wait).toBeGreaterThan(0);
+    expect(Number(limited.headers['retry-after'])).toBe(wait);
     // unmarked routes are not affected by the otp/auth throttlers
     for (let i = 0; i < 5; i++) await c.get('/api/v1/__probe/bigint').expect(200);
   });

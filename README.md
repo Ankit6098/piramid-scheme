@@ -195,7 +195,20 @@ pnpm test:e2e                                      # Playwright against E2E_BASE
 
 The integration suite includes `test/db-invariants.int-spec.ts`, which attacks every database
 guard with raw SQL and checks that it is refused. End-to-end tests read one-time codes from the
-Mailpit API (`tests/e2e/utils/mailpit.ts`).
+Mailpit API (`tests/e2e/utils/mailpit.ts`) and generate admin TOTP codes themselves
+(`tests/e2e/utils/totp.ts`).
+
+End-to-end run against the production images, next to the development stack (no shared ports:
+nginx on :8080, Mailpit UI/API on 127.0.0.1:8026; `.env.e2e` holds throwaway secrets and is
+git-ignored — copy the variables listed in docs/deployment.md):
+
+```bash
+C="docker compose --env-file .env.e2e -f docker-compose.prod.yml -f docker-compose.e2e.yml"
+$C up -d --build && $C run --rm seed
+E2E_BASE_URL=http://localhost:8080 MAILPIT_URL=http://localhost:8026 \
+  E2E_ADMIN_PASSWORD=<SEED_SUPER_ADMIN_PASSWORD from .env.e2e> pnpm test:e2e
+$C down -v && rm -rf tests/e2e/.state      # the admins' TOTP secrets live in tests/e2e/.state
+```
 
 ## Scripts
 

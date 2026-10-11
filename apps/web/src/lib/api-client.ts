@@ -51,8 +51,17 @@ export class ApiError extends Error {
   readonly status: number;
   readonly details: unknown;
   readonly requestId: string | undefined;
-  /** Field-level validation messages keyed by dotted path (`"rules.0.percentageBps"`). */
+  /**
+   * Field-level validation messages keyed by dotted path (`"rules.0.percentageBps"`). Only built
+   * from the API's field-issue shapes (`details.issues` / `errors` / `fieldErrors`); other details
+   * (e.g. `{ sqlState, reason }` of an INVARIANT_VIOLATION) are never treated as field errors.
+   */
   readonly fieldErrors: Record<string, string>;
+  /**
+   * Seconds to wait before retrying (429): `details.retryAfterSeconds`, else the `Retry-After`
+   * response header. `undefined` when the server gave no hint.
+   */
+  readonly retryAfterSeconds: number | undefined;
 
   constructor(init: {
     code: string;
@@ -60,6 +69,7 @@ export class ApiError extends Error {
     status: number;
     details?: unknown;
     requestId?: string;
+    retryAfterSeconds?: number;
   }) {
     super(init.message);
     this.code = init.code;
@@ -67,6 +77,7 @@ export class ApiError extends Error {
     this.details = init.details;
     this.requestId = init.requestId;
     this.fieldErrors = extractFieldErrors(init.details);
+    this.retryAfterSeconds = retryAfterFromDetails(init.details) ?? positiveSeconds(init.retryAfterSeconds);
   }
 
   get isUnauthenticated(): boolean {
@@ -128,10 +139,35 @@ export function getErrorMessage(
   return fallback;
 }
 
+function positiveSeconds(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.ceil(value) : undefined;
+}
+
+function retryAfterFromDetails(details: unknown): number | undefined {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return undefined;
+  return positiveSeconds((details as { retryAfterSeconds?: unknown }).retryAfterSeconds);
+}
+
 /**
- * Normalizes the API's validation `details` into `{ "dotted.path": "message" }`. Accepts the shapes
- * nestjs-zod / Zod produce: an issues array (`[{ path, message }]`), `{ issues: [...] }`,
- * `{ fieldErrors: { field: string[] } }` (`z.flattenError`) or a plain `{ field: message }` map.
+ * Parses a `Retry-After` header: delta-seconds or an HTTP date (relative to `now`, epoch ms).
+ * Returns undefined for a missing, malformed or already-passed value.
+ */
+export function parseRetryAfter(header: string | null | undefined, now = Date.now()): number | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return positiveSeconds(Number(value));
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : positiveSeconds((at - now) / 1000);
+}
+
+/**
+ * Normalizes the API's validation `details` into `{ "dotted.path": "message" }`. Only field-issue
+ * shapes count: an issues array (`[{ path, message }]`), `{ issues: [...] }` / `{ errors: [...] }`
+ * (VALIDATION_FAILED, and 409s such as a duplicate code that point at a field) or
+ * `{ fieldErrors: { field: string[] } }` (`z.flattenError`). Any other `details` object (e.g.
+ * `{ termsVersion }`, `{ sqlState, reason }`, `{ status }`) is context, not a field map, so it yields
+ * no field errors and callers fall back to a toast/alert. Policy issues with `severity: "warning"`
+ * are skipped (they never block a request).
  */
 export function extractFieldErrors(details: unknown): Record<string, string> {
   const result: Record<string, string> = {};
@@ -148,7 +184,8 @@ export function extractFieldErrors(details: unknown): Record<string, string> {
   const fromIssues = (issues: unknown[]) => {
     for (const issue of issues) {
       if (issue && typeof issue === 'object') {
-        const i = issue as { path?: unknown; field?: unknown; message?: unknown };
+        const i = issue as { path?: unknown; field?: unknown; message?: unknown; severity?: unknown };
+        if (i.severity === 'warning') continue;
         add(i.path ?? i.field, i.message);
       }
     }
@@ -161,13 +198,8 @@ export function extractFieldErrors(details: unknown): Record<string, string> {
     if (Array.isArray(d.issues)) fromIssues(d.issues);
     else if (Array.isArray(d.errors)) fromIssues(d.errors);
     const fieldErrors = d.fieldErrors;
-    if (fieldErrors && typeof fieldErrors === 'object') {
+    if (fieldErrors && typeof fieldErrors === 'object' && !Array.isArray(fieldErrors)) {
       for (const [key, value] of Object.entries(fieldErrors as Record<string, unknown>)) {
-        add(key, Array.isArray(value) ? value[0] : value);
-      }
-    }
-    if (!d.issues && !d.errors && !d.fieldErrors) {
-      for (const [key, value] of Object.entries(d)) {
         add(key, Array.isArray(value) ? value[0] : value);
       }
     }
@@ -282,6 +314,7 @@ async function toApiError(response: Response): Promise<ApiError> {
     status: response.status,
     details: err?.details,
     requestId: err?.requestId ?? headerRequestId,
+    retryAfterSeconds: parseRetryAfter(response.headers.get('retry-after')),
   });
 }
 

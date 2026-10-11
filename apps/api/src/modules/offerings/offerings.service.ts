@@ -21,6 +21,7 @@ import {
   type AuthContext,
   type Db,
 } from '../../common';
+import { keysetWhere } from '../../common/pagination/keyset';
 import type { Prisma } from '../../generated/prisma/client';
 
 const offeringInclude = {
@@ -87,7 +88,7 @@ export class OfferingsService {
         ? {
             AND: [
               where,
-              { OR: [{ createdAt: { lt: new Date(cursor.createdAt) } }, { createdAt: new Date(cursor.createdAt), id: { lt: cursor.id } }] },
+              keysetWhere<Prisma.OfferingWhereInput>('createdAt', new Date(cursor.createdAt), cursor.id, 'desc'),
             ],
           }
         : where,

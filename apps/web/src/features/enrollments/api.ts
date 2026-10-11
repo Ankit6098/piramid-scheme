@@ -3,7 +3,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { ActivateEnrollmentInput, AdminEnrollmentDto, MyEnrollmentDto } from '@app/shared';
 
-import { api } from '@/lib/api-client';
+import { api, isApiError } from '@/lib/api-client';
 import { queryKeys } from '@/lib/query-keys';
 
 /** Cursor list paths (use with `useCursorList`). */
@@ -24,11 +24,19 @@ function useInvalidateEnrollments() {
 }
 
 export function useActivateEnrollment() {
+  const queryClient = useQueryClient();
   const invalidate = useInvalidateEnrollments();
   return useMutation({
     mutationFn: ({ id, input }: { id: string; input: ActivateEnrollmentInput }) =>
       api.post<AdminEnrollmentDto>(`${ADMIN_ENROLLMENTS_PATH}/${id}/activate`, input),
     onSuccess: () => void invalidate(),
+    // 409: the enrollment changed meanwhile (activated/rejected/cancelled elsewhere, or the member
+    // account changed) — refresh the queue so the row shows its current state.
+    onError: (error) => {
+      if (isApiError(error) && error.isConflict) {
+        void queryClient.invalidateQueries({ queryKey: ['admin', 'enrollments'] });
+      }
+    },
   });
 }
 
@@ -52,10 +60,16 @@ export function useAdminCancelEnrollment() {
 
 /** Member cancels their own enrollment. */
 export function useCancelMyEnrollment() {
+  const queryClient = useQueryClient();
   const invalidate = useInvalidateEnrollments();
   return useMutation({
     mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
       api.post<MyEnrollmentDto>(`${MY_ENROLLMENTS_PATH}/${id}/cancel`, reason ? { reason } : {}),
-    onSuccess: () => void invalidate(),
+    onSuccess: () =>
+      void Promise.all([
+        invalidate(),
+        // The member dashboard shows active plans and coverage.
+        queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.all }),
+      ]),
   });
 }

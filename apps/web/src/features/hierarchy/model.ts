@@ -205,7 +205,7 @@ export function buildVisibleTree(
     if (item.node.childrenLoaded && item.node.hasMoreChildren && remaining > 0 && item.children.length === loaded.length) {
       item.children.push({
         kind: 'more',
-        id: `more:${item.id}`,
+        id: moreItemId(item.id),
         parentId: item.id,
         remaining,
         depth: item.node.depth + 1,
@@ -214,6 +214,42 @@ export function buildVisibleTree(
     }
   }
   return { root, count, capped };
+}
+
+/** Id of the "load more" pseudo child of `parentId`. */
+export function moreItemId(parentId: string): string {
+  return `more:${parentId}`;
+}
+
+/** Ids of `rows` that `parentId` does not list yet — what a "load more" page adds — in order. */
+export function newChildIds(model: TreeModel, parentId: string, rows: readonly { id: string }[]): string[] {
+  const known = new Set(model.nodes[parentId]?.childIds ?? []);
+  return rows.map((r) => r.id).filter((id) => !known.has(id));
+}
+
+export type LoadMoreFocus =
+  /** The new page is not rendered yet. */
+  | { status: 'wait' }
+  /** More pages remain: focus stays on the "load more" item. */
+  | { status: 'stay' }
+  | { status: 'focus'; id: string };
+
+/**
+ * Where keyboard focus goes once a "load more" page for `parentId` is rendered. After the last page
+ * the "load more" item disappears (its element and the focus with it), so focus moves to the first
+ * newly loaded child — or the parent when none of them is rendered (node budget, collapsed parent).
+ */
+export function focusAfterLoadMore(
+  order: readonly VisibleItem[],
+  parentId: string,
+  newIds: readonly string[],
+): LoadMoreFocus {
+  const rendered = new Set(order.map((item) => item.id));
+  const moreVisible = rendered.has(moreItemId(parentId));
+  const firstNew = newIds.find((id) => rendered.has(id));
+  if (moreVisible) return newIds.length > 0 && !firstNew ? { status: 'wait' } : { status: 'stay' };
+  if (firstNew) return { status: 'focus', id: firstNew };
+  return rendered.has(parentId) ? { status: 'focus', id: parentId } : { status: 'stay' };
 }
 
 /** Pre-order list of visible items (keyboard navigation order). */

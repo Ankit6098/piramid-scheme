@@ -137,7 +137,8 @@ export function AdminRewardsPage() {
         description="Review rewards calculated from qualifying sales. Approving a reward posts it to the ledger in the same step."
         actions={
           can(Permission.ReportsExport) ? (
-            <ExportCsvButton path="/admin/rewards/export.csv" query={{ ...baseQuery, status }} fallbackName="rewards.csv" />
+            // Same filters and order as the table (the Pending tab is oldest first).
+            <ExportCsvButton path="/admin/rewards/export.csv" query={query} fallbackName="rewards.csv" />
           ) : null
         }
       />

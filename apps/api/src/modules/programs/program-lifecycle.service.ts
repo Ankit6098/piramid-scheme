@@ -7,9 +7,12 @@ import {
 import {
   assertProgramAccess,
   AuditService,
+  inspectDbError,
   invalidState,
   PrismaService,
+  SqlState,
   staleVersion,
+  withLockTimeout,
   type AuthContext,
   type Tx,
 } from '../../common';
@@ -37,7 +40,16 @@ export interface ScheduledTransitionResult {
   started: string[];
   completed: string[];
   failed: string[];
+  /** Row lock not obtained within SCHEDULER_LOCK_TIMEOUT_MS (busy); retried on the next run. */
+  busy: string[];
 }
+
+/**
+ * Longest wait of the scheduler for a program row lock. Enrollments hold the row FOR SHARE only
+ * briefly; a blocking FOR UPDATE queues ahead of new share-lockers, so the transition happens on this
+ * run instead of being skipped while members keep enrolling (SKIP LOCKED skipped it every time).
+ */
+export const SCHEDULER_LOCK_TIMEOUT_MS = 2_000;
 
 /**
  * Program lifecycle (business rules §4, DB state machine `trg_programs_guard`): manual publish /
@@ -166,11 +178,13 @@ export class ProgramLifecycleService {
   /**
    * Scheduler job `programs-status-transitions` (idempotent): starts SCHEDULED programs whose
    * `startsAt` has passed and completes ACTIVE/PAUSED programs whose `endsAt` has passed. Each
-   * program changes in its own transaction (row lock, SKIP LOCKED); failures are logged and retried
-   * on the next run.
+   * program changes in its own transaction (blocking row lock, at most SCHEDULER_LOCK_TIMEOUT_MS).
+   * The change is recorded at the instant it was due (`startsAt` / `endsAt`, see
+   * `trg_programs_log_status`), so a late run never leaves sales after the start without an ACTIVE
+   * status. Busy rows and failures are logged and retried on the next run.
    */
   async applyScheduledTransitions(now = new Date()): Promise<ScheduledTransitionResult> {
-    const result: ScheduledTransitionResult = { started: [], completed: [], failed: [] };
+    const result: ScheduledTransitionResult = { started: [], completed: [], failed: [], busy: [] };
 
     const due = await this.prisma.program.findMany({
       where: { status: 'SCHEDULED', startsAt: { lte: now } },
@@ -185,8 +199,7 @@ export class ProgramLifecycleService {
         );
         if (done) result.started.push(id);
       } catch (err) {
-        result.failed.push(id);
-        this.logger.error({ err, programId: id }, 'scheduled program start failed');
+        this.recordFailure(result, id, err, 'start');
       }
     }
 
@@ -203,14 +216,23 @@ export class ProgramLifecycleService {
         );
         if (done) result.completed.push(id);
       } catch (err) {
-        result.failed.push(id);
-        this.logger.error({ err, programId: id }, 'scheduled program completion failed');
+        this.recordFailure(result, id, err, 'completion');
       }
     }
     if (result.started.length || result.completed.length) {
       this.logger.log({ started: result.started.length, completed: result.completed.length }, 'program status transitions applied');
     }
     return result;
+  }
+
+  private recordFailure(result: ScheduledTransitionResult, programId: string, err: unknown, kind: 'start' | 'completion'): void {
+    if (inspectDbError(err)?.sqlState === SqlState.LockNotAvailable) {
+      result.busy.push(programId);
+      this.logger.warn({ programId }, `scheduled program ${kind} skipped: the program row stayed locked; retrying on the next run`);
+      return;
+    }
+    result.failed.push(programId);
+    this.logger.error({ err, programId }, `scheduled program ${kind} failed`);
   }
 
   private async autoTransition(
@@ -223,13 +245,19 @@ export class ProgramLifecycleService {
     action: string,
     now: Date,
   ): Promise<boolean> {
-    const rows = await tx.$queryRaw<Array<{ status: ProgramStatus; starts_at: Date; ends_at: Date | null }>>`
-      SELECT "status", "starts_at", "ends_at" FROM "programs" WHERE "id" = ${id}::uuid FOR UPDATE SKIP LOCKED`;
+    // Blocking lock with a short timeout (55P03 → reported as busy): SKIP LOCKED silently skipped
+    // programs whose row members kept share-locking by enrolling.
+    const rows = await withLockTimeout(tx, SCHEDULER_LOCK_TIMEOUT_MS, () =>
+      tx.$queryRaw<Array<{ status: ProgramStatus; starts_at: Date; ends_at: Date | null }>>`
+        SELECT "status", "starts_at", "ends_at" FROM "programs" WHERE "id" = ${id}::uuid FOR UPDATE`,
+    );
     const row = rows[0];
     if (!row || !from.includes(row.status)) return false;
     const at = dateField === 'startsAt' ? row.starts_at : row.ends_at;
     if (!at || at.getTime() > now.getTime()) return false;
     await setStatusReason(tx, reason);
+    // Logged at the instant the transition was due (clamped in SQL to ≤ now and ≥ the previous change).
+    await tx.$executeRaw`SELECT set_config('app.status_changed_at', ${at.toISOString()}, true)`;
     await tx.program.update({ where: { id }, data: { status: to, updatedById: null } });
     await this.audit.record(tx, {
       action,

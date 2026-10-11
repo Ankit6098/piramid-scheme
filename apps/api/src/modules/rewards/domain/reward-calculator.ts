@@ -22,6 +22,15 @@ export const MAX_COMPRESSION_SEARCH_DEPTH = 50;
 
 const BPS_DENOMINATOR = 10_000n;
 
+/** Largest amount the database can store (`bigint` columns: 2^63 − 1). */
+export const MAX_STORABLE_MINOR = 2n ** 63n - 1n;
+
+/** Why a sale's reward base cannot be stored (POINTS conversion overflowing `bigint`), or null. */
+export function checkBaseStorable(amountMinor: bigint, unit: CalcUnit): string | null {
+  if (computeBase(amountMinor, unit) <= MAX_STORABLE_MINOR) return null;
+  return 'The sale amount is too large: converted to points it exceeds the largest amount that can be stored';
+}
+
 export interface CalcRule {
   level: number;
   calcType: RewardCalcType;

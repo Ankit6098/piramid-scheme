@@ -19,6 +19,16 @@ describe('email templates', () => {
     expect(subjects.size).toBe(ChallengePurpose.length);
   });
 
+  it('never greets a verification email by the (unverified) registration name', () => {
+    const injected = 'Ada. URGENT: your account is locked, call +1 555 0100 or visit evil.example';
+    const verify = renderOtpEmail({ code: '482913', purpose: 'EMAIL_VERIFICATION', expiresInMinutes: 10, name: injected }, ctx);
+    expect(verify.text).not.toContain('URGENT');
+    expect(verify.html).not.toContain('URGENT');
+    expect(verify.text.startsWith('Hi,')).toBe(true);
+    // existing accounts are still greeted by their name
+    expect(renderOtpEmail({ code: '482913', purpose: 'PASSWORD_RESET', expiresInMinutes: 10, name: 'Ada' }, ctx).text).toContain('Hi Ada,');
+  });
+
   it('escapes user-controlled values in HTML', () => {
     const r = renderEmail('generic', { subject: 'Hi', paragraphs: ['<script>alert(1)</script>'], actionLabel: 'Go', actionUrl: 'https://x.test/?a=1&b="2"' }, ctx);
     expect(r.html).not.toContain('<script>');

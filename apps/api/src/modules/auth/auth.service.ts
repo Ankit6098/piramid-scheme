@@ -222,6 +222,7 @@ export class AuthService {
         ip,
         ua,
         ttlHours: this.sessions.ttlHoursFor(['MEMBER']),
+        expect: { status: 'ACTIVE', passwordHash },
       });
 
       await this.audit.record(tx, {
@@ -269,6 +270,12 @@ export class AuthService {
    * Email + password → session. Unknown email and wrong password are indistinguishable (dummy argon2,
    * same error, same throttle counters). Status errors only after a correct password. Admin-role
    * users get a session WITHOUT a second factor and `mfaRequired: true`.
+   *
+   * The hash is read (and verified) outside the transaction, so the transaction only proceeds if the
+   * row still holds THAT hash and is still ACTIVE: a conditional UPDATE (lastLoginAt + optional
+   * rehash) that a concurrent password reset/change or suspension makes match nothing → the same
+   * INVALID_CREDENTIALS. It also row-locks the user before the session is created (lock order: user
+   * row, then the presented session), and `createSession` re-checks the hash it now holds.
    */
   async login(dto: LoginRequest, presentedToken?: string | null): Promise<SignedIn<LoginResponseDto>> {
     const now = new Date();
@@ -298,20 +305,23 @@ export class AuthService {
     }
 
     const roles = user.roles.map((r) => r.role.key);
-    const rehash = user.passwordHash && this.passwords.needsRehash(user.passwordHash) ? await this.passwords.hash(dto.password) : null;
+    const verifiedHash = user.passwordHash;
+    const rehash = verifiedHash && this.passwords.needsRehash(verifiedHash) ? await this.passwords.hash(dto.password) : null;
     const session = await this.prisma.runInTransaction(async (tx) => {
-      if (presentedToken) await this.revokePresentedSession(tx, presentedToken, now);
+      // Conditional on the hash we verified: never undo a concurrent reset/change (nor sign in with it).
+      const touched = await tx.user.updateMany({
+        where: { id: user.id, passwordHash: verifiedHash, status: 'ACTIVE' },
+        data: { lastLoginAt: now, ...(rehash ? { passwordHash: rehash } : {}) },
+      });
+      if (touched.count !== 1) throw invalidCredentials();
       const created = await this.sessions.createSession(tx, {
         userId: user.id,
         ip,
         ua: RequestContext.userAgent,
         ttlHours: this.sessions.ttlHoursFor(roles),
+        expect: { status: 'ACTIVE', passwordHash: rehash ?? verifiedHash },
       });
-      await tx.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: now, ...(rehash ? { passwordHash: rehash } : {}) },
-        select: { id: true },
-      });
+      if (presentedToken) await this.revokePresentedSession(tx, presentedToken, now);
       await this.audit.record(tx, {
         action: 'auth.login',
         resourceType: 'session',

@@ -28,6 +28,8 @@ export type ReferralAttributionSource = (typeof ReferralAttributionSource)[numbe
 export const FlagKind = {
   SharedIpRegistrations: 'SHARED_IP_REGISTRATIONS',
   ManualReport: 'MANUAL_REPORT',
+  /** A sale resembles a plan payment of the credited member's downline (raised per sale; business rules §0.1). */
+  PlanPaymentLookalike: 'PLAN_PAYMENT_LOOKALIKE',
 } as const;
 export type FlagKind = (typeof FlagKind)[keyof typeof FlagKind];
 

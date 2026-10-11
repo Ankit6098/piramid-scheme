@@ -2,7 +2,7 @@
 
 import {
   hierarchy,
-  linkHorizontal,
+  linkVertical,
   select,
   tree as d3Tree,
   zoom,
@@ -17,16 +17,32 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
-import { depthColor, flattenVisible, nodeLabel, type VisibleItem, type VisibleTree } from '../model';
+import {
+  depthColor,
+  flattenVisible,
+  focusAfterLoadMore,
+  nodeLabel,
+  type VisibleItem,
+  type VisibleTree,
+} from '../model';
 import type { CenterRequest } from '../use-hierarchy-explorer';
 import { NodeTooltip } from './node-tooltip';
 
 const NODE_W = 196;
 const NODE_H = 52;
-const GAP_X = 52;
-const GAP_Y = 14;
-const MIN_SCALE = 0.2;
+/** Horizontal space between neighbouring nodes of a row. */
+const GAP_X = 20;
+/** Vertical space between levels (room for the expand toggle and the connectors). */
+const GAP_Y = 56;
+/** Radius of the expand/collapse toggle on the bottom edge. */
+const TOGGLE_R = 10;
+/** Wide rows (hundreds of nodes) must still fit when zoomed out. */
+const MIN_SCALE = 0.1;
 const MAX_SCALE = 2.5;
+/** Space above the root in the initial placement. */
+const TOP_PAD = 28;
+/** Gap between a node and its keyboard focus ring. */
+const RING_OFFSET = 4;
 
 type LaidNode = HierarchyPointNode<VisibleItem>;
 
@@ -39,7 +55,8 @@ export interface TreeCanvasProps {
   /** Anchor depth offset (depths are relative to the viewer/anchor). */
   onToggle: (id: string) => void;
   onSelect: (id: string) => void;
-  onLoadMore: (parentId: string) => void;
+  /** Resolves with the ids of the loaded children (focus moves to the first after the last page). */
+  onLoadMore: (parentId: string) => Promise<readonly string[]> | void;
   label: string;
   /** How the anchor (depth 0) is named: "You" for members, "Member" in admin views. */
   rootLabel: string;
@@ -52,6 +69,14 @@ function truncate(text: string, max: number): string {
 
 function prefersReducedMotion(): boolean {
   return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+/**
+ * Top-left corner of a laid-out node. The layout is vertical: d3's `x` is the horizontal centre of
+ * the node within its row, `y` the top of its level (the root is at the top, depth grows downwards).
+ */
+function boxOf(n: LaidNode): { left: number; top: number } {
+  return { left: n.x - NODE_W / 2, top: n.y };
 }
 
 /** Accessible name of a node for screen readers. */
@@ -69,9 +94,10 @@ export function describeItem(item: VisibleItem, rootLabel: string): string {
 }
 
 /**
- * Interactive tree (D3 for layout + pan/zoom only; React renders the SVG). Horizontal layout:
- * depth grows to the right. Keyboard: arrows move between nodes (Right expands, Left collapses or
- * goes to the parent), Enter/Space selects or loads more, +/- zoom, 0 fits the view.
+ * Interactive tree (D3 for layout + pan/zoom only; React renders the SVG). Vertical layout: the
+ * anchor is at the top and each level is a row below its parent. Keyboard: Up goes to the parent,
+ * Down expands / goes to the first child, Left/Right move along the row, Space expands or collapses,
+ * Enter selects (or loads more), +/- zoom, 0 fits the whole tree.
  */
 export function TreeCanvas({
   visible,
@@ -102,14 +128,37 @@ export function TreeCanvas({
     if (!visible.root) return null;
     const root = hierarchy<VisibleItem>(visible.root, (d) => d.children);
     const laid = d3Tree<VisibleItem>()
-      .nodeSize([NODE_H + GAP_Y, NODE_W + GAP_X])
-      .separation((a, b) => (a.parent === b.parent ? 1 : 1.2))(root);
+      .nodeSize([NODE_W + GAP_X, NODE_H + GAP_Y])
+      .separation((a, b) => (a.parent === b.parent ? 1 : 1.15))(root);
     const nodes = laid.descendants();
-    return { nodes, links: laid.links(), byId: new Map(nodes.map((n) => [n.data.id, n])) };
+    // Rows (same level, left to right) for Left/Right keyboard moves.
+    const rows = new Map<number, LaidNode[]>();
+    for (const n of nodes) {
+      const row = rows.get(n.depth) ?? [];
+      row.push(n);
+      rows.set(n.depth, row);
+    }
+    for (const row of rows.values()) row.sort((a, b) => a.x - b.x);
+    return { nodes, links: laid.links(), rows, byId: new Map(nodes.map((n) => [n.data.id, n])) };
   }, [visible]);
 
   const order = useMemo(() => flattenVisible(visible.root), [visible]);
   const rovingId = activeId && layout?.byId.has(activeId) ? activeId : (visible.root?.id ?? null);
+
+  // After the last "Load N more" page its node (and the focus) disappears: move focus to the first
+  // new child once the page is rendered. "Adjust state during render", then focus in an effect.
+  const [loadFocus, setLoadFocus] = useState<{ parentId: string; ids: readonly string[] } | null>(null);
+  const [focusRequest, setFocusRequest] = useState<{ id: string; seq: number } | null>(null);
+  if (loadFocus) {
+    const next = focusAfterLoadMore(order, loadFocus.parentId, loadFocus.ids);
+    if (next.status !== 'wait') {
+      setLoadFocus(null);
+      if (next.status === 'focus') {
+        setActiveId(next.id);
+        setFocusRequest((prev) => ({ id: next.id, seq: (prev?.seq ?? 0) + 1 }));
+      }
+    }
+  }
 
   // Container size.
   useEffect(() => {
@@ -146,13 +195,30 @@ export function TreeCanvas({
     else selection.call(behavior.transform, next);
   }
 
+  /** Puts the centre of `node` in the middle of the viewport at scale `k`. */
   function centerTransform(node: LaidNode, k: number): ZoomTransform {
-    const x = node.y + NODE_W / 2;
-    const y = node.x;
+    const x = node.x;
+    const y = node.y + NODE_H / 2;
     return zoomIdentity.translate(size.width / 2 - x * k, size.height / 2 - y * k).scale(k);
   }
 
-  // Initial placement (anchor at the left, vertically centered) and centering requests.
+  /** Bounding box of every rendered node (incl. the toggles below the boxes). */
+  function bounds(nodes: readonly LaidNode[]) {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const n of nodes) {
+      const { left, top } = boxOf(n);
+      minX = Math.min(minX, left);
+      maxX = Math.max(maxX, left + NODE_W);
+      minY = Math.min(minY, top);
+      maxY = Math.max(maxY, top + NODE_H + TOGGLE_R);
+    }
+    return { minX, maxX, minY, maxY };
+  }
+
+  // Initial placement (anchor centred horizontally near the top) and centering requests.
   useEffect(() => {
     if (!layout || size.width === 0) return;
     if (center && handledCenter.current !== center.nonce) {
@@ -166,23 +232,28 @@ export function TreeCanvas({
     if (!initialised.current) {
       initialised.current = true;
       const root = layout.nodes[0];
-      if (root) applyTransform(zoomIdentity.translate(24, size.height / 2 - root.x), false);
+      if (!root) return;
+      // Shrink (down to 60%) so the first rows of a wide team fit; the fit button shows everything.
+      const { minX, maxX } = bounds(layout.nodes);
+      const k = Math.min(1, Math.max(0.6, (size.width - 48) / (maxX - minX || 1)));
+      applyTransform(zoomIdentity.translate(size.width / 2 - root.x * k, TOP_PAD - root.y * k).scale(k), false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- transform is read, not a trigger
   }, [layout, center, size.width, size.height]);
 
+  // Focus requested by a finished "load more" (see above).
+  useEffect(() => {
+    if (!focusRequest) return;
+    const { id } = focusRequest;
+    ensureVisible(id);
+    const frame = requestAnimationFrame(() => nodeRefs.current.get(id)?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- ensureVisible reads the current layout
+  }, [focusRequest]);
+
   function fit() {
     if (!layout || size.width === 0) return;
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
-    for (const n of layout.nodes) {
-      minX = Math.min(minX, n.y);
-      maxX = Math.max(maxX, n.y + NODE_W);
-      minY = Math.min(minY, n.x - NODE_H / 2);
-      maxY = Math.max(maxY, n.x + NODE_H / 2);
-    }
+    const { minX, maxX, minY, maxY } = bounds(layout.nodes);
     const pad = 32;
     const k = Math.max(
       MIN_SCALE,
@@ -208,7 +279,8 @@ export function TreeCanvas({
   function ensureVisible(id: string) {
     const node = layout?.byId.get(id);
     if (!node) return;
-    const [sx, sy] = transform.apply([node.y, node.x - NODE_H / 2]);
+    const { left, top } = boxOf(node);
+    const [sx, sy] = transform.apply([left, top]);
     const margin = 24;
     const outside =
       sx < margin ||
@@ -225,26 +297,35 @@ export function TreeCanvas({
     requestAnimationFrame(() => nodeRefs.current.get(id)?.focus({ preventScroll: true }));
   }
 
+  function loadMore(parentId: string) {
+    const result = onLoadMore(parentId);
+    if (result) void result.then((ids) => setLoadFocus({ parentId, ids }));
+  }
+
+  /** Neighbour in the same row (level), left (-1) or right (+1). */
+  function rowNeighbour(laid: LaidNode | undefined, step: -1 | 1): string | undefined {
+    if (!laid || !layout) return undefined;
+    const row = layout.rows.get(laid.depth) ?? [];
+    return row[row.indexOf(laid) + step]?.data.id;
+  }
+
   function onNodeKeyDown(event: KeyboardEvent<SVGGElement>, item: VisibleItem) {
-    const index = order.findIndex((o) => o.id === item.id);
     const laid = layout?.byId.get(item.id);
-    const parentId = laid?.parent?.data.id;
     switch (event.key) {
-      case 'ArrowDown':
-        focusItem(order[index + 1]?.id);
-        break;
       case 'ArrowUp':
-        focusItem(order[index - 1]?.id);
+        focusItem(laid?.parent?.data.id);
         break;
-      case 'ArrowRight':
+      case 'ArrowDown':
         if (item.kind === 'member' && item.node.childCount > 0) {
           if (!item.expanded) onToggle(item.id);
           else focusItem(item.children[0]?.id);
         }
         break;
       case 'ArrowLeft':
-        if (item.kind === 'member' && item.expanded && item.node.childCount > 0) onToggle(item.id);
-        else focusItem(parentId);
+        focusItem(rowNeighbour(laid, -1));
+        break;
+      case 'ArrowRight':
+        focusItem(rowNeighbour(laid, 1));
         break;
       case 'Home':
         focusItem(order[0]?.id);
@@ -252,9 +333,13 @@ export function TreeCanvas({
       case 'End':
         focusItem(order[order.length - 1]?.id);
         break;
-      case 'Enter':
       case ' ':
-        if (item.kind === 'more') onLoadMore(item.parentId);
+        if (item.kind === 'more') loadMore(item.parentId);
+        else if (item.node.childCount > 0) onToggle(item.id);
+        else onSelect(item.id);
+        break;
+      case 'Enter':
+        if (item.kind === 'more') loadMore(item.parentId);
         else onSelect(item.id);
         break;
       case '+':
@@ -273,10 +358,11 @@ export function TreeCanvas({
     event.preventDefault();
   }
 
-  const link = linkHorizontal<{ source: [number, number]; target: [number, number] }, [number, number]>();
+  const link = linkVertical<{ source: [number, number]; target: [number, number] }, [number, number]>();
   const tipId = focusedId ?? hoverId;
   const tipNode = tipId ? layout?.byId.get(tipId) : undefined;
-  const tipPos = tipNode ? transform.apply([tipNode.y + NODE_W, tipNode.x - NODE_H / 2]) : null;
+  const tipBox = tipNode ? boxOf(tipNode) : null;
+  const tipPos = tipBox ? transform.apply([tipBox.left + NODE_W, tipBox.top]) : null;
 
   return (
     <div ref={containerRef} className={cn('relative h-full min-h-[420px] overflow-hidden bg-subtle', className)}>
@@ -290,10 +376,11 @@ export function TreeCanvas({
           <g aria-hidden>
             {layout?.links.map((l) => {
               const onPath = highlight.has(l.source.data.id) && highlight.has(l.target.data.id);
+              // Parent's bottom-centre → child's top-centre.
               return (
                 <path
                   key={`${l.source.data.id}-${l.target.data.id}`}
-                  d={link({ source: [l.source.y + NODE_W, l.source.x], target: [l.target.y, l.target.x] }) ?? undefined}
+                  d={link({ source: [l.source.x, l.source.y + NODE_H], target: [l.target.x, l.target.y] }) ?? undefined}
                   className={cn('fill-none', onPath ? 'stroke-primary' : 'stroke-border')}
                   strokeWidth={onPath ? 2 : 1.25}
                 />
@@ -318,7 +405,7 @@ export function TreeCanvas({
                 setActiveId(id);
                 onSelect(id);
               }}
-              onLoadMore={onLoadMore}
+              onLoadMore={loadMore}
               onKeyDown={onNodeKeyDown}
               onHover={setHoverId}
               onFocusChange={setFocusedId}
@@ -342,12 +429,12 @@ export function TreeCanvas({
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Zoom out" onClick={() => zoomBy(0.8)}>
           <Minus aria-hidden />
         </Button>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label="Fit tree to view" onClick={fit}>
+        <Button type="button" variant="ghost" size="icon-sm" aria-label="Fit tree to view" title="Fit tree to view (0)" onClick={fit}>
           <Maximize aria-hidden />
         </Button>
       </div>
       <p className="pointer-events-none absolute bottom-2 left-3 hidden text-xs text-muted-foreground sm:block">
-        Drag to pan · scroll to zoom · arrow keys to move between members
+        Drag to pan · scroll to zoom · arrow keys move between members · Space expands
       </p>
     </div>
   );
@@ -369,6 +456,25 @@ interface CanvasNodeProps {
   onFocusChange: (id: string | null) => void;
 }
 
+/**
+ * Keyboard focus ring: drawn outside the node (offset like `ring-offset`), so it stays visible and
+ * distinct from the selected/path stroke on the node's own border.
+ */
+function FocusRing() {
+  return (
+    <rect
+      x={-RING_OFFSET}
+      y={-RING_OFFSET}
+      width={NODE_W + RING_OFFSET * 2}
+      height={NODE_H + RING_OFFSET * 2}
+      rx={10 + RING_OFFSET}
+      className="pointer-events-none fill-none stroke-ring opacity-0 group-focus-visible:opacity-100"
+      strokeWidth={2.5}
+      aria-hidden
+    />
+  );
+}
+
 function CanvasNode({
   laid,
   selected,
@@ -385,8 +491,7 @@ function CanvasNode({
   onFocusChange,
 }: CanvasNodeProps) {
   const item = laid.data;
-  const x = laid.y;
-  const y = laid.x - NODE_H / 2;
+  const { left: x, top: y } = boxOf(laid);
   const level = (laid.depth ?? 0) + 1;
   const common = {
     ref: registerRef,
@@ -410,10 +515,11 @@ function CanvasNode({
           width={NODE_W}
           height={NODE_H}
           rx={10}
-          className="fill-card stroke-input group-hover:fill-accent group-focus-visible:stroke-ring"
+          className="fill-card stroke-input group-hover:fill-accent"
           strokeDasharray="5 4"
           strokeWidth={1.5}
         />
+        <FocusRing />
         <text x={NODE_W / 2} y={NODE_H / 2 + 4} textAnchor="middle" className="fill-primary text-[12px] font-medium">
           {pending ? 'Loading…' : `Load ${item.remaining} more`}
         </text>
@@ -448,11 +554,11 @@ function CanvasNode({
           'transition-colors group-hover:fill-accent',
           inactive ? 'fill-muted' : 'fill-card',
           selected ? 'stroke-primary' : onPath ? 'stroke-primary/60' : 'stroke-border',
-          'group-focus-visible:stroke-ring',
         )}
         strokeWidth={selected ? 2.5 : onPath ? 2 : 1.25}
         strokeDasharray={inactive ? '4 3' : undefined}
       />
+      <FocusRing />
       <rect x={0} y={8} width={4} height={NODE_H - 16} rx={2} style={{ fill: depthColor(n.depth) }} aria-hidden />
       <text
         x={14}
@@ -465,18 +571,18 @@ function CanvasNode({
         {meta}
       </text>
       {n.hasEligibleEnrollment ? (
-        <BadgeCheck x={NODE_W - 44} y={9} width={14} height={14} className="text-primary" aria-hidden />
+        <BadgeCheck x={NODE_W - 24} y={9} width={14} height={14} className="text-primary" aria-hidden />
       ) : null}
       {hasChildren ? (
         <g
-          transform={`translate(${NODE_W},${NODE_H / 2})`}
+          transform={`translate(${NODE_W / 2},${NODE_H})`}
           onClick={(e) => {
             e.stopPropagation();
             onToggle(item.id);
           }}
           aria-hidden
         >
-          <circle r={10} className="fill-card stroke-input hover:fill-accent" strokeWidth={1.25} />
+          <circle r={TOGGLE_R} className="fill-card stroke-input hover:fill-accent" strokeWidth={1.25} />
           <text y={4} textAnchor="middle" className="fill-foreground text-[12px] font-semibold">
             {pending ? '…' : item.expanded ? '−' : '+'}
           </text>
@@ -485,4 +591,3 @@ function CanvasNode({
     </g>
   );
 }
-

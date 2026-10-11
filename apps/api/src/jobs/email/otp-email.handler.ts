@@ -63,7 +63,6 @@ export class OtpEmailOutboxHandler {
         expiresAt: true,
         consumedAt: true,
         invalidatedAt: true,
-        pendingFullName: true,
         user: { select: { fullName: true } },
       },
     });
@@ -86,12 +85,15 @@ export class OtpEmailOutboxHandler {
       return skip('skipped:stale');
     }
 
+    // Greet only with the name of an existing account. A pending registration's name is unverified
+    // input that anybody can type for any address, so EMAIL_VERIFICATION codes never carry it.
+    const name = challenge.purpose === 'EMAIL_VERIFICATION' ? null : (challenge.user?.fullName ?? null);
     const rendered = renderOtpEmail(
       {
         code,
         purpose: challenge.purpose,
         expiresInMinutes: Math.max(1, Math.ceil((challenge.expiresAt.getTime() - now.getTime()) / 60_000)),
-        ...((challenge.user?.fullName ?? challenge.pendingFullName) ? { name: (challenge.user?.fullName ?? challenge.pendingFullName)! } : {}),
+        ...(name ? { name } : {}),
       },
       this.ctx,
     );

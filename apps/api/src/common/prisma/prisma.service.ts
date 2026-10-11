@@ -3,6 +3,10 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { AppConfig } from '../../config/app-config';
 import { Prisma, PrismaClient } from '../../generated/prisma/client';
 import { inspectDbError } from '../errors/db-error';
+import { pgPoolConfig } from './create-client';
+
+/** `current_setting('TimeZone')` values that mean UTC. */
+const UTC_ZONE_NAMES = new Set(['UTC', 'Etc/UTC', 'UCT', 'Etc/UCT', 'Universal', 'Etc/Universal', 'Zulu', 'Etc/Zulu']);
 
 /** Interactive-transaction client. Every multi-row write receives one of these. */
 export type Tx = Prisma.TransactionClient;
@@ -30,11 +34,40 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
   private readonly logger = new Logger(PrismaService.name);
 
   constructor(config: AppConfig) {
-    super({ adapter: new PrismaPg({ connectionString: config.database.url, max: config.database.poolMax }) });
+    super({
+      adapter: new PrismaPg(
+        pgPoolConfig(config.database.url, config.database.poolMax, {
+          connectTimeoutMs: config.database.connectTimeoutMs,
+          statementTimeoutMs: config.database.statementTimeoutMs,
+          lockTimeoutMs: config.database.lockTimeoutMs,
+        }),
+      ),
+    });
   }
 
   async onModuleInit(): Promise<void> {
     await this.$connect();
+    await this.assertUtcSession();
+  }
+
+  /**
+   * Fails fast when DB sessions are not in UTC (pinned with `-c TimeZone=UTC`; a connection-string
+   * `options` parameter would override it): Date parameters are sent as UTC wall-clock text, so any
+   * other session time zone shifts every timestamp the API writes or compares. An unreachable
+   * database is only logged here — requests then fail with 503 until it is back.
+   */
+  async assertUtcSession(): Promise<void> {
+    let tz: string | undefined;
+    try {
+      const rows = await this.$queryRaw<Array<{ tz: string }>>`SELECT current_setting('TimeZone') AS "tz"`;
+      tz = rows[0]?.tz;
+    } catch (err) {
+      this.logger.warn(`Could not verify the database session time zone at startup: ${(err as Error).message}`);
+      return;
+    }
+    if (!tz || !UTC_ZONE_NAMES.has(tz)) {
+      throw new Error(`Database sessions must use TimeZone=UTC (got "${tz ?? 'unknown'}"); remove any "options" override from DATABASE_URL`);
+    }
   }
 
   async onModuleDestroy(): Promise<void> {

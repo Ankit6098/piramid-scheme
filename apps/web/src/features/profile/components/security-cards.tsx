@@ -31,6 +31,7 @@ import { FieldGroup } from '@/components/ui/field';
 import { Spinner } from '@/components/ui/spinner';
 import { mfaHref, routes } from '@/config/routes';
 import { FormErrorAlert, InfoAlert, ResendButton } from '@/features/auth/components/auth-bits';
+import { MfaNotice, mfaNoticeHref } from '@/features/auth/lib/navigation';
 import {
   FormOtpField,
   FormPasswordField,
@@ -134,7 +135,7 @@ export function EmailCard({ profile }: { profile: ProfileDto }) {
     defaultValues: { code: '' },
   });
 
-  const send = (values: StartEmailChangeRequest) =>
+  const send = (values: StartEmailChangeRequest, { resend = false } = {}) =>
     start.mutate(values, {
       onSuccess: (res) => {
         setPending({
@@ -143,11 +144,15 @@ export function EmailCard({ profile }: { profile: ProfileDto }) {
         });
         codeForm.reset();
       },
-      onError: (error) =>
-        applyApiFieldErrors(error, startForm.setError, { knownFields: ['newEmail', 'password'] }),
+      onError: (error) => {
+        // A resend happens on the code screen, where the start fields are not shown: its errors
+        // (e.g. "The password is incorrect", rate limits) are shown there as an alert instead.
+        if (resend) return;
+        applyApiFieldErrors(error, startForm.setError, { knownFields: ['newEmail', 'password'] });
+      },
     });
 
-  const onStart = startForm.handleSubmit(send);
+  const onStart = startForm.handleSubmit((values) => send(values));
   const onConfirm = codeForm.handleSubmit((values) =>
     confirm.mutate(values, {
       onSuccess: (updated) => {
@@ -185,7 +190,11 @@ export function EmailCard({ profile }: { profile: ProfileDto }) {
               If <span className="font-medium">{pending.email}</span> can be used, we sent it a
               6-digit code. It expires in 10 minutes.
             </InfoAlert>
+            {start.isError ? (
+              <FormErrorAlert error={start.error} title="We couldn't send a new code" />
+            ) : null}
             {showAlert(confirm.error) ? <FormErrorAlert error={confirm.error} /> : null}
+            <AdminStepUpHint error={confirm.error ?? start.error} />
             <FormOtpField
               control={codeForm.control}
               name="code"
@@ -199,14 +208,22 @@ export function EmailCard({ profile }: { profile: ProfileDto }) {
                 pending={start.isPending}
                 onResend={() => {
                   const values = startForm.getValues();
-                  send({
-                    newEmail: values.newEmail.trim().toLowerCase(),
-                    password: values.password,
-                  });
+                  send(
+                    { newEmail: values.newEmail.trim().toLowerCase(), password: values.password },
+                    { resend: true },
+                  );
                 }}
               />
               <div className="flex gap-2">
-                <Button type="button" variant="ghost" onClick={() => setPending(null)}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    start.reset();
+                    confirm.reset();
+                    setPending(null);
+                  }}
+                >
                   Cancel
                 </Button>
                 <Button type="submit" disabled={confirm.isPending}>
@@ -219,6 +236,7 @@ export function EmailCard({ profile }: { profile: ProfileDto }) {
         ) : (
           <form onSubmit={onStart} noValidate className="space-y-4">
             {showAlert(start.error) ? <FormErrorAlert error={start.error} /> : null}
+            <AdminStepUpHint error={start.error} />
             <FieldGroup>
               <FormTextField
                 control={startForm.control}
@@ -249,6 +267,22 @@ export function EmailCard({ profile }: { profile: ProfileDto }) {
   );
 }
 
+/**
+ * Admin accounts change their sign-in email only from a session verified with the authenticator
+ * app (the API answers MFA_REQUIRED otherwise) — offer the verification step.
+ */
+function AdminStepUpHint({ error }: { error: unknown }) {
+  if (!isApiError(error) || !error.isMfaRequired) return null;
+  return (
+    <Button asChild variant="outline" size="sm">
+      <Link href={mfaHref(routes.member.profile)}>
+        <ShieldAlert aria-hidden />
+        Verify with your authenticator
+      </Link>
+    </Button>
+  );
+}
+
 // ─── Two-step verification (admins) ──────────────────────────────────────────
 
 export function TwoFactorCard({ profile }: { profile: ProfileDto }) {
@@ -262,10 +296,8 @@ export function TwoFactorCard({ profile }: { profile: ProfileDto }) {
   const onReset = form.handleSubmit((values) =>
     reset.mutate(values.code, {
       onSuccess: () => {
-        toast.success('Authenticator removed', {
-          description: 'Set up your new authenticator app now.',
-        });
-        window.location.assign(mfaHref(routes.member.profile));
+        // A toast would not survive the full page load: the setup screen shows the confirmation.
+        window.location.assign(mfaNoticeHref(routes.member.profile, MfaNotice.TotpRemoved));
       },
       onError: (error) => {
         if (!applyApiFieldErrors(error, form.setError, { knownFields: ['code'] })) {

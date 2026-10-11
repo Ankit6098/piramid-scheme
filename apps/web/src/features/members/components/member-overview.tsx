@@ -116,12 +116,20 @@ function ProfileCard({ member }: { member: AdminMemberDetailDto }) {
             )}
           </Row>
           <Row label="Sponsor">
-            {member.sponsor ? (
+            {member.sponsor?.inScope ? (
               <span className="block min-w-0">
                 <Link href={`${routes.admin.members}/${member.sponsor.id}`} className="font-medium hover:underline">
-                  {member.sponsor.fullName}
+                  {member.sponsor.fullName ?? member.sponsor.displayName}
                 </Link>
-                <span className="block truncate text-xs text-muted-foreground">{member.sponsor.email}</span>
+                {member.sponsor.email ? (
+                  <span className="block truncate text-xs text-muted-foreground">{member.sponsor.email}</span>
+                ) : null}
+              </span>
+            ) : member.sponsor ? (
+              // Outside a program-scoped admin's programs: display name only, no link (it would 404).
+              <span className="block min-w-0">
+                <span className="font-medium">{member.sponsor.displayName}</span>
+                <span className="block text-xs text-muted-foreground">Not in your programs</span>
               </span>
             ) : (
               <span className="text-muted-foreground">No sponsor (joined directly)</span>

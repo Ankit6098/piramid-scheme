@@ -190,10 +190,14 @@ jobs:
           pg_password="$(openssl rand -hex 24)"
           redis_password="$(openssl rand -hex 24)"
           otp_pepper="$(openssl rand -hex 32)"
+          otp_outbox_key="$(openssl rand -hex 32)"
+          mfa_encryption_key="$(openssl rand -hex 32)"
           admin_password="E2e-$(openssl rand -hex 12)"
           echo "::add-mask::$pg_password"
           echo "::add-mask::$redis_password"
           echo "::add-mask::$otp_pepper"
+          echo "::add-mask::$otp_outbox_key"
+          echo "::add-mask::$mfa_encryption_key"
           echo "::add-mask::$admin_password"
           cat > .env <<EOF
           APP_PUBLIC_URL=http://localhost:8080
@@ -203,6 +207,8 @@ jobs:
           POSTGRES_DB=referral
           REDIS_PASSWORD=${redis_password}
           OTP_PEPPER=${otp_pepper}
+          OTP_OUTBOX_KEY=${otp_outbox_key}
+          MFA_ENCRYPTION_KEY=${mfa_encryption_key}
           COOKIE_SECURE=true
           SMTP_HOST=mailpit
           SMTP_PORT=1025
@@ -243,7 +249,7 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Run Playwright
-        run: pnpm exec playwright test --pass-with-no-tests
+        run: pnpm exec playwright test
 
       - name: Collect container logs
         if: always()

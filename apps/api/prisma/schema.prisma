@@ -636,6 +636,8 @@ model ProgramEnrollment {
   // partial indexes for eligibility lookups and the expiry sweep.
   @@index([userId, programId])
   @@index([programId, status])
+  // Admin enrollment list keyset (createdAt, id).
+  @@index([createdAt, id])
   @@map("program_enrollments")
 }
 
@@ -863,6 +865,9 @@ model QualifyingEvent {
   @@index([programId, status, occurredAt])
   @@index([subjectUserId])
   @@index([createdAt])
+  // Admin sale search by exact upstream id / customer reference (BitmapOr of the two).
+  @@index([externalId])
+  @@index([customerReference])
   @@map("qualifying_events")
 }
 
@@ -932,6 +937,9 @@ model Reward {
   @@unique([eventId, level])
   @@unique([eventId, recipientUserId], map: "uq_rewards_event_recipient")
   @@index([recipientUserId, status, createdAt])
+  // Member reward list (createdAt keyset) and dashboard "recent activity" (updatedAt keyset).
+  @@index([recipientUserId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([recipientUserId, updatedAt(sort: Desc), id(sort: Desc)])
   @@index([status, createdAt])
   @@index([programId, status, createdAt])
   @@index([createdAt])
@@ -957,6 +965,8 @@ model LedgerAccount {
   // Partial unique indexes "uq_ledger_accounts_member" / "uq_ledger_accounts_platform" in SQL.
   // Create accounts with INSERT ... ON CONFLICT DO NOTHING (see LedgerService).
   @@index([userId])
+  // Accounts list keyset (created_at, id ascending).
+  @@index([createdAt, id])
   @@map("ledger_accounts")
 }
 
@@ -1051,6 +1061,8 @@ model Notification {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, readAt, createdAt])
+  // Member notification list (createdAt desc, id desc keyset).
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
   @@map("notifications")
 }
 

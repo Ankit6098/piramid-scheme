@@ -3,12 +3,13 @@
 import { Check, ShieldAlert, Undo2, X } from 'lucide-react';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
-import type { AdminRewardDetailDto, LedgerTransactionDetailDto } from '@app/shared';
+import { Permission, type AdminRewardDetailDto, type LedgerTransactionDetailDto } from '@app/shared';
 
 import { Amount } from '@/components/app/amount';
 import { CopyButton } from '@/components/app/copy-button';
 import { DateTime } from '@/components/app/date-time';
 import { ErrorState } from '@/components/app/error-state';
+import { Can } from '@/components/app/guards';
 import { CardSkeleton } from '@/components/app/states';
 import { StatusBadge, ToneBadge } from '@/components/app/status-badge';
 import { Button } from '@/components/ui/button';
@@ -17,6 +18,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { routes } from '@/config/routes';
 
 import { DetailGrid, DetailItem, DetailSection } from '../../../finance/components/detail';
+import { PlanPaymentAlert } from '../../../finance/components/plan-payment-alert';
 import { EntriesTable } from '../../../ledger/components/entries-table';
 import { currencyFormat, unitFormat } from '../../../finance/lib';
 import { useAdminReward } from '../../api';
@@ -120,7 +122,8 @@ function Actions({ r, perms, onDecide }: { r: AdminRewardDetailDto; perms: Rewar
       </Button>,
     );
   }
-  if (perms.reverseEvent && r.event.status === 'PROCESSED') {
+  // A recipient of any live reward of the sale may not reverse it (the API answers 409 OWN_REWARD).
+  if (perms.reverseEvent && r.event.status === 'PROCESSED' && !r.viewer.saleRewardRecipient) {
     buttons.push(
       <Button key="reverse-event" variant="outline" onClick={() => onDecide(r, 'reverse-event')}>
         <Undo2 aria-hidden />
@@ -147,6 +150,7 @@ function Overview({ r }: { r: AdminRewardDetailDto }) {
   const tz = r.program.timezone;
   return (
     <>
+      <PlanPaymentAlert compliance={r.compliance} minorUnits={r.currencyMinorUnits} timeZone={tz} />
       <div className="flex flex-wrap items-end justify-between gap-3 rounded-lg border bg-muted/30 px-4 py-3">
         <div>
           <p className="text-xs text-muted-foreground">Reward amount</p>
@@ -273,9 +277,11 @@ function LedgerTab({ transactions, status }: { transactions: LedgerTransactionDe
               <StatusBadge kind="LedgerTransactionType" value={t.type} />
               <DateTime value={t.postedAt} className="text-xs text-muted-foreground" />
             </div>
-            <Button asChild variant="link" size="sm" className="h-auto p-0">
-              <Link href={`${routes.admin.ledger}?txn=${encodeURIComponent(t.id)}`}>Open in ledger</Link>
-            </Button>
+            <Can perm={Permission.LedgerRead}>
+              <Button asChild variant="link" size="sm" className="h-auto p-0">
+                <Link href={`${routes.admin.ledger}?txn=${encodeURIComponent(t.id)}`}>Open in ledger</Link>
+              </Button>
+            </Can>
           </div>
           <EntriesTable transaction={t} />
           {t.description && t.type === 'REWARD_REVERSAL' ? <p className="text-xs text-muted-foreground">Reason: {t.description}</p> : null}

@@ -6,6 +6,8 @@ import { ScheduledJobsRegistry } from '../scheduler/scheduled-jobs.registry';
 export const OUTBOX_RETENTION_DAYS = 14;
 /** Undelivered OTP emails older than this are useless (10-minute codes): mark DEAD + scrub. */
 export const OTP_OUTBOX_MAX_AGE_MINUTES = 60;
+/** Rows deleted per statement by the daily purge. */
+export const OUTBOX_PURGE_BATCH = 5_000;
 
 /**
  * Core scheduled job (03:17 daily, plus every 15 min for OTP rows):
@@ -39,10 +41,23 @@ export class OutboxCleanupJob {
 
   async run(now = new Date()): Promise<number> {
     const cutoff = new Date(now.getTime() - OUTBOX_RETENTION_DAYS * 86_400_000);
-    const res = await this.prisma.outboxMessage.deleteMany({ where: { status: 'SENT', processedAt: { lt: cutoff } } });
-    if (res.count) this.logger.log(`Purged ${res.count} delivered outbox messages`);
+    // Bounded batches: every statement stays far below the session statement_timeout, however many
+    // rows a day produced, and never holds row locks for long.
+    let purged = 0;
+    for (;;) {
+      const n = await this.prisma.$executeRaw`
+        DELETE FROM "outbox_messages"
+         WHERE "id" IN (
+           SELECT "id" FROM "outbox_messages"
+            WHERE "status" = 'SENT' AND "processed_at" < ${cutoff}
+            LIMIT ${OUTBOX_PURGE_BATCH}
+         )`;
+      purged += n;
+      if (n < OUTBOX_PURGE_BATCH) break;
+    }
+    if (purged) this.logger.log(`Purged ${purged} delivered outbox messages`);
     await this.expireOtpMessages(now);
-    return res.count;
+    return purged;
   }
 
   /** Returns the number of OTP messages that were given up (DEAD, ciphertext removed). */

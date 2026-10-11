@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { ApiPage, NotificationDto, NotificationListQuery } from '@app/shared';
 import { z } from 'zod';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
+import { keysetWhere } from '../../common/pagination/keyset';
 import { notFound } from '../../common/errors/app-error';
 import { OutboxService } from '../../common/outbox/outbox.service';
 import type { NotificationCreatePayload } from '../../common/outbox/outbox.topics';
@@ -77,7 +78,7 @@ export class NotificationsService {
     if (q.unread === false) and.push({ readAt: { not: null } });
     if (cursor) {
       const at = new Date(cursor.createdAt);
-      and.push({ OR: [{ createdAt: { lt: at } }, { createdAt: at, id: { lt: cursor.id } }] });
+      and.push(keysetWhere<Prisma.NotificationWhereInput>('createdAt', at, cursor.id, 'desc'));
     }
     const rows = await this.prisma.notification.findMany({
       where: { AND: and },

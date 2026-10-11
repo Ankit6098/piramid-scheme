@@ -169,11 +169,33 @@ export interface ProgramFormProps {
   program?: AdminProgramDetailDto;
 }
 
-/** Sectioned program form with validation, locked-field hints and an unsaved-changes guard. */
-export function ProgramForm({ program: latest }: ProgramFormProps) {
-  // The version the admin started editing: a concurrent change makes the save fail with
-  // STALE_VERSION instead of silently reverting someone else's edits.
-  const [program] = useState(latest);
+/** Defaults of the create form (also restored after a successful create). */
+const EMPTY_VALUES: FormInput = {
+  name: '',
+  code: '',
+  offeringId: '',
+  description: '',
+  timezone: 'Asia/Kolkata',
+  startsAt: '',
+  endsAt: null,
+  enrollmentOpensAt: null,
+  enrollmentClosesAt: null,
+  maxRewardDepth: '5',
+  lateEventGraceDays: '30',
+  minAccountAgeDays: '',
+  requireSponsor: false,
+  termsVersion: '1.0',
+  termsText: '',
+};
+
+/**
+ * Sectioned program form with validation, locked-field hints and an unsaved-changes guard.
+ *
+ * Edit mode: render it with `key={program.version}` so a new version (this admin's save, or another
+ * admin's change picked up by a refetch) starts a fresh form; `expectedVersion` is always the
+ * version the form was mounted with, so a concurrent change still fails with STALE_VERSION.
+ */
+export function ProgramForm({ program }: ProgramFormProps) {
   const router = useRouter();
   const browserZone = useBrowserTimeZone();
   const { settings } = usePlatformSettings();
@@ -186,25 +208,7 @@ export function ProgramForm({ program: latest }: ProgramFormProps) {
 
   const form = useForm<FormInput, unknown, FormOutput>({
     resolver: zodResolver(schema),
-    defaultValues: program
-      ? toFormValues(program)
-      : {
-          name: '',
-          code: '',
-          offeringId: '',
-          description: '',
-          timezone: 'Asia/Kolkata',
-          startsAt: '',
-          endsAt: null,
-          enrollmentOpensAt: null,
-          enrollmentClosesAt: null,
-          maxRewardDepth: '5',
-          lateEventGraceDays: '30',
-          minAccountAgeDays: '',
-          requireSponsor: false,
-          termsVersion: '1.0',
-          termsText: '',
-        },
+    defaultValues: program ? toFormValues(program) : EMPTY_VALUES,
   });
   useUnsavedChangesWarning(form);
   const timezone = useWatch({ control: form.control, name: 'timezone' });
@@ -245,9 +249,10 @@ export function ProgramForm({ program: latest }: ProgramFormProps) {
           toast.info('No changes to save');
           return;
         }
-        await update.mutateAsync({ expectedVersion: program.version, ...patch });
+        const updated = await update.mutateAsync({ expectedVersion: program.version, ...patch });
         toast.success('Program updated');
-        form.reset(values);
+        // Saved: not dirty any more (stops the unsaved-changes guard), showing what the server stored.
+        form.reset(toFormValues(updated));
         router.push(programHref(program.id));
       } else {
         const input: CreateProgramInput = {
@@ -268,11 +273,13 @@ export function ProgramForm({ program: latest }: ProgramFormProps) {
         };
         const created = await create.mutateAsync(input);
         toast.success('Draft program created', { description: 'Add options and a reward policy, then publish it.' });
-        form.reset(values);
+        // The /new route stays mounted (hidden) after navigating: start the next program from scratch.
+        form.reset(EMPTY_VALUES);
+        setCodeTouched(false);
         router.push(programHref(created.id));
       }
     } catch (error) {
-      if (!applyApiFieldErrors(error, form.setError)) {
+      if (!applyApiFieldErrors(error, form)) {
         toast.error(program ? 'Couldn’t save the program' : 'Couldn’t create the program', { description: getErrorMessage(error) });
       }
     }

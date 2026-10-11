@@ -1,17 +1,19 @@
 import { Injectable } from '@nestjs/common';
-import type {
-  AcceptedResponseDto,
-  ActivityEntryDto,
-  ApiPage,
-  ChangePasswordRequest,
-  ConfirmEmailChangeRequest,
-  CursorPageQuery,
-  ProfileDto,
-  RevokeSessionResponseDto,
-  RevokeSessionsResponseDto,
-  StartEmailChangeRequest,
-  UpdateProfileRequest,
-  UserSessionDto,
+import {
+  isAdminRole,
+  MfaRequiredReason,
+  type AcceptedResponseDto,
+  type ActivityEntryDto,
+  type ApiPage,
+  type ChangePasswordRequest,
+  type ConfirmEmailChangeRequest,
+  type CursorPageQuery,
+  type ProfileDto,
+  type RevokeSessionResponseDto,
+  type RevokeSessionsResponseDto,
+  type StartEmailChangeRequest,
+  type UpdateProfileRequest,
+  type UserSessionDto,
 } from '@app/shared';
 import { z } from 'zod';
 import type { AuthContext } from '../../common/auth/auth-context';
@@ -19,9 +21,11 @@ import { SessionTokenService } from '../../common/auth/session-token.service';
 import { AuditService } from '../../common/audit/audit.service';
 import { maskEmail } from '../../common/audit/mask';
 import { RequestContext } from '../../common/context/request-context';
-import { conflict, notFound, validationFailed } from '../../common/errors/app-error';
+import { conflict, mfaRequired, notFound, validationFailed } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
-import { PrismaService, type Db } from '../../common/prisma/prisma.service';
+import { keysetWhere } from '../../common/pagination/keyset';
+import type { Prisma } from '../../generated/prisma/client';
+import { PrismaService, type Db, type Tx } from '../../common/prisma/prisma.service';
 import { LoginThrottleService } from '../../common/throttle/login-throttle.service';
 import { AppConfig } from '../../config/app-config';
 import { ACCEPTED_MESSAGES, accepted, otpInvalid } from '../auth/auth-errors';
@@ -99,17 +103,22 @@ export class UsersService {
 
   // ─── Password ──────────────────────────────────────────────────────────────
 
-  /** Current password required (throttled like a login); revokes every OTHER session. */
+  /**
+   * Current password required (throttled like a login); revokes every OTHER session. The update is
+   * conditional on the hash that was verified (and on this session still being open), so a password
+   * reset that committed meanwhile is never overwritten with a password chosen from the old one.
+   */
   async changePassword(auth: AuthContext, dto: ChangePasswordRequest): Promise<ProfileDto> {
-    await this.verifyCurrentPassword(auth, dto.currentPassword, 'currentPassword');
+    const verifiedHash = await this.verifyCurrentPassword(auth, dto.currentPassword, 'currentPassword');
     const newHash = await this.passwords.hash(dto.newPassword);
     const now = new Date();
     return this.prisma.runInTransaction(async (tx) => {
-      const user = await tx.user.update({
-        where: { id: auth.userId },
+      const updated = await tx.user.updateMany({
+        where: { id: auth.userId, passwordHash: verifiedHash, status: 'ACTIVE' },
         data: { passwordHash: newHash, passwordChangedAt: now },
-        select: { id: true, email: true, fullName: true },
       });
+      if (updated.count !== 1 || !(await this.isSessionOpen(tx, auth.sessionId))) throw incorrectPassword('currentPassword');
+      const user = await tx.user.findUniqueOrThrow({ where: { id: auth.userId }, select: { id: true, email: true, fullName: true } });
       await this.sessions.revokeAllForUser(tx, auth.userId, 'password_changed', { exceptSessionId: auth.sessionId });
       await this.otp.invalidateOpen(tx, { userId: auth.userId, purpose: 'PASSWORD_RESET' }, now);
       await this.audit.record(tx, { action: 'user.password.change', resourceType: 'user', resourceId: auth.userId });
@@ -130,8 +139,12 @@ export class UsersService {
   /**
    * Password required. Sends an EMAIL_CHANGE code to the NEW address. If that address belongs to
    * another account, it gets a notice instead — the response (and the audit entry) is identical.
+   *
+   * Admin-role accounts additionally need a TOTP-verified session (`adminAccess`): the mailbox is
+   * where a first admin sign-in's LOGIN_MFA code goes, so a password alone must never move it.
    */
   async startEmailChange(auth: AuthContext, dto: StartEmailChangeRequest): Promise<AcceptedResponseDto> {
+    this.assertAdminStepUp(auth);
     if (dto.newEmail === auth.email) {
       throw validationFailed('This is already your email address', {
         issues: [{ path: 'newEmail', message: 'This is already your email address', code: 'custom' }],
@@ -165,8 +178,13 @@ export class UsersService {
     return accepted(ACCEPTED_MESSAGES.emailChange);
   }
 
-  /** Code from the new mailbox → address changed, other sessions revoked, OLD address notified. */
+  /**
+   * Code from the new mailbox → address changed, other sessions revoked, OLD address notified.
+   * Admin-role accounts need `adminAccess` here too (a change started as a member, or before the
+   * TOTP verification expired, cannot be finished without it).
+   */
   async confirmEmailChange(auth: AuthContext, dto: ConfirmEmailChangeRequest): Promise<ProfileDto> {
+    this.assertAdminStepUp(auth);
     const now = new Date();
     const open = await this.prisma.emailChallenge.findFirst({
       where: { userId: auth.userId, purpose: 'EMAIL_CHANGE', consumedAt: null, invalidatedAt: null },
@@ -185,6 +203,10 @@ export class UsersService {
 
     return this.prisma.runInTransaction(async (tx) => {
       if (!(await this.otp.consume(tx, attempt.challenge.id, now))) throw otpInvalid();
+      // Admin status as of NOW (a role granted since the request started counts too), under the lock
+      // that revokeAllForUser/role changes take.
+      await this.lockUser(tx, auth.userId);
+      if (!auth.adminAccess && (await this.holdsAdminRole(tx, auth.userId))) throw this.stepUpRequired(auth);
       const before = await tx.user.findUniqueOrThrow({ where: { id: auth.userId }, select: { email: true, fullName: true } });
       const taken = await tx.user.findUnique({ where: { email: newEmail }, select: { id: true } });
       if (taken) throw conflict('This email address is no longer available');
@@ -233,9 +255,7 @@ export class UsersService {
         revokedAt: null,
         expiresAt: { gt: now },
         lastSeenAt: { gt: idleCutoff },
-        ...(c
-          ? { OR: [{ createdAt: { lt: new Date(c.createdAt) } }, { createdAt: new Date(c.createdAt), id: { lt: c.id } }] }
-          : {}),
+        ...(c ? keysetWhere<Prisma.SessionWhereInput>('createdAt', new Date(c.createdAt), c.id, 'desc') : {}),
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: query.limit + 1,
@@ -289,9 +309,7 @@ export class UsersService {
       where: {
         AND: [
           { OR: [{ actorUserId: auth.userId }, { resourceType: 'user', resourceId: auth.userId }] },
-          ...(c
-            ? [{ OR: [{ createdAt: { lt: new Date(c.createdAt) } }, { createdAt: new Date(c.createdAt), id: { lt: c.id } }] }]
-            : []),
+          ...(c ? [keysetWhere<Prisma.AuditLogWhereInput>('createdAt', new Date(c.createdAt), c.id, 'desc')] : []),
         ],
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -313,19 +331,52 @@ export class UsersService {
   /**
    * Re-authentication for sensitive changes. Failures share the login backoff (per email + IP), so a
    * stolen session cannot brute-force the password. A wrong password is a field error (400), not a
-   * 401 — the session itself is fine.
+   * 401 — the session itself is fine. Returns the hash that was verified (for conditional updates).
    */
-  private async verifyCurrentPassword(auth: AuthContext, password: string, field: string): Promise<void> {
+  private async verifyCurrentPassword(auth: AuthContext, password: string, field: string): Promise<string> {
     const ip = RequestContext.ip;
     const key = this.loginThrottle.emailKey(auth.email);
     this.loginThrottle.assertAllowed(await this.loginThrottle.check(key, ip));
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: auth.userId }, select: { passwordHash: true } });
-    if (!(await this.passwords.verify(user.passwordHash, password))) {
+    if (!(await this.passwords.verify(user.passwordHash, password)) || !user.passwordHash) {
       await this.loginThrottle.recordFailure(key, ip);
-      throw validationFailed('The password is incorrect', {
-        issues: [{ path: field, message: 'The password is incorrect', code: 'custom' }],
-      });
+      throw incorrectPassword(field);
     }
     await this.loginThrottle.reset(key, ip);
+    return user.passwordHash;
   }
+
+  /**
+   * Admin-role accounts may move their sign-in mailbox only from a TOTP-verified session (business
+   * rules §2 "Admin MFA"): otherwise a password alone would redirect the LOGIN_MFA code that
+   * bootstraps the authenticator enrollment.
+   */
+  private assertAdminStepUp(auth: AuthContext): void {
+    if (auth.isAdmin && !auth.adminAccess) throw this.stepUpRequired(auth);
+  }
+
+  private stepUpRequired(auth: AuthContext) {
+    return mfaRequired('Verify with your authenticator app before changing the email address of an administrator account', {
+      reason: auth.hasTotpFactor ? MfaRequiredReason.TotpRequired : MfaRequiredReason.TotpEnrollmentRequired,
+    });
+  }
+
+  private async lockUser(tx: Tx, userId: string): Promise<void> {
+    await tx.$queryRaw`SELECT 1 FROM "users" WHERE "id" = ${userId}::uuid FOR UPDATE`;
+  }
+
+  private async holdsAdminRole(db: Db, userId: string): Promise<boolean> {
+    const roles = await db.userRole.findMany({ where: { userId }, select: { role: { select: { key: true } } } });
+    return roles.some((r) => isAdminRole(r.role.key));
+  }
+
+  private async isSessionOpen(db: Db, sessionId: string): Promise<boolean> {
+    return (await db.session.count({ where: { id: sessionId, revokedAt: null, expiresAt: { gt: new Date() } } })) === 1;
+  }
+}
+
+function incorrectPassword(field: string) {
+  return validationFailed('The password is incorrect', {
+    issues: [{ path: field, message: 'The password is incorrect', code: 'custom' }],
+  });
 }

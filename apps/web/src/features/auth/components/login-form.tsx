@@ -14,6 +14,7 @@ import { isAdminPath, mfaHref, routes, safeNextPath } from '@/config/routes';
 
 import { useLogin } from '../api';
 import { destinationAfterAuth, hardNavigate } from '../lib/navigation';
+import { useResetWhenHidden } from '../lib/use-reset-when-hidden';
 import { FormErrorAlert, InfoAlert, SubmitButton } from './auth-bits';
 import { FormPasswordField } from './form-fields';
 
@@ -29,6 +30,11 @@ export function LoginForm() {
   const form = useForm<LoginInput, unknown, LoginRequest>({
     resolver: zodResolver(loginSchema),
     defaultValues: { email: '', password: '' },
+  });
+  // A hidden (Activity-preserved) sign-in screen must not come back with an old error or password.
+  useResetWhenHidden(() => {
+    login.reset();
+    form.reset();
   });
 
   const onSubmit = form.handleSubmit((values) =>

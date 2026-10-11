@@ -18,6 +18,7 @@ import type { AuthContext } from '../../common/auth/auth-context';
 import { assertProgramAccess, programScopeFilter } from '../../common/auth/program-access';
 import { forbidden, notFound } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
+import { keysetSql, keysetWhere } from '../../common/pagination/keyset';
 import { PrismaService, type Db } from '../../common/prisma/prisma.service';
 import { Prisma, type LedgerAccountType, type RewardUnit } from '../../generated/prisma/client';
 import { CSV_BOM, csvRow } from './domain/csv';
@@ -72,9 +73,9 @@ export class LedgerQueryService {
     const where: Prisma.LedgerTransactionWhereInput = { AND: [this.transactionWhere(auth, q)] };
     if (cursor) {
       const at = new Date(cursor.postedAt);
-      (where.AND as Prisma.LedgerTransactionWhereInput[]).push({
-        OR: [{ postedAt: { lt: at } }, { postedAt: at, id: { lt: cursor.id } }],
-      });
+      (where.AND as Prisma.LedgerTransactionWhereInput[]).push(
+        keysetWhere<Prisma.LedgerTransactionWhereInput>('postedAt', at, cursor.id, 'desc'),
+      );
     }
     const rows = await this.prisma.ledgerTransaction.findMany({
       where,
@@ -107,27 +108,45 @@ export class LedgerQueryService {
   async listAccounts(auth: AuthContext, q: LedgerAccountListQuery): Promise<ApiPage<LedgerAccountDto>> {
     this.assertGlobalScope(auth);
     const cursor = decodeCursor(q.cursor, accountCursorSchema);
+    // Page the accounts first (index ledger_accounts(created_at, id)), then sum only their entries
+    // (index ledger_entries(account_id, …)) — never the whole ledger per page.
     const conditions: Prisma.Sql[] = [];
-    if (q.type) conditions.push(Prisma.sql`b."type" = ${q.type}::"LedgerAccountType"`);
-    if (q.memberId) conditions.push(Prisma.sql`b."user_id" = ${q.memberId}::uuid`);
-    if (q.rewardUnit) conditions.push(Prisma.sql`b."reward_unit" = ${q.rewardUnit}::"RewardUnit"`);
-    if (q.currencyCode) conditions.push(Prisma.sql`b."currency_code" = ${q.currencyCode}`);
-    if (q.nonZero) conditions.push(Prisma.sql`b."credits_minor" <> b."debits_minor"`);
-    if (cursor) {
-      const at = new Date(cursor.createdAt);
-      conditions.push(Prisma.sql`(a."created_at" > ${at} OR (a."created_at" = ${at} AND a."id" > ${cursor.id}::uuid))`);
-    }
+    if (q.type) conditions.push(Prisma.sql`a."type" = ${q.type}::"LedgerAccountType"`);
+    if (q.memberId) conditions.push(Prisma.sql`a."user_id" = ${q.memberId}::uuid`);
+    if (q.rewardUnit) conditions.push(Prisma.sql`a."reward_unit" = ${q.rewardUnit}::"RewardUnit"`);
+    if (q.currencyCode) conditions.push(Prisma.sql`a."currency_code" = ${q.currencyCode}`);
+    if (cursor) conditions.push(keysetSql(Prisma.sql`a."created_at"`, Prisma.sql`a."id"`, new Date(cursor.createdAt), cursor.id, 'asc'));
     const where = conditions.length ? Prisma.sql`WHERE ${Prisma.join(conditions, ' AND ')}` : Prisma.empty;
-    const rows = await this.prisma.$queryRaw<AccountRow[]>`
-      SELECT b."account_id" AS "id", b."type", b."user_id", u."full_name", b."reward_unit", b."currency_code",
-             c."minor_units", b."credits_minor", b."debits_minor", a."created_at"
-        FROM "ledger_account_balances" b
-        JOIN "ledger_accounts" a ON a."id" = b."account_id"
-        LEFT JOIN "users" u ON u."id" = b."user_id"
-        LEFT JOIN "currencies" c ON c."code" = b."currency_code"
-        ${where}
+    const sums = Prisma.sql`CROSS JOIN LATERAL (
+          SELECT coalesce(sum(e."amount_minor") FILTER (WHERE e."direction" = 'CREDIT'), 0)::bigint AS "credits_minor",
+                 coalesce(sum(e."amount_minor") FILTER (WHERE e."direction" = 'DEBIT'), 0)::bigint AS "debits_minor"
+            FROM "ledger_entries" e WHERE e."account_id" = a."id"
+        ) s`;
+    const columns = Prisma.sql`a."id", a."type", a."user_id", u."full_name", a."reward_unit", a."currency_code",
+             c."minor_units", s."credits_minor", s."debits_minor", a."created_at"`;
+    const rows = q.nonZero
+      ? // The balance filter needs the sums: walk accounts in key order until a page of non-zero ones.
+        await this.prisma.$queryRaw<AccountRow[]>`
+      SELECT ${columns}
+        FROM "ledger_accounts" a
+        ${sums}
+        LEFT JOIN "users" u ON u."id" = a."user_id"
+        LEFT JOIN "currencies" c ON c."code" = a."currency_code"
+        ${where} ${conditions.length ? Prisma.sql`AND` : Prisma.sql`WHERE`} s."credits_minor" <> s."debits_minor"
        ORDER BY a."created_at" ASC, a."id" ASC
-       LIMIT ${q.limit + 1}`;
+       LIMIT ${q.limit + 1}`
+      : await this.prisma.$queryRaw<AccountRow[]>`
+      WITH page AS MATERIALIZED (
+        SELECT a.* FROM "ledger_accounts" a ${where}
+         ORDER BY a."created_at" ASC, a."id" ASC
+         LIMIT ${q.limit + 1}
+      )
+      SELECT ${columns}
+        FROM page a
+        ${sums}
+        LEFT JOIN "users" u ON u."id" = a."user_id"
+        LEFT JOIN "currencies" c ON c."code" = a."currency_code"
+       ORDER BY a."created_at" ASC, a."id" ASC`;
     return paginate(rows, q.limit, (r) => ({ createdAt: r.created_at.toISOString(), id: r.id }), (r) => ({
       id: r.id,
       type: r.type,
@@ -267,14 +286,7 @@ export class LedgerQueryService {
     let count = 0;
     for (;;) {
       const page: Prisma.LedgerTransactionWhereInput[] = [base];
-      if (cursor) {
-        page.push({
-          OR: [
-            { postedAt: desc ? { lt: cursor.postedAt } : { gt: cursor.postedAt } },
-            { postedAt: cursor.postedAt, id: desc ? { lt: cursor.id } : { gt: cursor.id } },
-          ],
-        });
-      }
+      if (cursor) page.push(keysetWhere<Prisma.LedgerTransactionWhereInput>('postedAt', cursor.postedAt, cursor.id, desc ? 'desc' : 'asc'));
       const rows = await this.prisma.ledgerTransaction.findMany({
         where: { AND: page },
         include: LEDGER_TRANSACTION_DETAIL_INCLUDE,

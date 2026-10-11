@@ -87,7 +87,7 @@ export function MemberRolesDialog({ member }: { member: AdminMemberDetailDto }) 
       });
       setOpen(false);
     } catch (error) {
-      if (!applyApiFieldErrors(error, form.setError)) setSubmitError(getErrorMessage(error));
+      if (!applyApiFieldErrors(error, form)) setSubmitError(getErrorMessage(error));
     }
   });
 

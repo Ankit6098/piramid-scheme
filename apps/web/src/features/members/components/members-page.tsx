@@ -4,10 +4,10 @@ import type { ColumnDef } from '@tanstack/react-table';
 import { Flag, Search, Users, X } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { RoleKey, UserStatus, type AdminMemberListItemDto } from '@app/shared';
 
-import { DataTable, useCursorList } from '@/components/app/data-table';
+import { DataTable, useCursorList, useUrlTextFilters } from '@/components/app/data-table';
 import { DateTime, RelativeTime } from '@/components/app/date-time';
 import { PageHeader } from '@/components/app/page-header';
 import { EmptyState } from '@/components/app/states';
@@ -120,9 +120,7 @@ export function MembersPage() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const filters = useMemo(() => readFilters(new URLSearchParams(searchParams.toString())), [searchParams]);
-  const [search, setSearch] = useState(filters.q ?? '');
-
-  const setParams = (patch: Partial<Record<keyof MemberListFilters, string | undefined>>) => {
+  const setParams = (patch: Partial<Record<keyof MemberListFilters, string | null | undefined>>) => {
     const next = new URLSearchParams(searchParams.toString());
     for (const [key, value] of Object.entries(patch)) {
       if (value) next.set(key, value);
@@ -132,14 +130,11 @@ export function MembersPage() {
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   };
 
-  // Debounce typing into the URL (the list query follows the URL).
-  useEffect(() => {
-    const trimmed = search.trim();
-    if (trimmed === (filters.q ?? '')) return;
-    const timer = setTimeout(() => setParams({ q: trimmed || undefined }), SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- setParams reads the latest params
-  }, [search]);
+  // Debounce typing into the URL (the list query follows the URL); the box follows URL changes made
+  // elsewhere (links with ?q=, back/forward, this route revived by <Activity>).
+  const searchText = useUrlTextFilters({ q: filters.q ?? '' }, setParams, SEARCH_DEBOUNCE_MS);
+  const search = searchText.text.q;
+  const setSearch = (value: string) => searchText.setText('q', value);
 
   const list = useCursorList<AdminMemberListItemDto>({
     queryKey: queryKeys.admin.members({ ...filters }),
@@ -149,7 +144,7 @@ export function MembersPage() {
 
   const hasFilters = Boolean(filters.q || filters.status || filters.role || filters.programId);
   const clearAll = () => {
-    setSearch('');
+    searchText.clear();
     router.replace(pathname, { scroll: false });
   };
 

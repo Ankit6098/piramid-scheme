@@ -15,6 +15,7 @@ import { routes } from '@/config/routes';
 
 import { useForgotPassword } from '../api';
 import { rememberPendingEmail } from '../lib/navigation';
+import { useResetWhenHidden } from '../lib/use-reset-when-hidden';
 import { FormErrorAlert, InfoAlert, SubmitButton } from './auth-bits';
 
 /** Requests a password-reset code. The answer never reveals whether the address has an account. */
@@ -24,6 +25,11 @@ export function ForgotPasswordForm() {
   const form = useForm<z.input<typeof forgotPasswordSchema>, unknown, ForgotPasswordRequest>({
     resolver: zodResolver(forgotPasswordSchema),
     defaultValues: { email: '' },
+  });
+  // Coming back to this screen starts a new request instead of showing the old "Check your email".
+  useResetWhenHidden(() => {
+    forgot.reset();
+    form.reset();
   });
 
   const onSubmit = form.handleSubmit((values) =>

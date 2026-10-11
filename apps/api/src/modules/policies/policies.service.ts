@@ -25,7 +25,7 @@ import {
 import { z } from 'zod';
 import { AuditService } from '../../common/audit/audit.service';
 import type { AuthContext } from '../../common/auth/auth-context';
-import { assertProgramAccess } from '../../common/auth/program-access';
+import { assertProgramAccess, programScopeFilter } from '../../common/auth/program-access';
 import { AppError, forbidden, invalidState, notFound, staleVersion } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
 import { PrismaService, type Db, type Tx } from '../../common/prisma/prisma.service';
@@ -443,6 +443,7 @@ export class PoliciesService {
       unit,
     };
     if (input.subjectUserId !== undefined) {
+      await this.assertDryRunSubjectReadable(auth, program.id, input.subjectUserId);
       const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
       const ancestors = await this.ancestorsAtSale(this.prisma, program.id, input.subjectUserId, occurredAt, state);
       return runDryRun({ ...base, mode: 'MEMBER', occurredAt, ancestors });
@@ -467,6 +468,20 @@ export class PoliciesService {
   }
 
   // ─── internals ─────────────────────────────────────────────────────────
+
+  /**
+   * A real-tree dry-run reveals the subject's upline (display names, eligibility). A program-scoped
+   * caller (PROGRAM_ADMIN) may only use a subject enrolled in THIS program — the members API rule,
+   * narrowed to the policy's program; anyone else behaves as "not found" (no existence probe).
+   */
+  private async assertDryRunSubjectReadable(auth: AuthContext, programId: string, subjectUserId: string): Promise<void> {
+    if (programScopeFilter(auth, 'read') === 'ALL') return;
+    const enrolled = await this.prisma.programEnrollment.findFirst({
+      where: { userId: subjectUserId, programId },
+      select: { id: true },
+    });
+    if (!enrolled) throw notFound('Member');
+  }
 
   /**
    * Eligibility of the subject's upline at the sale instant — the same rules as the reward engine

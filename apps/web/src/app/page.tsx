@@ -62,12 +62,13 @@ export default function LandingPage() {
     <div className="flex min-h-svh flex-col">
       <header className="border-b bg-background">
         <div className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
-          <Link href={routes.home} className="rounded-md" aria-label={`${siteConfig.name} home`}>
+          <Link href={routes.home} className="min-w-0 rounded-md" aria-label={`${siteConfig.name} home`}>
             <BrandMark />
           </Link>
-          <nav aria-label="Account" className="flex items-center gap-1.5 sm:gap-2">
+          <nav aria-label="Account" className="flex shrink-0 items-center gap-1.5 sm:gap-2">
             <ThemeToggle />
-            <Button asChild variant="ghost" size="sm">
+            {/* Phones: the hero has its own "Sign in" link; keep the header to one call to action. */}
+            <Button asChild variant="ghost" size="sm" className="hidden sm:inline-flex">
               <Link href={routes.auth.login}>Sign in</Link>
             </Button>
             <Button asChild size="sm">

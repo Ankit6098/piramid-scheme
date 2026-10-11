@@ -34,6 +34,17 @@ export function hardNavigate(queryClient: QueryClient, href: string): void {
   window.location.assign(href);
 }
 
+/** One-off confirmations the /mfa screen shows after a full page load (a toast would be lost). */
+export const MFA_NOTICE_PARAM = 'notice';
+export const MfaNotice = { TotpRemoved: 'totp-removed' } as const;
+export type MfaNotice = (typeof MfaNotice)[keyof typeof MfaNotice];
+
+/** `/mfa?next=…&notice=…`. */
+export function mfaNoticeHref(next: string, notice: MfaNotice): string {
+  const href = mfaHref(next);
+  return `${href}${href.includes('?') ? '&' : '?'}${MFA_NOTICE_PARAM}=${encodeURIComponent(notice)}`;
+}
+
 const PENDING_EMAIL_KEY = 'auth:pending-email';
 
 /**

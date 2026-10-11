@@ -21,6 +21,7 @@ import { isApiError } from '@/lib/api-client';
 
 import { useForgotPassword, useResetPassword } from '../api';
 import { forgetPendingEmail, readPendingEmail } from '../lib/navigation';
+import { useResetWhenHidden } from '../lib/use-reset-when-hidden';
 import { FormErrorAlert, InfoAlert, ResendButton, SubmitButton } from './auth-bits';
 import { FormOtpField, FormPasswordField, NEW_PASSWORD_HINT } from './form-fields';
 
@@ -37,6 +38,13 @@ export function ResetPasswordForm() {
   const form = useForm<ResetPasswordInput, unknown, ResetPasswordRequest>({
     resolver: zodResolver(resetPasswordSchema),
     defaultValues: { email: '', code: '', newPassword: '' },
+  });
+  // After a success the screen stays mounted while hidden: never return to a disabled button, an old
+  // error or a typed password.
+  useResetWhenHidden(() => {
+    reset.reset();
+    resend.reset();
+    form.reset();
   });
 
   useEffect(() => {

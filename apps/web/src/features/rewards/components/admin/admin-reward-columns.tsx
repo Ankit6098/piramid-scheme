@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
+import { PlanPaymentBadge } from '../../../finance/components/plan-payment-alert';
 import { currencyFormat, unitFormat } from '../../../finance/lib';
 import type { RewardDecisionKind } from './reward-decision-dialog';
 
@@ -143,6 +144,7 @@ export function adminRewardColumns(o: AdminRewardColumnsOptions): ColumnDef<Admi
             />{' '}
             · {row.original.event.subject.fullName}
           </p>
+          {row.original.event.planPaymentLookalike ? <PlanPaymentBadge className="mt-1" /> : null}
         </div>
       ),
     },
@@ -173,7 +175,8 @@ function RowActions({ reward, o }: { reward: AdminRewardRowDto; o: AdminRewardCo
   const pending = isPending(reward);
   const canReject = o.perms.approve && pending && !reward.viewer.isRecipient;
   const canReverse = o.perms.reverse && reward.status === 'POSTED' && !reward.viewer.isRecipient;
-  const canReverseEvent = o.perms.reverseEvent && reward.event.status === 'PROCESSED';
+  // A recipient of any live reward of the sale may not reverse it (the API answers 409 OWN_REWARD).
+  const canReverseEvent = o.perms.reverseEvent && reward.event.status === 'PROCESSED' && !reward.viewer.saleRewardRecipient;
 
   return (
     <div className="flex items-center justify-end gap-1">

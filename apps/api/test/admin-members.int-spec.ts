@@ -164,7 +164,7 @@ describe('admin members', () => {
         programScopes: [],
         hasTotpFactor: false,
         referralCode: f.rahul.referralCode,
-        sponsor: { id: f.anita.id, fullName: 'Anita Sharma', email: 'anita.sharma@example.test' },
+        sponsor: { id: f.anita.id, displayName: 'Anita S.', fullName: 'Anita Sharma', email: 'anita.sharma@example.test', inScope: true },
         team: { directReferrals: 2, totalDescendants: 2 },
         can: { suspend: true, reactivate: false, changeRoles: true, sendPasswordReset: true },
       });
@@ -189,6 +189,40 @@ describe('admin members', () => {
       expect(d.can).toEqual({ suspend: false, reactivate: false, changeRoles: false, sendPasswordReset: false });
       await client.get(`/api/v1/admin/members/${f.kiran.id}`).expect(404);
       await client.get(`/api/v1/admin/members/${f.admin.id}`).expect(404);
+      // the in-scope sponsor (anita is enrolled in P1) is shown in full
+      expect(d.sponsor).toEqual({
+        id: f.anita.id,
+        displayName: 'Anita S.',
+        fullName: 'Anita Sharma',
+        email: 'anita.sharma@example.test',
+        inScope: true,
+      });
+    });
+
+    it('never shows a PROGRAM_ADMIN an out-of-scope sponsor identity or programs outside their scope', async () => {
+      // Oscar is enrolled nowhere (outside Pooja's scope) and sponsors Mira, who is enrolled in P1.
+      const oscar = await createUser(t.prisma, { fullName: 'Oscar Outside Wilde', email: 'oscar@outside.example.test' });
+      const mira = await createUser(t.prisma, { fullName: 'Mira Inside', sponsor: oscar, roles: ['PROGRAM_ADMIN'], programScopes: [f.p1.id, f.p2.id] });
+      await createEnrollment(t.prisma, { userId: mira.id, programId: f.p1.id });
+
+      const scoped = (await (await loginAs(t, f.programAdmin)).get(`/api/v1/admin/members/${mira.id}`).expect(200)).body
+        .data as AdminMemberDetailDto;
+      expect(scoped.sponsor).toEqual({ id: oscar.id, displayName: 'Oscar W.', fullName: null, email: null, inScope: false });
+      expect(JSON.stringify(scoped)).not.toContain('oscar@outside.example.test');
+      expect(JSON.stringify(scoped)).not.toContain('Outside');
+      expect(scoped.programScopes.map((p) => p.id)).toEqual([f.p1.id]);
+      expect(JSON.stringify(scoped)).not.toContain(f.p2.id);
+
+      // a SUPER_ADMIN sees everything
+      const full = (await (await loginAs(t, f.admin)).get(`/api/v1/admin/members/${mira.id}`).expect(200)).body.data as AdminMemberDetailDto;
+      expect(full.sponsor).toEqual({
+        id: oscar.id,
+        displayName: 'Oscar W.',
+        fullName: 'Oscar Outside Wilde',
+        email: 'oscar@outside.example.test',
+        inScope: true,
+      });
+      expect(full.programScopes.map((p) => p.id).sort()).toEqual([f.p1.id, f.p2.id].sort());
     });
 
     it('404 for an unknown id, 400 for a malformed one', async () => {

@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { CreateFlagInput, FlagDto, FlagStatus, ResolveFlagInput } from '@app/shared';
 
 import { useCursorList } from '@/components/app/data-table';
-import { api } from '@/lib/api-client';
+import { api, isApiError } from '@/lib/api-client';
 import { queryKeys } from '@/lib/query-keys';
 
 export interface FlagFilters {
@@ -23,16 +23,29 @@ export function useFlags(filters: FlagFilters) {
   });
 }
 
+/**
+ * After a flag change: open-flag counts appear on the admin overview, member lists/details and
+ * team views, so refresh the whole admin area (not only the flags list).
+ */
 function useInvalidateFlags() {
   const queryClient = useQueryClient();
-  return () => queryClient.invalidateQueries({ queryKey: ['admin', 'flags'] });
+  return {
+    all: () => queryClient.invalidateQueries({ queryKey: queryKeys.admin.all }),
+    /** 409 (e.g. the flag was already resolved by someone else): reload the list. */
+    onConflict: (error: unknown) => {
+      if (isApiError(error) && error.isConflict) {
+        void queryClient.invalidateQueries({ queryKey: ['admin', 'flags'] });
+      }
+    },
+  };
 }
 
 export function useRaiseFlag() {
   const invalidate = useInvalidateFlags();
   return useMutation({
     mutationFn: (input: CreateFlagInput) => api.post<FlagDto>('/admin/flags', input),
-    onSuccess: () => invalidate(),
+    onSuccess: () => invalidate.all(),
+    onError: invalidate.onConflict,
   });
 }
 
@@ -41,6 +54,7 @@ export function useResolveFlag() {
   return useMutation({
     mutationFn: ({ id, ...input }: ResolveFlagInput & { id: string }) =>
       api.post<FlagDto>(`/admin/flags/${id}/resolve`, input),
-    onSuccess: () => invalidate(),
+    onSuccess: () => invalidate.all(),
+    onError: invalidate.onConflict,
   });
 }

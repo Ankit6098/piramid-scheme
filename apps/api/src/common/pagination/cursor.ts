@@ -10,8 +10,8 @@ import { validationFailed } from '../errors/app-error';
  *   const cursorSchema = z.object({ createdAt: z.iso.datetime(), id: z.uuid() });
  *   const c = decodeCursor(query.cursor, cursorSchema);
  *   const rows = await db.reward.findMany({
- *     where: c ? { OR: [{ createdAt: { lt: new Date(c.createdAt) } },
- *                       { createdAt: new Date(c.createdAt), id: { lt: c.id } }] } : {},
+ *     // keysetWhere (./keyset.ts): index-friendly form of "(createdAt, id) < (c.createdAt, c.id)"
+ *     where: c ? keysetWhere<Prisma.RewardWhereInput>('createdAt', new Date(c.createdAt), c.id, 'desc') : {},
  *     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
  *     take: query.limit + 1,                     // fetch one extra row to detect a next page
  *   });

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { Permission, type RecordSaleResultDto } from '@app/shared';
@@ -7,14 +7,15 @@ import { CurrentUser, RequirePermissions } from '../../common/auth/decorators';
 import { ok } from '../../common/http/envelope';
 import { Idempotent } from '../../common/idempotency/idempotency.interceptor';
 import { IdParamDto } from '../../common/validation/zod';
-import { ListSaleEventsQueryDto, RecordSaleDto } from './dto';
+import { ListSaleEventsQueryDto, RecordSaleDto, RejectPendingSaleDto } from './dto';
 import { EventIntakeService } from './event-intake.service';
 import { EventsQueryService } from './events-query.service';
 
 /**
  * Admin sales intake and event views (business rules §8). Recording is program-scoped
  * (`events:write` + write access); views need `rewards:read` + read access to the program.
- * Event reversal (`POST /admin/events/:id/reverse`) belongs to the rewards slice.
+ * Rejecting a stuck RECEIVED sale needs `events:reverse`. Event reversal
+ * (`POST /admin/events/:id/reverse`) belongs to the rewards slice.
  */
 @ApiTags('admin: events')
 @Controller('admin/events')
@@ -52,5 +53,15 @@ export class AdminEventsController {
     res.status(result.replayed ? 200 : 201);
     const dto: RecordSaleResultDto = { event, outcome: event.outcome, replayed: result.replayed };
     return ok(dto);
+  }
+
+  /** Rejects a sale stuck in RECEIVED (it can then be re-recorded as a new revision). */
+  @Post(':id/reject')
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermissions(Permission.EventsReverse)
+  async reject(@Param() p: IdParamDto, @Body() body: RejectPendingSaleDto, @CurrentUser() auth: AuthContext) {
+    await this.intake.rejectPending(auth, p.id, body.reason);
+    return ok(await this.query.getDetail(auth, p.id));
   }
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { CheckCheck, CircleAlert, X } from 'lucide-react';
+import { CheckCheck, CircleAlert, ShieldAlert, X } from 'lucide-react';
 import { useState } from 'react';
 import { toast } from 'sonner';
 import { MAX_BULK_APPROVE, type AdminRewardRowDto, type BulkApproveResultDto } from '@app/shared';
@@ -34,6 +34,7 @@ export function BulkApproveBar({ selected, onClear, onDone }: BulkApproveBarProp
   const first = selected[0];
   const sameUnit = first && selected.every((r) => r.rewardUnit === first.rewardUnit && r.currencyCode === first.currencyCode);
   const total = sameUnit ? selected.reduce((sum, r) => sum + BigInt(r.amountMinor), BigInt(0)).toString() : null;
+  const lookalikes = selected.filter((r) => r.event.planPaymentLookalike).length;
 
   if (selected.length === 0 && !result) return null;
 
@@ -92,6 +93,16 @@ export function BulkApproveBar({ selected, onClear, onDone }: BulkApproveBarProp
           }
         }}
       >
+        {lookalikes > 0 ? (
+          <p role="alert" className="flex gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-sm">
+            <ShieldAlert className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />
+            <span>
+              {lookalikes === 1 ? '1 selected reward comes' : `${lookalikes} selected rewards come`} from a sale that looks like a plan
+              payment of the credited member or their downline. Plan payments never earn rewards — review{' '}
+              {lookalikes === 1 ? 'it' : 'them'} individually before approving.
+            </span>
+          </p>
+        ) : null}
         {total && first ? (
           <p className="rounded-lg border bg-muted/30 px-3 py-2">
             Total: <Amount value={total} format={unitFormat(first)} className="font-medium" />

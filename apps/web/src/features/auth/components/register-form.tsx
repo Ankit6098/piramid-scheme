@@ -18,6 +18,7 @@ import { isApiError } from '@/lib/api-client';
 
 import { previewReferralCode, useRegister } from '../api';
 import { rememberPendingEmail } from '../lib/navigation';
+import { useResetWhenHidden } from '../lib/use-reset-when-hidden';
 import { authKeys } from '../query-keys';
 import { FormErrorAlert, SubmitButton } from './auth-bits';
 import { FormPasswordField, NEW_PASSWORD_HINT } from './form-fields';
@@ -82,8 +83,21 @@ export function RegisterForm() {
   });
   const referralCode = useWatch({ control: form.control, name: 'referralCode' });
   const codeRejected = form.formState.errors.referralCode?.type === 'server';
+  // Returning to this (Activity-preserved) screen shows a fresh form, not the last submission.
+  useResetWhenHidden(() => {
+    register.reset();
+    form.reset({ fullName: '', email: '', password: '', referralCode: ref });
+  });
+  // A preserved screen re-shown for another invitation link picks up the new `?ref=` (unless edited).
+  useEffect(() => {
+    if (!form.getFieldState('referralCode').isDirty) form.setValue('referralCode', ref);
+  }, [ref, form]);
+  // One registration per submit: a second click while the first is pending or navigating to the code
+  // screen would issue a new code and invalidate the one just sent.
+  const submitting = register.isPending || register.isSuccess;
 
-  const onSubmit = form.handleSubmit((values) =>
+  const onSubmit = form.handleSubmit((values) => {
+    if (submitting) return;
     register.mutate(values, {
       onSuccess: () => {
         rememberPendingEmail(values.email);
@@ -106,8 +120,8 @@ export function RegisterForm() {
           knownFields: ['fullName', 'email', 'password', 'referralCode'],
         });
       },
-    }),
-  );
+    });
+  });
 
   const showGenericError =
     register.isError &&
@@ -177,7 +191,7 @@ export function RegisterForm() {
                 <InvitedBy code={referralCode ?? ''} />
               )}
             </div>
-            <SubmitButton pending={register.isPending}>Create account</SubmitButton>
+            <SubmitButton pending={submitting}>Create account</SubmitButton>
           </FieldGroup>
         </form>
         <p className="text-center text-sm text-muted-foreground">

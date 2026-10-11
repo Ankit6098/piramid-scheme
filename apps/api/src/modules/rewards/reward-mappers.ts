@@ -43,7 +43,15 @@ export function toProgramRef(p: { id: string; name: string; code: string; timezo
   return { id: p.id, name: p.name, code: p.code, timezone: p.timezone };
 }
 
-export function toAdminRewardEvent(e: AdminRewardRow['event']): AdminRewardEventDto {
+/** Per-row facts computed with one query per page (see RewardsQueryService). */
+export interface AdminRewardRowContext {
+  /** The sale resembles a plan payment (business rules §0.1). */
+  planPaymentLookalike: boolean;
+  /** The viewer holds a live reward of this sale. */
+  saleRewardRecipient: boolean;
+}
+
+export function toAdminRewardEvent(e: AdminRewardRow['event'], planPaymentLookalike: boolean): AdminRewardEventDto {
   return {
     id: e.id,
     externalId: e.externalId,
@@ -56,12 +64,13 @@ export function toAdminRewardEvent(e: AdminRewardRow['event']): AdminRewardEvent
     occurredAt: e.occurredAt.toISOString(),
     subject: { id: e.subject.id, fullName: e.subject.fullName },
     recordedBy: personRef(e.recordedBy),
+    planPaymentLookalike,
   };
 }
 
 const iso = (d: Date | null) => (d ? d.toISOString() : null);
 
-export function toAdminRewardRow(row: AdminRewardRow, viewerId: string): AdminRewardRowDto {
+export function toAdminRewardRow(row: AdminRewardRow, viewerId: string, ctx: AdminRewardRowContext): AdminRewardRowDto {
   return {
     id: row.id,
     status: row.status,
@@ -72,7 +81,7 @@ export function toAdminRewardRow(row: AdminRewardRow, viewerId: string): AdminRe
     currencyMinorUnits: row.program.currencyMinorUnits,
     program: toProgramRef(row.program),
     recipient: { id: row.recipient.id, fullName: row.recipient.fullName },
-    event: toAdminRewardEvent(row.event),
+    event: toAdminRewardEvent(row.event, ctx.planPaymentLookalike),
     createdAt: row.createdAt.toISOString(),
     approvedAt: iso(row.approvedAt),
     approvedBy: personRef(row.approvedBy),
@@ -86,6 +95,7 @@ export function toAdminRewardRow(row: AdminRewardRow, viewerId: string): AdminRe
     viewer: {
       isRecipient: row.recipientUserId === viewerId,
       recordedSale: row.event.recordedById === viewerId,
+      saleRewardRecipient: ctx.saleRewardRecipient,
     },
   };
 }

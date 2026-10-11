@@ -18,6 +18,7 @@ import {
   type RewardCalcType,
   type RewardUnit,
 } from '../enums';
+import type { SaleComplianceDto } from './events';
 import type { LedgerTransactionDetailDto } from './ledger';
 
 // ─── Shared building blocks (also used by the ledger contracts) ─────────────
@@ -130,6 +131,11 @@ export interface AdminRewardEventDto {
   occurredAt: string;
   subject: FinancePersonRef;
   recordedBy: FinancePersonRef | null;
+  /**
+   * Compliance review: the sale resembles a plan payment of the credited member or of their
+   * downline (business rules §0.1). Its rewards are never auto-approved; review before approving.
+   */
+  planPaymentLookalike: boolean;
 }
 
 /** Segregation-of-duties hints for the current viewer (the server enforces them regardless). */
@@ -138,6 +144,8 @@ export interface AdminRewardViewerHints {
   isRecipient: boolean;
   /** The viewer recorded the sale: they may not approve its rewards. */
   recordedSale: boolean;
+  /** The viewer holds a live reward of this sale (this one or another level): they may not reverse the sale. */
+  saleRewardRecipient: boolean;
 }
 
 export interface AdminRewardRowDto extends FinanceAmountUnit {
@@ -271,6 +279,8 @@ export interface AdminRewardDetailDto extends Omit<AdminRewardRowDto, 'event'> {
   ledgerTransactions: LedgerTransactionDetailDto[];
   /** Reward and sale audit entries, oldest first. */
   auditTrail: AdminRewardAuditEntryDto[];
+  /** Plan-payment compliance review of the sale (business rules §0.1). */
+  compliance: SaleComplianceDto;
 }
 
 // ─── Admin: decisions ───────────────────────────────────────────────────────

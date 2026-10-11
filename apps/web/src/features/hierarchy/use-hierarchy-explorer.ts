@@ -10,6 +10,8 @@ import {
   applyPatches,
   buildVisibleTree,
   modelFromTree,
+  moreItemId,
+  newChildIds,
   pathToRoot,
   type TreeModel,
   type TreePatch,
@@ -48,7 +50,8 @@ export interface HierarchyExplorerState {
   toggle: (id: string) => void;
   expand: (id: string) => Promise<void>;
   collapse: (id: string) => void;
-  loadMore: (parentId: string) => Promise<void>;
+  /** Loads the next page of children; resolves with the ids it added (`[]` on failure). */
+  loadMore: (parentId: string) => Promise<string[]>;
   select: (id: string | null) => void;
   focusMember: (id: string) => Promise<void>;
   showFrom: (id: string | null) => void;
@@ -144,11 +147,11 @@ export function useHierarchyExplorer(source: HierarchySource): HierarchyExplorer
   );
 
   const loadMore = useCallback(
-    async (parentId: string) => {
+    async (parentId: string): Promise<string[]> => {
       const node = model.nodes[parentId];
       const cursor = node?.childrenCursor ?? null;
-      if (!node || !cursor) return;
-      const key = `more:${parentId}`;
+      if (!node || !cursor) return [];
+      const key = moreItemId(parentId);
       markPending(key, true);
       try {
         const page = await queryClient.fetchQuery({
@@ -160,13 +163,15 @@ export function useHierarchyExplorer(source: HierarchySource): HierarchyExplorer
           ...prev,
           { kind: 'children', parentId, rows: page.data, nextCursor: page.page.nextCursor },
         ]);
+        return newChildIds(model, parentId, page.data);
       } catch (error) {
         toast.error("Couldn't load more members", { description: getErrorMessage(error) });
+        return [];
       } finally {
         markPending(key, false);
       }
     },
-    [markPending, model.nodes, queryClient, source],
+    [markPending, model, queryClient, source],
   );
 
   /** Loads every node on the path to `memberId`, expands it, selects + highlights + centers it. */

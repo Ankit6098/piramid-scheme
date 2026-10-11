@@ -46,6 +46,12 @@ export const envSchema = z.object({
   TEST_DATABASE_URL: postgresUrl.optional(),
   /** Max connections in the pg pool used by Prisma. */
   DATABASE_POOL_MAX: int(10, 1, 200),
+  /** Max wait (ms) for a pooled / new DB connection before the request fails with 503. */
+  DATABASE_CONNECT_TIMEOUT_MS: int(5_000, 100, 60_000),
+  /** Session `statement_timeout` (ms); keep ≤ the 15 s default transaction timeout. */
+  DATABASE_STATEMENT_TIMEOUT_MS: int(15_000, 1_000, 600_000),
+  /** Session `lock_timeout` (ms) for row and advisory lock waits. */
+  DATABASE_LOCK_TIMEOUT_MS: int(5_000, 100, 600_000),
 
   REDIS_URL: z
     .string()

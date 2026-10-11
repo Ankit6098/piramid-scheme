@@ -147,6 +147,19 @@ export interface AdminMemberFlagDto {
   createdAt: string;
 }
 
+/**
+ * The member's sponsor. `fullName`/`email` are null (and `inScope` false) when a program-scoped
+ * caller may not read the sponsor (not enrolled in any of the caller's programs) — then only the
+ * privacy-filtered `displayName` (first name + last initial) is shown and the sponsor is not linkable.
+ */
+export interface AdminMemberSponsorDto {
+  id: string;
+  displayName: string;
+  fullName: string | null;
+  email: string | null;
+  inScope: boolean;
+}
+
 export interface AdminMemberDetailDto {
   id: string;
   fullName: string;
@@ -160,12 +173,15 @@ export interface AdminMemberDetailDto {
   suspendedAt: string | null;
   suspensionReason: string | null;
   roles: AdminMemberRoleDto[];
-  /** Programs assigned to this member as PROGRAM_ADMIN. */
+  /**
+   * Programs assigned to this member as PROGRAM_ADMIN — for a program-scoped caller only those
+   * within the caller's own scope.
+   */
   programScopes: ProgramRefDto[];
   /** Has a confirmed TOTP authenticator (required for admin roles). */
   hasTotpFactor: boolean;
   referralCode: string | null;
-  sponsor: (UserRefDto & { email: string }) | null;
+  sponsor: AdminMemberSponsorDto | null;
   team: { directReferrals: number; totalDescendants: number };
   /** Within the caller's program scope. */
   enrollments: AdminMemberEnrollmentDto[];

@@ -69,7 +69,10 @@ export function useAdminReward(id: string | undefined) {
   });
 }
 
-/** Everything a reward decision can change: queue, counts, details, ledger, reconciliation, sales. */
+/**
+ * Everything a reward decision can change: queue, counts, details, ledger, reconciliation, sales,
+ * the admin member detail (its rewards/earnings) and the audit log.
+ */
 function useInvalidateFinance() {
   const queryClient = useQueryClient();
   return () =>
@@ -79,6 +82,8 @@ function useInvalidateFinance() {
       queryClient.invalidateQueries({ queryKey: financeKeys.reconciliation.all }),
       queryClient.invalidateQueries({ queryKey: financeKeys.adminOverview }),
       queryClient.invalidateQueries({ queryKey: financeKeys.events }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.adminMember }),
+      queryClient.invalidateQueries({ queryKey: financeKeys.adminAudit }),
     ]);
 }
 

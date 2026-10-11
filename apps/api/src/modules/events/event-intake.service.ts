@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
-import { ErrorCode, type QualifyingEventType, type ProgramStatus } from '@app/shared';
+import {
+  ErrorCode,
+  type ProgramStatus,
+  type QualifyingEventStatus,
+  type QualifyingEventType,
+  type RewardUnit,
+} from '@app/shared';
 import { AuditService } from '../../common/audit/audit.service';
 import type { AuthContext } from '../../common/auth/auth-context';
 import { assertProgramAccess, canAccessProgram } from '../../common/auth/program-access';
@@ -9,10 +15,12 @@ import { inspectDbError, SqlState } from '../../common/errors/db-error';
 import { PrismaService, type Tx } from '../../common/prisma/prisma.service';
 import { RewardEngineService } from '../rewards/reward-engine.service';
 import type { CalcPolicy } from '../rewards/domain/reward-calculator';
+import type { PlanPaymentMatch } from '../rewards/domain/plan-payment';
+import { STATUS_CHANGES_LOOKBACK, statusInForce } from '../rewards/domain/program-status';
+import { PlanPaymentLookalikeService } from '../rewards/plan-payment-lookalike.service';
 import {
   decideRevision,
   evaluateIntake,
-  PLAN_PAYMENT_WINDOW_MS,
   saleRequestHash,
   type IntakeRejection,
   type RevisionDecision,
@@ -49,6 +57,18 @@ interface IntakeProgram {
   endsAt: Date | null;
   lateEventGraceDays: number;
   currencyCode: string;
+  rewardUnit: RewardUnit;
+  currencyMinorUnits: number;
+}
+
+const NOT_REJECTABLE: Record<Exclude<QualifyingEventStatus, 'RECEIVED'>, string> = {
+  PROCESSED: 'This sale has already been processed. Reverse it instead of rejecting it.',
+  REJECTED: 'This sale has already been rejected.',
+  REVERSED: 'This sale was reversed, so it can no longer be rejected.',
+};
+
+function notRejectable(status: QualifyingEventStatus): AppError {
+  return invalidState(NOT_REJECTABLE[status as Exclude<QualifyingEventStatus, 'RECEIVED'>] ?? `The sale is ${status}`, { status });
 }
 
 /** Events stuck in RECEIVED longer than this are picked up by the sweeper. */
@@ -70,6 +90,7 @@ export class EventIntakeService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly engine: RewardEngineService,
+    private readonly lookalike: PlanPaymentLookalikeService,
   ) {}
 
   /** Records (or replays) a sale and runs the engine for a new RECEIVED event. */
@@ -90,6 +111,8 @@ export class EventIntakeService {
         endsAt: true,
         lateEventGraceDays: true,
         currencyCode: true,
+        rewardUnit: true,
+        currencyMinorUnits: true,
       },
     });
     if (!program) throw notFound('Program');
@@ -168,6 +191,41 @@ export class EventIntakeService {
     return { attempted: stuck.length, processed };
   }
 
+  /**
+   * Rejects a sale that is still RECEIVED — typically one stuck because it can never be processed —
+   * so its external id can be re-recorded as a new revision (business rules §8). `events:reverse`,
+   * program-scoped, reason required, audited `event.reject`. Serializes with the reward engine on the
+   * event row lock: whichever commits first wins; the other sees a non-RECEIVED sale.
+   */
+  async rejectPending(auth: AuthContext, eventId: string, reason: string): Promise<void> {
+    const event = await this.prisma.qualifyingEvent.findUnique({
+      where: { id: eventId },
+      select: { id: true, programId: true, status: true },
+    });
+    if (!event) throw notFound('Sale event');
+    assertProgramAccess(auth, event.programId, 'read');
+    if (event.status !== 'RECEIVED') throw notRejectable(event.status);
+    await this.prisma.runInTransaction(async (tx) => {
+      const rows = await tx.$queryRaw<Array<{ status: QualifyingEventStatus }>>`
+        SELECT "status"::text AS "status" FROM "qualifying_events" WHERE "id" = ${eventId}::uuid FOR UPDATE`;
+      const status = rows[0]?.status;
+      if (status !== 'RECEIVED') throw notRejectable(status ?? 'REJECTED');
+      await tx.qualifyingEvent.update({
+        where: { id: eventId },
+        data: { status: 'REJECTED', rejectionReason: `Rejected by an administrator: ${reason}`.slice(0, 500) },
+      });
+      await this.audit.record(tx, {
+        action: 'event.reject',
+        resourceType: 'qualifying_event',
+        resourceId: eventId,
+        programId: event.programId,
+        before: { status: 'RECEIVED' },
+        after: { status: 'REJECTED' },
+        reason,
+      });
+    });
+  }
+
   // ─── internals ─────────────────────────────────────────────────────────
 
   private async assertRecorderSod(recorderId: string, subjectId: string): Promise<void> {
@@ -235,7 +293,7 @@ export class EventIntakeService {
     ctx: { occurredAt: Date; amountMinor: bigint; requestHash: string; decision: Extract<RevisionDecision, { kind: 'create' }> },
   ): Promise<{ id: string; status: 'RECEIVED' | 'REJECTED' }> {
     return this.prisma.runInTransaction(async (tx) => {
-      const rejection = await this.evaluate(tx, program, req, ctx.occurredAt, ctx.amountMinor);
+      const { rejection, lookalikes } = await this.evaluate(tx, program, req, ctx.occurredAt, ctx.amountMinor);
       const id = randomUUID();
       const status = rejection ? ('REJECTED' as const) : ('RECEIVED' as const);
       const source = actor.kind === 'ADMIN' ? ('ADMIN_MANUAL' as const) : ('API' as const);
@@ -282,41 +340,62 @@ export class EventIntakeService {
           rejectionCode: rejection?.code ?? null,
           rejectionReason: rejection?.reason ?? null,
           apiClientId: actor.kind === 'API_CLIENT' ? actor.clientId : null,
+          planPaymentLookalike: rejection ? null : lookalikes.length > 0,
         },
       });
+      // A downline plan payment of the same amount: processed, but flagged and never auto-approved.
+      if (!rejection && lookalikes.length > 0) {
+        await this.lookalike.raiseFlag(
+          tx,
+          {
+            eventId: id,
+            programId: program.id,
+            externalId: req.externalId,
+            subjectUserId: req.subjectUserId,
+            amountMinor: ctx.amountMinor,
+            currencyCode: program.currencyCode,
+          },
+          lookalikes,
+        );
+      }
       return { id, status };
     });
   }
 
-  /** Gathers the facts for `evaluateIntake` inside the recording transaction. */
+  /**
+   * Gathers the facts for `evaluateIntake` inside the recording transaction. Also returns the plan
+   * payments the sale resembles (business rules §0.1): the subject's own → rejection; a downline
+   * member's → the sale is accepted but flagged.
+   */
   private async evaluate(
     tx: Tx,
     program: IntakeProgram,
     req: SaleIntakeRequest,
     occurredAt: Date,
     amountMinor: bigint,
-  ): Promise<IntakeRejection | null> {
+  ): Promise<{ rejection: IntakeRejection | null; lookalikes: PlanPaymentMatch[] }> {
     const now = new Date();
     // Sequential: an interactive transaction owns a single connection.
     const offering = await tx.offering.findUnique({ where: { id: program.offeringId }, select: { status: true } });
-    const statusAtSale = await tx.programStatusChange.findFirst({
+    const statusChanges = await tx.programStatusChange.findMany({
       where: { programId: program.id, changedAt: { lte: occurredAt } },
       orderBy: { changedAt: 'desc' },
-      select: { toStatus: true },
+      select: { fromStatus: true, toStatus: true, changedAt: true },
+      take: STATUS_CHANGES_LOOKBACK,
     });
     const subject = await tx.user.findUniqueOrThrow({ where: { id: req.subjectUserId }, select: { status: true, emailVerifiedAt: true } });
-    const paymentRef = await tx.programEnrollment.count({ where: { programId: program.id, paymentReference: req.externalId } });
-    const paymentAmount = await tx.programEnrollment.count({
-      where: {
-        programId: program.id,
-        userId: req.subjectUserId,
-        paymentAmountMinor: amountMinor,
-        paymentRecordedAt: {
-          gte: new Date(occurredAt.getTime() - PLAN_PAYMENT_WINDOW_MS),
-          lte: new Date(occurredAt.getTime() + PLAN_PAYMENT_WINDOW_MS),
-        },
-      },
+    // Payment references are unique across programs: any program's plan payment id is not a sale.
+    const paymentRef = await tx.programEnrollment.count({ where: { paymentReference: req.externalId } });
+    // Same amount in any program with this currency, within ±2 days of the sale date or of now
+    // (back-dating cannot escape the window); own payment (depth 0) or a downline member's.
+    const lookalikes = await this.lookalike.find(tx, {
+      subjectUserId: req.subjectUserId,
+      amountMinor,
+      currencyCode: program.currencyCode,
+      occurredAt,
+      recordedAt: now,
     });
+    const ownPayment = lookalikes.some((m) => m.depth === 0);
     const policyRow = await tx.rewardPolicyVersion.findFirst({
       where: {
         programId: program.id,
@@ -340,18 +419,26 @@ export class EventIntakeService {
           rules: policyRow.rules,
         }
       : null;
-    return evaluateIntake({
+    const rejection = evaluateIntake({
       now,
       type: req.type,
       amountMinor,
       occurredAt,
       offeringActive: offering?.status === 'ACTIVE',
       program,
-      statusAtSale: statusAtSale?.toStatus ?? null,
+      statusAtSale: statusInForce(statusChanges),
       subject: { status: subject.status, emailVerified: subject.emailVerifiedAt !== null },
-      planPayment: paymentRef > 0 ? 'REFERENCE' : paymentAmount > 0 ? 'AMOUNT' : null,
+      planPayment: paymentRef > 0 ? 'REFERENCE' : ownPayment ? 'AMOUNT' : null,
       policy,
+      unit: policyRow
+        ? {
+            rewardUnit: program.rewardUnit,
+            currencyMinorUnits: program.currencyMinorUnits,
+            pointsPerCurrencyUnit: policyRow.pointsPerCurrencyUnit,
+          }
+        : null,
     });
+    return { rejection, lookalikes };
   }
 
   private isUniqueViolation(err: unknown): boolean {

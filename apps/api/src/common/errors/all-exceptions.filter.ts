@@ -135,9 +135,28 @@ export function normalizeError(exception: unknown): NormalizedError {
   }
   const db = mapDbError(exception);
   if (db) {
-    return { status: db.httpStatus, code: db.code, message: db.message, details: db.details, unexpected: db.httpStatus >= 500 };
+    // 503 = a bounded wait gave up (lock/statement/pool timeout): logged as a warning, not a crash.
+    return { status: db.httpStatus, code: db.code, message: db.message, details: db.details, unexpected: db.httpStatus >= 500 && db.httpStatus !== 503 };
   }
   return { status: HttpStatus.INTERNAL_SERVER_ERROR, code: ErrorCode.Internal, message: DEFAULT_MESSAGES[ErrorCode.Internal]!, unexpected: true };
+}
+
+/** Throttler names whose guard headers are `Retry-After` (default) / `Retry-After-<name>`. */
+const THROTTLER_RETRY_HEADERS = ['retry-after', 'retry-after-auth', 'retry-after-otp'] as const;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Longest wait (whole seconds) the throttler guard put on the response, if any. */
+export function throttlerRetryAfter(res: Pick<Response, 'getHeader'>): number | undefined {
+  let wait: number | undefined;
+  for (const name of THROTTLER_RETRY_HEADERS) {
+    const raw = res.getHeader(name);
+    const seconds = Number(Array.isArray(raw) ? raw[0] : raw);
+    if (Number.isFinite(seconds) && seconds > 0) wait = Math.max(wait ?? 0, Math.ceil(seconds));
+  }
+  return wait;
 }
 
 /**
@@ -161,9 +180,20 @@ export class AllExceptionsFilter implements ExceptionFilter {
     }
 
     if (res.headersSent) return;
-    if (n.status === 429 && !res.getHeader('retry-after')) {
-      const retry = (n.details as { retryAfterSeconds?: unknown } | undefined)?.retryAfterSeconds;
-      res.setHeader('retry-after', typeof retry === 'number' && retry > 0 ? String(Math.ceil(retry)) : '60');
+    if (n.status === 429) {
+      if (exception instanceof ThrottlerException) {
+        // The throttler guard already set `Retry-After` (default throttler) or `Retry-After-<name>`
+        // (auth/otp): expose the wait in the body too, so clients can show it.
+        const fromGuard = throttlerRetryAfter(res);
+        if (fromGuard !== undefined) {
+          n.details = { ...(isPlainObject(n.details) ? n.details : {}), retryAfterSeconds: fromGuard };
+          res.setHeader('retry-after', String(fromGuard));
+        }
+      }
+      if (!res.getHeader('retry-after')) {
+        const retry = (n.details as { retryAfterSeconds?: unknown } | undefined)?.retryAfterSeconds;
+        res.setHeader('retry-after', typeof retry === 'number' && retry > 0 ? String(Math.ceil(retry)) : '60');
+      }
     }
     const body: ApiErrorBody = {
       error: {

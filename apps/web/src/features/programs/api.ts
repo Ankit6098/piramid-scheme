@@ -16,7 +16,7 @@ import type {
   UpdateProgramOptionInput,
 } from '@app/shared';
 
-import { api } from '@/lib/api-client';
+import { api, isApiError } from '@/lib/api-client';
 import { queryKeys } from '@/lib/query-keys';
 
 import { programKeys } from './query-keys';
@@ -131,6 +131,11 @@ export function useProgramLifecycle(id: string) {
       queryClient.setQueryData(queryKeys.admin.program(id), program);
       void invalidate();
     },
+    // STALE_VERSION / INVALID_STATE_TRANSITION: the program changed meanwhile. Reload it so the
+    // header, allowed actions and `version` (sent as expectedVersion on the retry) are current.
+    onError: (error) => {
+      if (isApiError(error) && error.isConflict) void invalidate(id);
+    },
   });
 }
 
@@ -197,6 +202,13 @@ export function useEnroll(programId: string) {
         queryClient.invalidateQueries({ queryKey: queryKeys.enrollments.all }),
         queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.all }),
       ]),
+    // 409 (terms changed, enrollment closed, already enrolled…): the catalogue entry is out of date.
+    onError: (error) => {
+      if (isApiError(error) && error.isConflict) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.programs.all });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.enrollments.all });
+      }
+    },
   });
 }
 

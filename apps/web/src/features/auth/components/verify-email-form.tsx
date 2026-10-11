@@ -29,6 +29,7 @@ import {
   hardNavigate,
   readPendingEmail,
 } from '../lib/navigation';
+import { useResetWhenHidden } from '../lib/use-reset-when-hidden';
 import { FormErrorAlert, InfoAlert, ResendButton, SubmitButton } from './auth-bits';
 import { FormOtpField, FormPasswordField } from './form-fields';
 
@@ -50,6 +51,14 @@ export function VerifyEmailForm() {
   const form = useForm<VerifyEmailInput, unknown, VerifyEmailRequest>({
     resolver: zodResolver(verifyEmailSchema),
     defaultValues: { email: '', code: '', password: '' },
+  });
+  // Hidden screens keep their state: clear old errors, "code resent" notices, the code and password.
+  useResetWhenHidden(() => {
+    verify.reset();
+    resend.reset();
+    setResent(false);
+    setJoinedWithoutSponsor(null);
+    form.reset();
   });
 
   useEffect(() => {

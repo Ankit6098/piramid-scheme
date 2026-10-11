@@ -23,6 +23,7 @@ import type { AuthContext } from '../../common/auth/auth-context';
 import { assertProgramAccess, programScopeFilter } from '../../common/auth/program-access';
 import { notFound } from '../../common/errors/app-error';
 import { decodeCursor, paginate } from '../../common/pagination/cursor';
+import { keysetWhere } from '../../common/pagination/keyset';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import type { Prisma, RewardUnit } from '../../generated/prisma/client';
 import { resolveDateRange } from '../ledger/domain/date-range';
@@ -30,6 +31,7 @@ import { LedgerQueryService } from '../ledger/ledger-query.service';
 import { PERSON_SELECT, personRef } from '../ledger/ledger-mappers';
 import { buildEarningsBuckets } from './domain/member-view';
 import { parseRewardTrace, traceUserIds } from './domain/trace';
+import { PlanPaymentLookalikeService } from './plan-payment-lookalike.service';
 import {
   ADMIN_REWARD_INCLUDE,
   MEMBER_REWARD_SELECT,
@@ -41,14 +43,15 @@ import {
 
 const rewardCursorSchema = z.object({ createdAt: z.iso.datetime(), id: z.uuid() });
 const AUDIT_TRAIL_LIMIT = 100;
+/** Rewards that still count for a sale (a recipient of one may not reverse the sale). */
+const LIVE_REWARD_STATUSES: RewardStatus[] = ['PENDING_APPROVAL', 'APPROVED', 'POSTED'];
 
-/** Keyset condition for (createdAt, id) in the given direction. */
+/** Keyset condition for (createdAt, id) in the given direction (index-friendly, see keysetWhere). */
 export function createdAtKeyset(
   cursor: { createdAt: Date; id: string },
   order: 'asc' | 'desc',
 ): Prisma.RewardWhereInput {
-  const op = order === 'asc' ? 'gt' : 'lt';
-  return { OR: [{ createdAt: { [op]: cursor.createdAt } }, { createdAt: cursor.createdAt, id: { [op]: cursor.id } }] };
+  return keysetWhere<Prisma.RewardWhereInput>('createdAt', cursor.createdAt, cursor.id, order);
 }
 
 /**
@@ -60,7 +63,24 @@ export class RewardsQueryService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ledgerQuery: LedgerQueryService,
+    private readonly lookalike: PlanPaymentLookalikeService,
   ) {}
+
+  /** Per-row facts for a page of rewards: plan-payment lookalike sales, sales the viewer holds a live reward of. */
+  private async rowContexts(eventIds: readonly string[], viewerId: string) {
+    const ids = [...new Set(eventIds)];
+    const [lookalikes, held] = await Promise.all([
+      this.lookalike.lookalikeEventIds(this.prisma, ids),
+      ids.length
+        ? this.prisma.reward.findMany({
+            where: { eventId: { in: ids }, recipientUserId: viewerId, status: { in: LIVE_REWARD_STATUSES } },
+            select: { eventId: true },
+          })
+        : Promise.resolve([]),
+    ]);
+    const heldEvents = new Set(held.map((r) => r.eventId));
+    return (eventId: string) => ({ planPaymentLookalike: lookalikes.has(eventId), saleRewardRecipient: heldEvents.has(eventId) });
+  }
 
   // ─── Admin ──────────────────────────────────────────────────────────────
 
@@ -95,11 +115,12 @@ export class RewardsQueryService {
       orderBy: [{ createdAt: q.order }, { id: q.order }],
       take: q.limit + 1,
     });
+    const ctx = await this.rowContexts(rows.slice(0, q.limit).map((r) => r.eventId), auth.userId);
     return paginate(
       rows,
       q.limit,
       (r) => ({ createdAt: r.createdAt.toISOString(), id: r.id }),
-      (r) => toAdminRewardRow(r, auth.userId),
+      (r) => toAdminRewardRow(r, auth.userId, ctx(r.eventId)),
     );
   }
 
@@ -151,7 +172,7 @@ export class RewardsQueryService {
     if (!row) throw notFound('Reward');
     assertProgramAccess(auth, row.programId, 'read');
 
-    const [siblings, ledgerTransactions, audit] = await Promise.all([
+    const [siblings, ledgerTransactions, audit, compliance, rowCtx] = await Promise.all([
       this.prisma.reward.findMany({
         where: { eventId: row.eventId, id: { not: row.id } },
         select: { id: true, level: true, status: true, amountMinor: true, rewardUnit: true, currencyCode: true, recipient: PERSON_SELECT },
@@ -169,6 +190,13 @@ export class RewardsQueryService {
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         take: AUDIT_TRAIL_LIMIT,
       }),
+      this.prisma.qualifyingEvent
+        .findUniqueOrThrow({
+          where: { id: row.eventId },
+          select: { id: true, subjectUserId: true, amountMinor: true, currencyCode: true, occurredAt: true, createdAt: true },
+        })
+        .then((e) => this.lookalike.compliance(this.prisma, e)),
+      this.rowContexts([row.eventId], auth.userId),
     ]);
 
     const calc = row.calculation;
@@ -185,12 +213,14 @@ export class RewardsQueryService {
       raw: calc.trace,
     };
 
-    const base = toAdminRewardRow(row, auth.userId);
+    const ctx = rowCtx(row.eventId);
+    // The detail's compliance view is authoritative (it also covers a flag raised at processing).
+    const base = toAdminRewardRow(row, auth.userId, { ...ctx, planPaymentLookalike: compliance.planPaymentLookalike });
     const minorUnits = row.program.currencyMinorUnits;
     return {
       ...base,
       event: {
-        ...toAdminRewardEvent(row.event),
+        ...toAdminRewardEvent(row.event, compliance.planPaymentLookalike),
         customerReference: row.event.customerReference,
         description: row.event.description,
         processedAt: row.event.processedAt?.toISOString() ?? null,
@@ -237,6 +267,7 @@ export class RewardsQueryService {
           createdAt: a.createdAt.toISOString(),
         }),
       ),
+      compliance,
     };
   }
 

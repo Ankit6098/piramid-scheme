@@ -74,7 +74,8 @@ calculator: `applicable` / `notApplicableReason` (type not rewarded, below minim
 per-level `levels[].decision` (`AWARDED`, `NO_RULE`, `NO_ANCESTOR`, `INELIGIBLE_FORFEITED`,
 `BUDGET_EXHAUSTED`, `ZERO_AMOUNT`), `ancestors` (display name = first name + last initial in member mode),
 `warnings` and the raw `trace`. Exactly one of `ancestors` / `subjectUserId` (400 otherwise); unknown member
-→ 404.
+→ 404. A program-scoped caller (PROGRAM_ADMIN) may only preview a `subjectUserId` enrolled in the policy's
+program (any enrollment status) — anyone else is 404, like the members API.
 
 **Member view.** Programs in SCHEDULED/ACTIVE/PAUSED/COMPLETED (404 otherwise). Returns the version in effect
 now, or the next scheduled one (`inEffect: false`), or `null`: levels (type, percentage / fixed amount, cap),
@@ -87,8 +88,9 @@ names, notes, approval settings or authors.
 |---|---|---|---|---|
 | GET | `/admin/events/programs` | programs:read | – | `SaleProgramOptionDto[]` — programs in the caller's read scope, `canRecordSales` (events:write + write access + program ACTIVE/PAUSED/COMPLETED/ARCHIVED) |
 | GET | `/admin/events` | rewards:read | `programId`, `status`, `type`, `source`, `from`/`to` (occurredAt), `q` (exact external id or customer reference), `subjectUserId`, `cursor`, `limit` | page of `SaleEventDto`, `createdAt desc, id desc`, scoped to readable programs |
-| GET | `/admin/events/:id` | rewards:read | – | `SaleEventDetailDto` — calculation (base, budget, ancestors with eligibility, steps, warnings), rewards, revisions |
+| GET | `/admin/events/:id` | rewards:read | – | `SaleEventDetailDto` — calculation (base, budget, ancestors with eligibility, steps, warnings), rewards, revisions, `compliance` (plan-payment review, below) |
 | POST | `/admin/events` | events:write | `recordSaleSchema`; optional `Idempotency-Key` | 201 new / 200 replay: `{ event: SaleEventDetailDto, outcome, replayed }` |
+| POST | `/admin/events/:id/reject` | events:reverse (scoped) | `{ reason }` (10–480 chars); `Idempotency-Key` required | `SaleEventDetailDto` — the sale is now `REJECTED` (`rejectionReason` = "Rejected by an administrator: <reason>"); 409 `INVALID_STATE_TRANSITION` unless it is RECEIVED |
 
 `POST /admin/events/:id/reverse` (events:reverse) is documented in [finance.md](finance.md).
 
@@ -119,14 +121,32 @@ generic per-actor replay on top.
 member of their own downline.
 
 **Stored as REJECTED** (201, `outcome: REJECTED`, `event.rejectionReason`): sale dated > 5 min in the future;
-outside the program period; offering not ACTIVE; external id is an enrollment payment reference, or the
-subject has a plan payment of the same amount recorded within ±2 days (plan payments never earn rewards);
-program not ACTIVE at `occurredAt` (from `program_status_changes`); program COMPLETED/ARCHIVED and the late
+outside the program period; offering not ACTIVE; external id is an enrollment payment reference **of any
+program**, or the subject has a plan payment of the same amount in **any program with the sale's currency**
+recorded within ±2 days of `occurredAt` **or of now** (plan payments never earn rewards; back-dating does not
+help); program not ACTIVE at `occurredAt` (from `program_status_changes`); program COMPLETED/ARCHIVED and the late
 window (`endsAt + lateEventGraceDays`) has closed; subject not ACTIVE + verified; no non-draft policy covering
-`occurredAt`; policy does not list the type; amount below the policy minimum.
+`occurredAt`; policy does not list the type; amount below the policy minimum; POINTS program whose converted
+base (`amount × pointsPerCurrencyUnit / 10^minorUnits`) exceeds 2^63 − 1 ("The sale amount is too large…").
+
+**Plan-payment lookalikes (compliance review).** A sale with the amount of a plan payment by a member of the
+subject's **downline** (any depth; same currency; recorded within ±2 days of `occurredAt` or of the recording)
+is accepted, but flagged: its rewards are always created `PENDING_APPROVAL` — also for API sales under a
+policy with `requiresApproval = false` (the DB refuses an auto-approved reward for it) — and an OPEN
+`PLAN_PAYMENT_LOOKALIKE` member flag (dedupe key `PLAN_PAYMENT_LOOKALIKE:<eventId>`, once per sale) is raised on
+the subject. `SaleEventDetailDto.compliance` = `{ planPaymentLookalike, message, matches: [{ relation: OWN |
+DOWNLINE, depth, enrollmentId, program, payer, amountMinor, currencyCode, paymentRecordedAt }], flag: { id,
+status } | null }` (re-evaluated on every read with the sale's `createdAt` as recording time; `planPaymentLookalike`
+is also true when a flag was raised at processing). The admin reward row/detail carry the same signal
+(`event.planPaymentLookalike`, `compliance`), see [finance.md](finance.md).
+
+**Stuck sales.** `POST /admin/events/:id/reject` (events:reverse) rejects a sale that is still RECEIVED (e.g. one
+the engine can never process), so its external id can be re-recorded as a new revision. It locks the event row
+(serializing with the engine), audits `event.reject` with the reason, and returns the updated detail.
 
 **Processing.** A valid sale is stored RECEIVED and, after commit, `RewardEngineService.processEvent` runs
-(binds the policy, stores the calculation + rewards, PROCESSED). The response reflects the stored state:
+(binds the policy, stores the calculation + rewards, PROCESSED; a POINTS base that cannot be stored is
+rejected instead). The response reflects the stored state:
 `outcome` ∈ `REWARDS_CREATED`, `NO_ELIGIBLE_RECIPIENTS`, `REJECTED`, `PENDING` (engine failed — the event stays
 RECEIVED), `REVERSED`. The scheduled job **`events-received-sweeper`** (every minute) re-runs the engine for
 events RECEIVED for more than 2 minutes (batch of 100, idempotent).
@@ -156,7 +176,8 @@ stored. Clients cannot be created for ARCHIVED programs.
 rate-limited to 120 requests/min per IP. The key is checked before the body: missing, unknown or revoked → 401
 `UNAUTHENTICATED`. A `programId` other than the key's program → 403. Then the same intake as the admin route
 (source `API`, `api_client_id` set, audited with `actorRoles = ['API_CLIENT']`), and `lastUsedAt` is updated.
-Under a policy with `requiresApproval = false`, rewards from API sales are approved and posted immediately.
+Under a policy with `requiresApproval = false`, rewards from API sales are approved and posted immediately —
+except for a sale that resembles a plan payment (above), whose rewards wait for a reviewer.
 The response is deliberately minimal: `{ id, programId, externalId, revision, type, amountMinor,
 currencyCode, occurredAt, status, outcome, rejectionReason, createdAt, replayed }` — no member or reward
 details.

@@ -4,22 +4,26 @@ import { CalendarRange, CheckCircle2, ClipboardCheck, Layers, ScrollText, XCircl
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import type { ReactNode } from 'react';
-import type { AdminProgramDetailDto, ProgramPublishCheckKey } from '@app/shared';
+import { Permission, type AdminProgramDetailDto, type ProgramPublishCheckKey } from '@app/shared';
 
 import { DateTime } from '@/components/app/date-time';
+import { Can } from '@/components/app/guards';
 import { SectionHeader } from '@/components/app/page-header';
 import { StatCard } from '@/components/app/stat-card';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { routes } from '@/config/routes';
 import { enumLabel } from '@/lib/enum-labels';
 
 import { useAdminProgram } from '../../api';
 import { programHref } from './program-links';
 import { StatusTimeline } from './status-timeline';
 
-const CHECK_LINK: Record<ProgramPublishCheckKey, { label: string; href: (id: string) => string } | null> = {
+/** Where to fix a failing check; `perm` hides links to pages the viewer cannot open. */
+const CHECK_LINK: Record<ProgramPublishCheckKey, { label: string; href: (id: string) => string; perm?: Permission } | null> = {
   ACTIVE_OPTION: { label: 'Add an option', href: (id) => programHref(id, 'options') },
-  OFFERING_ACTIVE: { label: 'Review offerings', href: () => '/admin/offerings' },
+  // The offerings page needs offerings:write (Program Admins don't have it).
+  OFFERING_ACTIVE: { label: 'Review offerings', href: () => routes.admin.offerings, perm: Permission.OfferingsWrite },
   DATES_VALID: { label: 'Edit dates', href: (id) => programHref(id, 'edit') },
   PUBLISHED_POLICY: { label: 'Open policies', href: (id) => programHref(id, 'policies') },
 };
@@ -194,9 +198,11 @@ function PublishReadiness({ program }: { program: AdminProgramDetailDto }) {
                   <span className="sr-only">{c.ok ? 'Done: ' : 'To do: '}</span>
                   {c.message}
                   {!c.ok && link ? (
-                    <Link href={link.href(program.id)} className="mt-0.5 block text-xs font-medium text-primary hover:underline">
-                      {link.label}
-                    </Link>
+                    <Can perm={link.perm}>
+                      <Link href={link.href(program.id)} className="mt-0.5 block text-xs font-medium text-primary hover:underline">
+                        {link.label}
+                      </Link>
+                    </Can>
                   ) : null}
                 </div>
               </li>

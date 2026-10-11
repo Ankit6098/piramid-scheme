@@ -151,7 +151,15 @@ function EnrollmentCard({ enrollment: e, compact }: { enrollment: MyEnrollmentDt
               confirmLabel="Cancel enrollment"
               cancelLabel="Keep it"
               variant="destructive"
-              reason={{ required: false, label: 'Note (optional)', placeholder: 'Anything the program team should know' }}
+              reason={{
+                required: false,
+                label: 'Note (optional)',
+                placeholder: 'Anything the program team should know',
+                // Matches the API (`cancelMyEnrollmentSchema`): optional, any length up to 500.
+                minLength: 0,
+                maxLength: 500,
+                description: 'Optional. The program team sees this note with your cancellation.',
+              }}
               onConfirm={async ({ reason }) => {
                 await cancel.mutateAsync({ id: e.id, reason });
                 toast.success('Enrollment cancelled');

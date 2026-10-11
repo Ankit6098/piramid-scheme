@@ -112,7 +112,7 @@ export function CreateApiClientDialog({
         });
       },
       onError: (error) => {
-        if (!applyApiFieldErrors(error, form.setError)) {
+        if (!applyApiFieldErrors(error, form)) {
           toast.error("Couldn't create the API client", { description: getErrorMessage(error) });
         }
       },

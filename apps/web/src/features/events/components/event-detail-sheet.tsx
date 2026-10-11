@@ -27,6 +27,7 @@ import { useSession } from '@/hooks/use-session';
 import { isApiError } from '@/lib/api-client';
 import { enumLabel } from '@/lib/enum-labels';
 
+import { PlanPaymentAlert } from '../../finance/components/plan-payment-alert';
 import { useSaleEvent } from '../api';
 import { outcomeMeta, pluralize, programCurrencyFormat, programRewardFormat } from '../labels';
 import { isUuid } from '../use-event-filters';
@@ -34,6 +35,7 @@ import { RevisionBadge } from './event-columns';
 import { EventCalculation } from './event-calculation';
 import { EventRewards } from './event-rewards';
 import { DetailSection, Fact } from './detail-section';
+import { RejectPendingSaleDialog } from './reject-pending-sale-dialog';
 import { ReverseSaleDialog } from './reverse-sale-dialog';
 
 export interface EventDetailSheetProps {
@@ -46,6 +48,9 @@ export interface EventDetailSheetProps {
   onReRecord: (event: SaleEventDetailDto) => void;
   programs: readonly SaleProgramOptionDto[] | undefined;
 }
+
+/** Rewards that still count for a sale. */
+const LIVE_REWARD_STATUSES: ReadonlySet<string> = new Set(['PENDING_APPROVAL', 'APPROVED', 'POSTED']);
 
 function DetailSkeleton() {
   return (
@@ -198,9 +203,18 @@ function StatusAlerts({
           <Info aria-hidden />
           <AlertTitle>Rewards are being calculated</AlertTitle>
           <AlertDescription>
-            The sale is stored; the reward engine processes it within a couple of minutes.
+            The sale is stored; the reward engine processes it within a couple of minutes. If it
+            stays here, a reviewer with the reverse-sales permission can reject it so it can be
+            re-recorded.
           </AlertDescription>
         </Alert>
+      ) : null}
+      {event.status !== 'REJECTED' && event.status !== 'REVERSED' ? (
+        <PlanPaymentAlert
+          compliance={event.compliance}
+          minorUnits={event.program.currencyMinorUnits}
+          timeZone={tz}
+        />
       ) : null}
       {event.supersededByEventId ? (
         <Alert role="note">
@@ -331,7 +345,7 @@ export function EventDetailSheet({
   const notFound =
     Boolean(activeId) && (!validId || (isApiError(query.error) && query.error.isNotFound));
   // UI gating only — the API authorizes every action.
-  const { can } = useSession();
+  const { can, user } = useSession();
   const canReRecordProgram = Boolean(
     event && programs?.some((p) => p.id === event.programId && p.canRecordSales),
   );
@@ -341,7 +355,12 @@ export function EventDetailSheet({
     !event?.supersededByEventId &&
     canReRecordProgram &&
     can(Permission.EventsWrite);
-  const showReverse = event?.status === 'PROCESSED' && can(Permission.EventsReverse);
+  // A recipient of any live reward of the sale may not reverse it (the API answers 409 OWN_REWARD).
+  const holdsLiveReward = Boolean(
+    user && event?.rewards.some((r) => r.recipient.id === user.id && LIVE_REWARD_STATUSES.has(r.status)),
+  );
+  const showReverse = event?.status === 'PROCESSED' && can(Permission.EventsReverse) && !holdsLiveReward;
+  const showRejectPending = event?.status === 'RECEIVED' && can(Permission.EventsReverse);
 
   return (
     <Sheet open={Boolean(eventId)} onOpenChange={(open) => (open ? undefined : onClose())}>
@@ -394,7 +413,7 @@ export function EventDetailSheet({
           )}
         </div>
 
-        {event && (showReRecord || showReverse) ? (
+        {event && (showReRecord || showReverse || showRejectPending) ? (
           <SheetFooter className="flex-row flex-wrap justify-end border-t">
             {showReRecord ? (
               <Button variant="outline" onClick={() => onReRecord(event)}>
@@ -402,6 +421,7 @@ export function EventDetailSheet({
                 Re-record
               </Button>
             ) : null}
+            {showRejectPending ? <RejectPendingSaleDialog event={event} /> : null}
             {showReverse ? <ReverseSaleDialog event={event} /> : null}
           </SheetFooter>
         ) : null}

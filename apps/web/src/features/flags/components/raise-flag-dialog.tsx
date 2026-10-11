@@ -63,7 +63,7 @@ export function RaiseFlagDialog({ defaultUserId }: { defaultUserId?: string }) {
                 close();
               },
               onError: (error) => {
-                if (!applyApiFieldErrors(error, form.setError)) toast.error(getErrorMessage(error));
+                if (!applyApiFieldErrors(error, form)) toast.error(getErrorMessage(error));
               },
             }),
           )}

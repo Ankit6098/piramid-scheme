@@ -14,11 +14,14 @@ import {
   ENGINE_VERSION,
   MAX_COMPRESSION_SEARCH_DEPTH,
   calculateRewards,
+  checkBaseStorable,
   checkEventAgainstPolicy,
   serializeTrace,
   type CalcAncestor,
   type CalcPolicy,
 } from './domain/reward-calculator';
+import { STATUS_CHANGES_LOOKBACK, statusInForce } from './domain/program-status';
+import { PlanPaymentLookalikeService } from './plan-payment-lookalike.service';
 
 export type ProcessEventOutcome = 'REWARDS_CREATED' | 'NO_ELIGIBLE_RECIPIENTS' | 'ALREADY_PROCESSED' | 'REJECTED';
 
@@ -37,8 +40,11 @@ interface LockedEvent {
   subject_user_id: string;
   source: string;
   type: CalcPolicy['triggerEventTypes'][number];
+  external_id: string;
   amount_minor: bigint;
+  currency_code: string;
   occurred_at: Date;
+  created_at: Date;
 }
 
 /**
@@ -56,6 +62,7 @@ export class RewardEngineService {
     private readonly ledger: LedgerService,
     private readonly notifications: NotificationsService,
     private readonly audit: AuditService,
+    private readonly lookalike: PlanPaymentLookalikeService,
   ) {}
 
   /**
@@ -63,7 +70,8 @@ export class RewardEngineService {
    * lock the event FOR UPDATE → ALREADY_PROCESSED unless RECEIVED → take the referral tree lock in
    * SHARED mode (waits for an in-flight sponsor correction) → validate (→ REJECTED with a
    * reason) → bind the applicable policy → calculate → insert the calculation and rewards → auto-post
-   * when the policy skips approval and the sale did not come from a manual entry → mark PROCESSED →
+   * when the policy skips approval, the sale did not come from a manual entry and it does not resemble
+   * a plan payment (own or downline — such a sale is flagged for review instead) → mark PROCESSED →
    * notify recipients. Concurrent calls for the same event serialize on the row lock; exactly one
    * calculation is ever stored.
    */
@@ -75,7 +83,8 @@ export class RewardEngineService {
 
   private async processInTx(tx: Tx, eventId: string): Promise<ProcessEventResult> {
     const locked = await tx.$queryRaw<LockedEvent[]>`
-      SELECT "id", "status", "program_id", "subject_user_id", "source"::text AS "source", "type", "amount_minor", "occurred_at"
+      SELECT "id", "status", "program_id", "subject_user_id", "source"::text AS "source", "type", "external_id",
+             "amount_minor", "currency_code"::text AS "currency_code", "occurred_at", "created_at"
       FROM "qualifying_events" WHERE "id" = ${eventId}::uuid FOR UPDATE`;
     const event = locked[0];
     if (!event) throw notFound('Qualifying event');
@@ -122,12 +131,14 @@ export class RewardEngineService {
     if (!subject || subject.status !== 'ACTIVE' || !subject.emailVerifiedAt) {
       return reject('The member credited with the sale is not an active member');
     }
-    const statusAtSale = await tx.programStatusChange.findFirst({
+    // Several changes may share one timestamp (one transaction): resolve the chain, not the SQL tie.
+    const statusChanges = await tx.programStatusChange.findMany({
       where: { programId: program.id, changedAt: { lte: event.occurred_at } },
       orderBy: { changedAt: 'desc' },
-      select: { toStatus: true },
+      select: { fromStatus: true, toStatus: true, changedAt: true },
+      take: STATUS_CHANGES_LOOKBACK,
     });
-    if (statusAtSale?.toStatus !== 'ACTIVE') {
+    if (statusInForce(statusChanges) !== 'ACTIVE') {
       return reject('The program was not active when the sale occurred');
     }
     if ((program.status === 'COMPLETED' || program.status === 'ARCHIVED') && program.endsAt) {
@@ -167,6 +178,14 @@ export class RewardEngineService {
     const eventInput = { type: event.type, amountMinor: event.amount_minor };
     const policyProblem = checkEventAgainstPolicy(eventInput, policy);
     if (policyProblem) return reject(policyProblem);
+    const unit = {
+      rewardUnit: program.rewardUnit,
+      currencyMinorUnits: program.currencyMinorUnits,
+      pointsPerCurrencyUnit: policyRow.pointsPerCurrencyUnit,
+    };
+    // A POINTS base beyond bigint can never be stored: reject instead of failing forever.
+    const storageProblem = checkBaseStorable(event.amount_minor, unit);
+    if (storageProblem) return reject(storageProblem);
 
     // Bind the policy (the DB re-checks that it applies to this sale).
     await tx.qualifyingEvent.update({ where: { id: eventId }, data: { policyVersionId: policy.id } });
@@ -193,16 +212,32 @@ export class RewardEngineService {
       return { userId: a.userId, depth: a.depth, eligible: reason === undefined, ...(reason ? { ineligibleReason: reason } : {}) };
     });
 
-    const calc = calculateRewards({
-      event: eventInput,
-      policy,
-      unit: {
-        rewardUnit: program.rewardUnit,
-        currencyMinorUnits: program.currencyMinorUnits,
-        pointsPerCurrencyUnit: policyRow.pointsPerCurrencyUnit,
-      },
-      ancestors,
+    const calc = calculateRewards({ event: eventInput, policy, unit, ancestors });
+
+    // Compliance (business rules §0.1): a sale with the amount of a plan payment by the subject or
+    // their downline is processed, but its rewards always wait for a reviewer (the DB refuses an
+    // auto-approved reward for it) and the subject is flagged once per sale.
+    const lookalikes = await this.lookalike.find(tx, {
+      subjectUserId: event.subject_user_id,
+      amountMinor: event.amount_minor,
+      currencyCode: event.currency_code,
+      occurredAt: event.occurred_at,
+      recordedAt: event.created_at,
     });
+    if (lookalikes.length > 0) {
+      await this.lookalike.raiseFlag(
+        tx,
+        {
+          eventId,
+          programId: program.id,
+          externalId: event.external_id,
+          subjectUserId: event.subject_user_id,
+          amountMinor: event.amount_minor,
+          currencyCode: event.currency_code,
+        },
+        lookalikes,
+      );
+    }
 
     // ── Persist ────────────────────────────────────────────────────────────────
     const calculationId = randomUUID();
@@ -235,7 +270,7 @@ export class RewardEngineService {
       },
     });
 
-    const autoApprove = !policyRow.requiresApproval && event.source !== 'ADMIN_MANUAL';
+    const autoApprove = !policyRow.requiresApproval && event.source !== 'ADMIN_MANUAL' && lookalikes.length === 0;
     const now = new Date();
     const rewardIds: string[] = [];
     for (const allocation of calc.allocations) {
@@ -274,6 +309,7 @@ export class RewardEngineService {
         rewards: rewardIds.length,
         totalAllocatedMinor: calc.totalAllocatedMinor.toString(),
         autoApproved: autoApprove,
+        planPaymentLookalike: lookalikes.length > 0,
       },
     });
 

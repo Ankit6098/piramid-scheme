@@ -95,7 +95,7 @@ export function HierarchyExplorer({ source, initialFocusId, actions }: Hierarchy
     pending: explorer.pending,
     onToggle: explorer.toggle,
     onSelect: explorer.select,
-    onLoadMore: (id: string) => void explorer.loadMore(id),
+    onLoadMore: explorer.loadMore,
     label,
     rootLabel,
   };
