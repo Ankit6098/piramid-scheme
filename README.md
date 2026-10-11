@@ -254,6 +254,7 @@ docker-compose.prod.yml   full stack behind nginx
 
 ## Documentation
 
+- **[User guide](docs/user-guide.md): how to use the software — setup, every role's daily work, troubleshooting**
 - [Business rules](docs/business-rules.md): the authoritative domain rules
 - [Architecture](docs/architecture.md): system overview, module map, request and processing flows, API core contracts
 - [Database](docs/database.md): entities, every invariant with its rationale, state machines, the referral write protocol, ledger shape, indexes, concurrency, retention
